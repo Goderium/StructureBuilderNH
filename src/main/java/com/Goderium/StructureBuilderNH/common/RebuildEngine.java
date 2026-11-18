@@ -42,7 +42,7 @@ public final class RebuildEngine {
         Session(World world, TileEntity target) { this.world = world; this.target = target; }
         public boolean planning() { return planning; }
         public void defer(Bounds bounds, Runnable placement) {
-            if (placements.size() >= RebuildConfig.maxVolume) throw new IllegalStateException("Too many placement operations");
+            if (placements.size() >= RebuildConfig.maxRebuildVolume) throw new IllegalStateException("Too many placement operations");
             regions.add(bounds); placements.add(placement);
             log.line("PLAN_PIECE index=" + placements.size() + " bounds=" + bounds + " volume=" + bounds.volume());
         }
@@ -51,7 +51,7 @@ public final class RebuildEngine {
             if (planning) {
                 Bounds point = Bounds.point(x, y, z);
                 legacy = legacy == null ? point : legacy.union(point);
-                if (placements.size() >= RebuildConfig.maxVolume) throw new IllegalStateException("Too many placement operations");
+                if (placements.size() >= RebuildConfig.maxRebuildVolume) throw new IllegalStateException("Too many placement operations");
                 placements.add(() -> w.setBlock(x, y, z, block, meta, flags));
                 if (details()) log.line("PLAN_DIRECT at=" + position(x, y, z) + " block=" + blockName(block, meta) + " flags=" + flags);
                 return true;
@@ -91,9 +91,9 @@ public final class RebuildEngine {
             Bounds bounds = Bounds.enclosing(regions);
             long volume = bounds.volume();
             log.checkpoint("PLAN_END uniquePieces=" + regions.size() + " operations=" + placements.size()
-                + " bounds=" + bounds + " volume=" + volume + " limit=" + RebuildConfig.maxVolume);
-            if (volume > RebuildConfig.maxVolume) throw new IllegalStateException("Selected cuboid volume=" + volume
-                + " exceeds maxVisitedBlocks=" + RebuildConfig.maxVolume);
+                + " bounds=" + bounds + " volume=" + volume + " limit=" + RebuildConfig.maxRebuildVolume);
+            if (volume > RebuildConfig.maxRebuildVolume) throw new IllegalStateException("Selected cuboid volume=" + volume
+                + " exceeds maxRebuildVolume=" + RebuildConfig.maxRebuildVolume);
             if (bounds.minY < 0 || bounds.maxY >= world.getHeight()) throw new IllegalStateException("Structure extends outside world height");
             for (int cx = bounds.minX >> 4; cx <= bounds.maxX >> 4; cx++) for (int cz = bounds.minZ >> 4; cz <= bounds.maxZ >> 4; cz++) {
                 if (!world.getChunkProvider().chunkExists(cx, cz)) throw new IllegalStateException("Structure reaches unloaded chunk " + cx + "," + cz);
@@ -175,7 +175,7 @@ public final class RebuildEngine {
                 + " target=" + position(x, y, z) + " player=" + player.getCommandSenderName()
                 + " creative=" + player.capabilities.isCreativeMode + " sneaking=" + player.isSneaking()
                 + " blueprintCount=" + stack.stackSize + " blueprintTag=" + stack.getTagCompound());
-            session.log.line("CONFIG maxVisitedBlocks=" + RebuildConfig.maxVolume + " protectAllTileEntities="
+            session.log.line("CONFIG maxRebuildVolume=" + RebuildConfig.maxRebuildVolume + " protectAllTileEntities="
                 + RebuildConfig.protectTileEntities + " logBlockDecisions=" + RebuildConfig.logBlockDecisions);
             session.log.line("MOD_WHITELIST " + RebuildConfig.protectedMods);
             session.log.line("BLOCK_WHITELIST " + RebuildConfig.protectedBlocks);
