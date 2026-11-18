@@ -22,13 +22,64 @@ import java.util.*;
 public final class BuilderTasks extends WorldSavedData {
     private static final String NAME = "structurebuildernh_builds";
     final Map<String, BuildTask> jobs = new LinkedHashMap<>();
+    final ChannelMemory channelMemory = new ChannelMemory();
     final Map<String, Integer> viewers = new HashMap<>();
     private final Map<String, Integer> credits = new HashMap<>();
     private final Map<String, Integer> dispatchTurns = new HashMap<>();
+    private final Map<Integer, Map<Long, Set<PlacementLedger>>> watched = new HashMap<>();
+
+    void watch(int dim, long key, PlacementLedger ledger) {
+        watched.computeIfAbsent(dim, d -> new HashMap<>())
+                .computeIfAbsent(key, k -> new HashSet<>())
+                .add(ledger);
+    }
+
+    void unwatch(int dim, long key, PlacementLedger ledger) {
+        Map<Long, Set<PlacementLedger>> parts = watched.get(dim);
+        Set<PlacementLedger> ledgers = parts.get(key);
+        ledgers.remove(ledger);
+        if (ledgers.isEmpty()) parts.remove(key);
+        if (parts.isEmpty()) watched.remove(dim);
+    }
+
+    private void blockChanged(World world, int x, int y, int z) {
+        Map<Long, Set<PlacementLedger>> parts = watched.get(world.provider.dimensionId);
+        if (parts == null) return;
+        Set<PlacementLedger> ledgers = parts.get(PlacementLedger.key(x, y, z));
+        if (ledgers != null) {
+            // Forget may detach the last section entry while iterating these tasks.
+            for (PlacementLedger ledger : ledgers.toArray(new PlacementLedger[0]))
+                ledger.forget(x, y, z);
+        }
+    }
+
+    private final Set<String> autoRemoveOwners = new HashSet<>();
+
+    boolean autoRemove(EntityPlayerMP player) {
+        return autoRemoveOwners.contains(player.getUniqueID().toString());
+    }
+
+    void toggleAutoRemove(EntityPlayerMP player) {
+        String owner = player.getUniqueID().toString();
+        if (!autoRemoveOwners.remove(owner)) autoRemoveOwners.add(owner);
+        markDirty();
+    }
+
+    void completed(BuildTask task, EntityPlayerMP player, WorldServer world) {
+        if (!autoRemove(player)) return;
+        if (task.hasReserved() || task.savedLink != null) {
+            task.deleteRequested = true;
+            task.cancel(player, world);
+        } else remove(task, player);
+    }
+
     private int turn;
+    private int chunkLoadsLeft;
+    private final Map<String, BuildTask> unbound = new HashMap<>();
 
     public BuilderTasks(String name) {
         super(name);
+        com.Goderium.StructureBuilderNH.common.WorldHooks.trackedChanges = this::blockChanged;
     }
 
     static BuilderTasks get() {
@@ -55,6 +106,10 @@ public final class BuilderTasks extends WorldSavedData {
     BuildTask selected(EntityPlayer p, ItemStack stack) {
         if (stack == null || stack.getItem() != BuilderItem.ITEM) return null;
         BuildTask t = jobs.get(tag(stack).getString("selected"));
+        if (t == null) {
+            t = unbound.get(p.getUniqueID().toString());
+            if (t == null || !t.id.equals(tag(stack).getString("selected"))) return null;
+        }
         return owns(t, p, stack) ? t : null;
     }
 
@@ -89,17 +144,10 @@ public final class BuilderTasks extends WorldSavedData {
                     && t.y == y
                     && t.z == z
                     && t.state != BuildTask.State.DONE
-                    && t.state != BuildTask.State.REFUND) {
+                    && t.state != BuildTask.State.REFUND && t.state != BuildTask.State.DISMANTLED) {
                 select(stack, t);
                 return;
             }
-        // Reuse an untouched draft, so ordinary browsing does not accumulate empty tasks.
-        owned.removeIf(
-                t -> t.state != BuildTask.State.DRAFT || t.target != null || t.hasReserved());
-        for (BuildTask empty : owned) {
-            jobs.remove(empty.id);
-            viewers.remove(empty.id);
-        }
         BuildTask t =
                 new BuildTask(
                         this,
@@ -112,23 +160,53 @@ public final class BuilderTasks extends WorldSavedData {
                         z,
                         facing,
                         host != null);
-        if (host != null) t.target = host.getMetaTileEntity().getStackForm(1);
+        if (host != null) t.configureTarget(host.getMetaTileEntity().getStackForm(1));
         t.key = tag(stack).getString("network");
-        jobs.put(t.id, t);
+        if (host == null) unbound.put(t.owner, t);
+        else register(t);
         select(stack, t);
         markDirty();
     }
 
+    void unbind(BuildTask t) {
+        jobs.remove(t.id);
+        viewers.remove(t.id);
+        unbound.put(t.owner, t);
+        markDirty();
+    }
+
+    void register(BuildTask t) {
+        unbound.remove(t.owner, t);
+        jobs.put(t.id, t);
+        markDirty();
+    }
+
+    void remove(BuildTask t, EntityPlayerMP player) {
+        jobs.remove(t.id);
+        viewers.remove(t.id);
+        t.workChunks.release();
+        t.ledger.discard();
+        PreviewStream.stop(t, player);
+        markDirty();
+    }
+
     void touch(BuildTask t) {
+        if (t.target == null) return;
         viewers.put(t.id, turn);
     }
 
     public void readFromNBT(NBTTagCompound n) {
+        for (BuildTask t : jobs.values()) t.workChunks.release();
         jobs.clear();
+        watched.clear();
+        channelMemory.read(n);
+        autoRemoveOwners.clear();
+        NBTTagList owners = n.getTagList("autoRemoveOwners", 8);
+        for (int i = 0; i < owners.tagCount(); i++) autoRemoveOwners.add(owners.getStringTagAt(i));
         NBTTagList l = n.getTagList("jobs", 10);
         for (int i = 0; i < l.tagCount(); i++) {
             BuildTask t = BuildTask.load(this, l.getCompoundTagAt(i));
-            jobs.put(t.id, t);
+            if (t.target != null || t.hasReserved() || t.savedLink != null) jobs.put(t.id, t);
         }
     }
 
@@ -136,10 +214,21 @@ public final class BuilderTasks extends WorldSavedData {
         NBTTagList l = new NBTTagList();
         for (BuildTask t : jobs.values()) l.appendTag(t.save());
         n.setTag("jobs", l);
+        channelMemory.write(n);
+        NBTTagList owners = new NBTTagList();
+        for (String owner : autoRemoveOwners) owners.appendTag(new NBTTagString(owner));
+        n.setTag("autoRemoveOwners", owners);
+    }
+
+    boolean claimChunkLoad() {
+        if (chunkLoadsLeft <= 0) return false;
+        chunkLoadsLeft--;
+        return true;
     }
 
     private void tick() {
         turn++;
+        chunkLoadsLeft = 2;
         Map<String, EntityPlayerMP> players = new HashMap<>();
         Map<String, ItemStack> tools = new HashMap<>();
         for (Object o : MinecraftServer.getServer().getConfigurationManager().playerEntityList) {
@@ -150,6 +239,7 @@ public final class BuilderTasks extends WorldSavedData {
                 if (s != null && s.getItem() == BuilderItem.ITEM && s.hasTagCompound())
                     tools.put(id + s.getTagCompound().getString("tool"), s);
         }
+        unbound.keySet().retainAll(players.keySet());
         Map<String, List<BuildTask>> running = new LinkedHashMap<>();
         long deadline = System.nanoTime() + 4_000_000L;
         List<BuildTask> active = new ArrayList<>(jobs.values());
@@ -161,6 +251,9 @@ public final class BuilderTasks extends WorldSavedData {
             ItemStack item = tools.get(t.owner + t.tool);
             boolean present =
                     player != null && !player.isDead && player.worldObj == world && item != null;
+            boolean work = t.state == BuildTask.State.VERIFYING || t.state == BuildTask.State.SCANNING
+                    || t.state == BuildTask.State.QUEUED || t.state == BuildTask.State.BUILDING;
+            if (!present || (!work && t.state != BuildTask.State.DISMANTLING)) t.workChunks.release();
             if (world == null) {
                 if (t.order != null) t.detach();
                 continue;
@@ -189,24 +282,26 @@ public final class BuilderTasks extends WorldSavedData {
                     t.reason = player == null ? "offline" : "tool";
                 continue;
             }
+            if (t.state == BuildTask.State.DISMANTLING) {
+                running.computeIfAbsent(t.owner + t.tool, k -> new ArrayList<>()).add(t);
+                continue;
+            }
+            if (t.state == BuildTask.State.DISMANTLED || t.state == BuildTask.State.TEARDOWN_PAUSED) continue;
             if (t.state == BuildTask.State.REFUND) {
                 if (t.key.isEmpty()) t.key = tag(item).getString("network");
                 if (Math.floorMod(turn - t.id.hashCode(), 100) == 0
                         && (t.hasReserved() || t.savedLink != null)) t.retryRefund(player, world);
+                if (t.deleteRequested && !t.hasReserved() && t.savedLink == null) remove(t,player);
+                else t.beginDismantle();
                 continue;
             }
             if (!t.ordering()
                     && t.state != BuildTask.State.DONE
                     && t.state != BuildTask.State.REFUND
                     && t.held.rows.isEmpty()) t.key = tag(item).getString("network");
-            boolean work =
-                    t.state == BuildTask.State.VERIFYING
-                            || t.state == BuildTask.State.SCANNING
-                            || t.state == BuildTask.State.QUEUED
-                            || t.state == BuildTask.State.BUILDING;
             boolean viewed =
                     turn - viewers.getOrDefault(t.id, turn - 2000) < 30
-                            || PreviewStream.active(player, t);
+                            || t.previewLayers != 0;
             if (!work && !viewed) {
                 if (turn - viewers.getOrDefault(t.id, turn - 2000) > 600) t.plan = null;
                 continue;
@@ -240,8 +335,9 @@ public final class BuilderTasks extends WorldSavedData {
                 int share = (budget + remaining - 1) / remaining--;
                 EntityPlayerMP actor = players.get(t.owner);
                 try {
-                    budget -=
-                            t.build(actor, DimensionManager.getWorld(t.dim), share, buildDeadline);
+                    WorldServer w = DimensionManager.getWorld(t.dim);
+                    budget -= t.state == BuildTask.State.DISMANTLING
+                            ? t.dismantle(actor,w,item,share,buildDeadline) : t.build(actor,w,share,buildDeadline);
                 } catch (RuntimeException ex) {
                     failure(t, ex);
                 }
@@ -249,12 +345,12 @@ public final class BuilderTasks extends WorldSavedData {
         }
         credits.keySet().retainAll(running.keySet());
         dispatchTurns.keySet().retainAll(running.keySet());
-        PreviewStream.tick(players);
+        PreviewStream.tick(active, players, tools);
     }
 
     private void failure(BuildTask t, RuntimeException e) {
         StructureBuilderNH.LOG.warn("Cannot process builder task {}", t.id, e);
-        t.state = BuildTask.State.BLOCKED;
+        t.state = t.dismantleRequested ? BuildTask.State.TEARDOWN_PAUSED : BuildTask.State.BLOCKED;
         t.reason = "unsupported";
         t.plan = null;
         t.changed();
@@ -270,7 +366,11 @@ public final class BuilderTasks extends WorldSavedData {
 
     public static void shutdown() {
         if (DimensionManager.getWorld(0) != null)
-            for (BuildTask t : get().jobs.values()) t.detach();
+            for (BuildTask t : get().jobs.values()) {
+                t.workChunks.release();
+                t.detach();
+            }
+        com.Goderium.StructureBuilderNH.common.WorldHooks.trackedChanges = null;
         PreviewStream.clear();
     }
 }

@@ -28,19 +28,21 @@ import net.minecraft.world.*;
 import net.minecraft.world.chunk.*;
 
 import java.util.*;
+import java.util.function.IntPredicate;
 
 /** The native construct call describes the pieces. Only this isolated world defers their walks. */
 public final class Blueprint extends GTDummyWorld {
     final List<Section> sections = new ArrayList<>();
     private final Map<ChunkPosition, Section> index = new HashMap<>();
     private final Deque<Piece<?>> pieces = new ArrayDeque<>();
-    private final Map<IStructureElement<?>, Boolean> hatches = new IdentityHashMap<>();
+    private final Map<IStructureElement<?>, Integer> hatches = new IdentityHashMap<>();
     private final Map<IStructureElement<?>, Cell> last = new IdentityHashMap<>();
     final Materials bill = new Materials();
     final ItemStack trigger;
     final int x, y, z;
     final IMetaTileEntity controller;
     final AutoPlaceEnvironment env;
+    private final IntPredicate initiallyConfirmed;
     Bounds bounds;
     int size;
     private int[] positions = new int[1024];
@@ -54,6 +56,7 @@ public final class Blueprint extends GTDummyWorld {
         final int x, y, z, id;
         final Cell[] cells = new Cell[4096];
         final long[] solid = new long[64], hatch = new long[64];
+        final long[] confirmed = new long[64];
 
         Section(int x, int y, int z, int id) {
             this.x = x;
@@ -68,15 +71,18 @@ public final class Blueprint extends GTDummyWorld {
         final ItemStack item;
         final Block block;
         final int meta;
-        final boolean air, hatch;
+        final boolean air, hatch, inscribedRitual;
+        final int dots;
 
-        Cell(IStructureElement<Object> e, ItemStack s, Block b, int m, boolean a, boolean h) {
+        Cell(IStructureElement<Object> e, ItemStack s, Block b, int m, boolean a, int dots) {
             element = e;
             item = s;
             block = b;
+            inscribedRitual = isInscribedRitual(b, m);
             meta = m;
             air = a;
-            hatch = h;
+            this.dots = dots;
+            hatch = dots >= 0;
         }
     }
 
@@ -95,7 +101,9 @@ public final class Blueprint extends GTDummyWorld {
             int x,
             int y,
             int z,
-            EntityPlayer actor) {
+            EntityPlayer actor,
+            IntPredicate initiallyConfirmed) {
+        this.initiallyConfirmed = initiallyConfirmed;
         this.x = x;
         this.y = y;
         this.z = z;
@@ -114,7 +122,7 @@ public final class Blueprint extends GTDummyWorld {
         if (controller instanceof IAlignment) ((IAlignment) controller).setExtendedFacing(facing);
         if (controller instanceof INEIPreviewModifier)
             ((INEIPreviewModifier) controller).onPreviewConstruct(trigger);
-        put(x, y, z, new Cell(null, target, GregTechAPI.sBlockMachines, m, false, false));
+        put(x, y, z, new Cell(null, target, GregTechAPI.sBlockMachines, m, false, -1));
         ((IConstructable) controller).construct(trigger, false);
         if (pieces.isEmpty() && size <= 1)
             throw new IllegalArgumentException("Controller supplied no structure");
@@ -229,7 +237,7 @@ public final class Blueprint extends GTDummyWorld {
                             break;
                         }
                     }
-                if (item == null && choices != null && isHatch(e)) {
+                if (item == null && choices != null && hatches.computeIfAbsent(e, Blueprint::hatchDots) >= 0) {
                     Cell known = last.get(e);
                     if (known != null
                             && known.item != null
@@ -246,6 +254,9 @@ public final class Blueprint extends GTDummyWorld {
                 }
             }
         }
+        // Inscribed ritual stones have no obtainable item variant. Charge a blank and inscribe after placement.
+        if (isInscribedRitual(sample, meta))
+            item = new ItemStack(sample, 1, 0);
         Cell cell = last.get(e);
         if (cell == null
                 || cell.block != sample
@@ -258,10 +269,16 @@ public final class Blueprint extends GTDummyWorld {
                             sample,
                             meta,
                             air,
-                            hatches.computeIfAbsent(e, Blueprint::isHatch));
+                            hatches.computeIfAbsent(e, Blueprint::hatchDots));
             last.put(e, cell);
         }
         put(px, py, pz, cell);
+    }
+
+    private static boolean isInscribedRitual(Block block, int meta) {
+        return meta >= 1
+                && meta <= 6
+                && "AWWayofTime:ritualStone".equals(Block.blockRegistry.getNameForObject(block));
     }
 
     private static boolean allowsAir(IStructureElement<?> e) {
@@ -272,12 +289,42 @@ public final class Blueprint extends GTDummyWorld {
         return false;
     }
 
-    private static boolean isHatch(IStructureElement<?> e) {
-        if (e.getClass().getEnclosingClass() == HatchElementBuilder.class) return true;
-        if (e instanceof IStructureElementChain)
-            for (IStructureElement<?> child : ((IStructureElementChain<?>) e).fallbacks())
-                if (isHatch(child)) return true;
-        return false;
+    // GT's structure element captures its builder; getHint() is the native one-based dot count.
+    private static int hatchDots(IStructureElement<?> e) {
+        if (e.getClass().getEnclosingClass() == HatchElementBuilder.class) {
+            for (java.lang.reflect.Field field : e.getClass().getDeclaredFields()) {
+                if (field.getType() != HatchElementBuilder.class) continue;
+                try {
+                    field.setAccessible(true);
+                    return Math.max(
+                            0, Math.min(16, ((HatchElementBuilder<?>) field.get(e)).getHint()));
+                } catch (ReflectiveOperationException ignored) {
+                    break;
+                }
+            }
+            return 0;
+        }
+        if (e.getClass().getEnclosingClass() == gregtech.api.util.GTStructureUtility.class
+                && e.getClass().getEnclosingMethod() != null
+                && "ofHatchAdder".equals(e.getClass().getEnclosingMethod().getName())) {
+            try {
+                java.lang.reflect.Field block = e.getClass().getDeclaredField("val$aHintBlock");
+                java.lang.reflect.Field meta = e.getClass().getDeclaredField("val$aHintMeta");
+                block.setAccessible(true);
+                meta.setAccessible(true);
+                if (block.get(e) == StructureLibAPI.getBlockHint())
+                    return Math.max(0, Math.min(16, meta.getInt(e) + 1));
+            } catch (ReflectiveOperationException ignored) {
+            }
+            return 0;
+        }
+        if (e instanceof IStructureElementChain) {
+            for (IStructureElement<?> child : ((IStructureElementChain<?>) e).fallbacks()) {
+                int dots = hatchDots(child);
+                if (dots >= 0) return dots;
+            }
+        }
+        return -1;
     }
 
     private void put(int px, int py, int pz, Cell cell) {
@@ -292,6 +339,7 @@ public final class Blueprint extends GTDummyWorld {
         Cell old = s.cells[i];
         if (old == null) {
             if (size == positions.length) positions = Arrays.copyOf(positions, size * 2);
+            if (initiallyConfirmed.test(size)) s.confirmed[i >> 6] |= 1L << (i & 63);
             positions[size++] = s.id << 12 | i;
         } else if (old.item != null) bill.add(old.item, -1);
         s.cells[i] = cell;
@@ -304,6 +352,15 @@ public final class Blueprint extends GTDummyWorld {
 
     private static int slot(int x, int y, int z) {
         return (x & 15) | ((z & 15) << 4) | ((y & 15) << 8);
+    }
+
+    Section setConfirmed(int cursor, boolean value) {
+        int pos = positions[cursor], i = pos & 4095;
+        Section section = sections.get(pos >>> 12);
+        long bit = 1L << (i & 63);
+        if (value) section.confirmed[i >> 6] |= bit;
+        else section.confirmed[i >> 6] &= ~bit;
+        return section;
     }
 
     Cell at(int cursor, int[] xyz) {

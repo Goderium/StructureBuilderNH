@@ -2,6 +2,8 @@ package com.Goderium.StructureBuilderNH.mixin;
 
 import com.Goderium.StructureBuilderNH.common.WorldHooks;
 import net.minecraft.block.Block;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.item.EntityItem;
 import net.minecraft.tileentity.TileEntity;
 import net.minecraft.world.World;
 import org.spongepowered.asm.mixin.Mixin;
@@ -12,6 +14,14 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 @Mixin(value = World.class, remap = false)
 public abstract class WorldMixin {
+    @Inject(method = {"spawnEntityInWorld", "func_72838_d"}, at = @At("HEAD"),
+        cancellable = true, require = 1, allow = 1, remap = false)
+    private void builder$captureDismantleDrop(Entity entity, CallbackInfoReturnable<Boolean> result) {
+        if (!(entity instanceof EntityItem)) return;
+        WorldHooks.ItemDropSink sink = WorldHooks.DISMANTLE_DROPS.get();
+        if (sink != null && sink.accept((World) (Object) this, ((EntityItem) entity).getEntityItem()))
+            result.setReturnValue(true);
+    }
     @Inject(method = {"setBlock(IIILnet/minecraft/block/Block;II)Z", "func_147465_d(IIILnet/minecraft/block/Block;II)Z"},
         at = @At("HEAD"), cancellable = true, require = 1, allow = 1, remap = false)
     private void rebuild$set(int x, int y, int z, Block block, int meta, int flags, CallbackInfoReturnable<Boolean> cir) {

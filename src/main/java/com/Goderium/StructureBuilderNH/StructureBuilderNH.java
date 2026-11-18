@@ -14,7 +14,12 @@ import cpw.mods.fml.common.event.FMLPreInitializationEvent;
 import cpw.mods.fml.common.event.FMLServerStoppingEvent;
 import cpw.mods.fml.common.registry.GameRegistry;
 
+import gregtech.api.enums.ItemList;
+
 import net.minecraft.item.ItemStack;
+import net.minecraftforge.common.ForgeChunkManager;
+
+import java.io.IOException;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -27,6 +32,9 @@ import org.apache.logging.log4j.Logger;
                 "required-after:gregtech;required-after:structurelib;required-after:appliedenergistics2;required-after:modularui2",
         acceptableRemoteVersions = "*")
 public class StructureBuilderNH {
+    @Mod.Instance("structurebuildernh")
+    public static StructureBuilderNH instance;
+
     @SidedProxy(
             clientSide = "com.Goderium.StructureBuilderNH.client.BuilderRenderer",
             serverSide = "com.Goderium.StructureBuilderNH.common.BuilderProxy")
@@ -47,8 +55,9 @@ public class StructureBuilderNH {
         if (terminal != null)
             GameRegistry.addShapelessRecipe(
                     new ItemStack(BuilderItem.ITEM),
-                    StructureLibAPI.getDefaultHologramItem(),
-                    terminal);
+                    terminal,
+                    ItemList.Energy_LapotronicOrb2.get(1),
+                    StructureLibAPI.getDefaultHologramItem());
     }
 
     @Mod.EventHandler
@@ -59,7 +68,10 @@ public class StructureBuilderNH {
     public static final Logger LOG = LogManager.getLogger("StructureBuilderNH");
 
     @Mod.EventHandler
-    public void preInit(FMLPreInitializationEvent event) {
+    public void preInit(FMLPreInitializationEvent event) throws IOException {
+        // Work tickets are temporary. Resumed tasks acquire fresh ones after their owner returns.
+        ForgeChunkManager.setForcedChunkLoadingCallback(this,
+                (tickets, world) -> tickets.forEach(ForgeChunkManager::releaseTicket));
         BuilderItem.register();
         RebuildConfig.load(event.getSuggestedConfigurationFile());
         StructureLibAPI.registerChannelDescription(

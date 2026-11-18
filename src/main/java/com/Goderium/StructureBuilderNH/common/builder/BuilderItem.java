@@ -27,6 +27,7 @@ import java.util.List;
 
 public final class BuilderItem extends Item
         implements IGuiHolder<PlayerInventoryGuiData>, INetworkEncodable {
+    static final int MAX_RATE = 16_384;
     public static final BuilderItem ITEM = new BuilderItem();
     static final Item RECEIPT =
             new Item() {
@@ -37,9 +38,8 @@ public final class BuilderItem extends Item
                                     ? ItemStack.loadItemStackFromNBT(
                                             s.getTagCompound().getCompoundTag("controller"))
                                     : null;
-                    return StatCollector.translateToLocalFormatted(
-                            "structurebuildernh.receipt",
-                            machine == null ? "" : machine.getDisplayName());
+                    return machine == null ? super.getItemStackDisplayName(s)
+                            : StatCollector.translateToLocalFormatted("structurebuildernh.receipt", machine.getDisplayName());
                 }
             }.setUnlocalizedName("sbnh.materials")
                     .setTextureName("structurelib:itemConstructableTrigger");
@@ -47,7 +47,7 @@ public final class BuilderItem extends Item
     private BuilderItem() {
         setMaxStackSize(1);
         setUnlocalizedName("sbnh.builder");
-        setTextureName("structurelib:itemConstructableTrigger");
+        setTextureName("structurebuildernh:wireless_structure_terminal");
     }
 
     public static void register() {
@@ -67,22 +67,22 @@ public final class BuilderItem extends Item
 
     static int rate(ItemStack s) {
         return s.hasTagCompound() && s.getTagCompound().hasKey("rate")
-                ? Math.max(1, Math.min(4096, s.getTagCompound().getInteger("rate")))
+                ? clampRate(s.getTagCompound().getInteger("rate"))
                 : 256;
     }
 
-    private static ExtendedFacing facing(EntityPlayer p) {
+    static int clampRate(int rate) {
+        return Math.max(1, Math.min(MAX_RATE, rate));
+    }
+
+    private static ExtendedFacing facingPlayer(EntityPlayer p) {
         ForgeDirection[] dirs = {
             ForgeDirection.SOUTH, ForgeDirection.WEST, ForgeDirection.NORTH, ForgeDirection.EAST
         };
-        return ExtendedFacing.of(
-                p.rotationPitch > 65
-                        ? ForgeDirection.DOWN
-                        : p.rotationPitch < -65
-                                ? ForgeDirection.UP
-                                : dirs[
-                                        MathHelper.floor_double(p.rotationYaw * 4. / 360. + .5)
-                                                & 3]);
+        int horizontal = MathHelper.floor_double(p.rotationYaw / 90.0 + 0.5) & 3;
+        ForgeDirection look = p.rotationPitch > 65 ? ForgeDirection.DOWN
+                : p.rotationPitch < -65 ? ForgeDirection.UP : dirs[horizontal];
+        return ExtendedFacing.of(look.getOpposite());
     }
 
     @Override
@@ -106,7 +106,7 @@ public final class BuilderItem extends Item
                     instanceof com.gtnewhorizon.structurelib.alignment.constructable.IConstructable)
                 host = gt;
         }
-        ExtendedFacing f = facing(p);
+        ExtendedFacing f = facingPlayer(p);
         if (host == null) {
             ForgeDirection d = ForgeDirection.getOrientation(side);
             x += d.offsetX;
@@ -127,16 +127,7 @@ public final class BuilderItem extends Item
     public ItemStack onItemRightClick(ItemStack s, World w, EntityPlayer p) {
         if (!w.isRemote && getMovingObjectPositionFromPlayer(w, p, false) == null) {
             BuilderTasks.tag(s).setBoolean("openQueue", p.isSneaking());
-            if (!p.isSneaking())
-                BuilderTasks.get()
-                        .create(
-                                p,
-                                s,
-                                MathHelper.floor_double(p.posX),
-                                MathHelper.floor_double(p.boundingBox.minY),
-                                MathHelper.floor_double(p.posZ),
-                                null,
-                                facing(p));
+            if (!p.isSneaking()) selectAtFeet(p, s);
             else if (BuilderTasks.get().selected(p, s) == null) {
                 List<BuildTask> tasks = BuilderTasks.get().list(p, s);
                 if (!tasks.isEmpty()) BuilderTasks.get().select(s, tasks.get(0));
@@ -144,6 +135,12 @@ public final class BuilderItem extends Item
             PlayerInventoryGuiFactory.INSTANCE.openFromMainHand(p);
         }
         return s;
+    }
+
+    static void selectAtFeet(EntityPlayer player, ItemStack blueprint) {
+        BuilderTasks.get().create(player, blueprint, MathHelper.floor_double(player.posX),
+                MathHelper.floor_double(player.boundingBox.minY), MathHelper.floor_double(player.posZ),
+                null, facingPlayer(player));
     }
 
     @Override
@@ -162,6 +159,7 @@ public final class BuilderItem extends Item
     @Override
     public void addInformation(ItemStack s, EntityPlayer p, List lines, boolean advanced) {
         lines.add(StatCollector.translateToLocal("structurebuildernh.help"));
+        lines.add(StatCollector.translateToLocal("structurebuildernh.helpAir"));
         lines.add(
                 StatCollector.translateToLocal(
                         getEncryptionKey(s).isEmpty()

@@ -1,6 +1,6 @@
 package com.Goderium.StructureBuilderNH.loader;
 
-import java.util.Collections;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -17,5 +17,5 @@ public class EarlyLoader implements IFMLLoadingPlugin, IEarlyMixinLoader {
     public void injectData(Map<String, Object> data) { }
     public String getAccessTransformerClass() { return null; }
     public String getMixinConfig() { return "mixins.structurebuildernh.early.json"; }
-    public List<String> getMixins(Set<String> mods) { return Collections.singletonList("WorldMixin"); }
+    public List<String> getMixins(Set<String> mods) { return Arrays.asList("WorldMixin", "PlacementChunkMixin"); }
 }

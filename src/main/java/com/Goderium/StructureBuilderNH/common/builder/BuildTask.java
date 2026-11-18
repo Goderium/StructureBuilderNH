@@ -22,6 +22,7 @@ import java.util.*;
 final class BuildTask {
     enum State {
         DRAFT,
+        PREVIEW,
         SCANNING,
         MISSING,
         PLANNING,
@@ -33,9 +34,12 @@ final class BuildTask {
         VERIFYING,
         BLOCKED,
         DONE,
-        REFUND
+        REFUND, DISMANTLING, TEARDOWN_PAUSED, DISMANTLED
     }
 
+    final PlacementLedger ledger = new PlacementLedger(this);
+    final TaskChunks workChunks = new TaskChunks();
+    boolean deleteRequested, dismantleRequested;
     final BuilderTasks store;
     final String id, owner, tool;
     final int dim, x, y, z;
@@ -44,11 +48,23 @@ final class BuildTask {
     String key = "", orderId = "", detail = "", reason = "";
     State state = State.DRAFT;
     boolean auto, received;
+    ChunkCoordinates issue;
+
+    void pointAt(int x, int y, int z) {
+        if (issue == null || issue.posX != x || issue.posY != y || issue.posZ != z) {
+            issue = new ChunkCoordinates(x, y, z);
+            changed();
+        }
+    }
+
     ItemStack target;
     int tier = 1, cursor, total, placed, revision;
+    int previewLayers;
+    NBTTagCompound pendingDefaults = new NBTTagCompound();
     NBTTagCompound channels = new NBTTagCompound(), savedLink;
     final Materials needed = new Materials(),
             held = new Materials(),
+            salvage = new Materials(),
             backpack = new Materials(),
             shortage = new Materials(),
             orderItems = new Materials(),
@@ -60,6 +76,21 @@ final class BuildTask {
     MaterialOrder order;
     private final int[] xyz = new int[3];
     private BitSet pending = new BitSet();
+    private BitSet confirmed = new BitSet();
+    private long nextSalvageRetry;
+
+    private boolean initiallyConfirmed(int index) {
+        // Older tasks that finished scanning stored only the complementary pending mask.
+        return confirmed == null ? !pending.get(index) : confirmed.get(index);
+    }
+
+    private void confirm(int index, boolean matches) {
+        if (confirmed.get(index) == matches) return;
+        confirmed.set(index, matches);
+        Blueprint.Section section = plan.setConfirmed(index, matches);
+        PreviewStream.changed(this, section);
+        changed();
+    }
 
     BuildTask(
             BuilderTasks s,
@@ -90,21 +121,45 @@ final class BuildTask {
 
     void resetPlan() {
         plan = null;
+        confirmed = new BitSet();
         revision++;
         reason = "";
+        issue = null;
         changed();
     }
 
     boolean editable() {
-        return state == State.DRAFT || state == State.MISSING && !hasReserved();
+        return state == State.DRAFT || state == State.PREVIEW || state == State.MISSING && !hasReserved();
+    }
+
+    void configureTarget(ItemStack stack) {
+        target = ItemStack.copyItemStack(stack);
+        if (target == null) previewLayers = 0;
+        else target.stackSize = 1;
+        observedChannels.clear();
+        store.channelMemory.restore(this);
+        resetDraft();
+    }
+
+    void resetDraft() {
+        state = previewLayers == 0 ? State.DRAFT : State.PREVIEW;
+        resetPlan();
+    }
+
+    void togglePreview(int layer) {
+        if (target == null || state == State.DONE || state == State.REFUND || dismantleRequested || state == State.DISMANTLED) return;
+        previewLayers ^= layer;
+        if (state == State.DRAFT || state == State.PREVIEW)
+            state = previewLayers == 0 ? State.DRAFT : State.PREVIEW;
+        changed();
     }
 
     List<IChannelDefinition> definitions() {
         if (Blueprint.prototype(target) == null) return Collections.emptyList();
         IStructureDefinition<?> def =
                 ((IConstructable) Blueprint.prototype(target)).getStructureDefinition();
-        if (def == null) return Collections.emptyList();
-        List<IChannelDefinition> list = new ArrayList<>(def.getChannelDefinitions());
+        List<IChannelDefinition> list = new ArrayList<>();
+        if (def != null) list.addAll(def.getChannelDefinitions());
         Set<String> extra = new HashSet<>(observedChannels);
         for (IChannelDefinition d : list) extra.remove(d.getChannel());
         for (String id : extra) list.add(IChannelDefinition.unbounded(id));
@@ -117,6 +172,7 @@ final class BuildTask {
     void prepare(EntityPlayerMP actor, long deadline) {
         if (target == null || "unsupported".equals(reason)) return;
         if (plan != null && plan.ready) return;
+        int known = observedChannels.size();
         ChannelProbe.begin(observedChannels);
         try {
             if (plan == null) {
@@ -129,11 +185,24 @@ final class BuildTask {
                 }
                 if (!channels.hasKey("chisel"))
                     ChannelDataAccessor.setChannelData(trigger, "chisel", 1);
-                plan = new Blueprint(target, trigger, facing, x, y, z, actor);
+                plan = new Blueprint(target, trigger, facing, x, y, z, actor, this::initiallyConfirmed);
             }
             if (!plan.ready) plan.advance(deadline);
+            if (plan.ready && confirmed == null) {
+                confirmed = new BitSet(plan.size);
+                confirmed.set(0, plan.size);
+                confirmed.andNot(pending);
+                changed();
+            }
         } finally {
             ChannelProbe.end();
+        }
+        if (!pendingDefaults.hasNoTags() && known != observedChannels.size()
+                && ChannelMemory.applyKnown(this)) {
+            resetPlan();
+        } else if (plan.ready && !pendingDefaults.hasNoTags()) {
+            pendingDefaults = new NBTTagCompound();
+            changed();
         }
     }
 
@@ -153,9 +222,11 @@ final class BuildTask {
             changed();
             return;
         }
-        if (state != State.DRAFT && state != State.MISSING && state != State.BLOCKED) return;
+        if (state != State.DRAFT && state != State.PREVIEW && state != State.MISSING && state != State.BLOCKED) return;
         if (target == null) return;
+        if (confirmed == null) resetPlan();
         if (state != State.BLOCKED) placed = 0;
+        issue = null;
         state = State.SCANNING;
         cursor = 0;
         total = placed;
@@ -185,6 +256,7 @@ final class BuildTask {
                                 pz,
                                 new ChatComponentTranslation("structurebuildernh." + why)));
         }
+        pointAt(px, py, pz);
         reason = why;
         detail = px + ", " + py + ", " + pz;
         state = State.BLOCKED;
@@ -201,6 +273,28 @@ final class BuildTask {
                         || ((IAlignment) gt.getMetaTileEntity()).getExtendedFacing() == facing);
     }
 
+    private boolean requireChunk(WorldServer world, int px, int py, int pz) {
+        if (py < 0 || py >= world.getHeight() || px < -30000000 || px >= 30000000
+                || pz < -30000000 || pz >= 30000000) {
+            boolean teardown = state == State.DISMANTLING;
+            stop(py < 0 || py >= world.getHeight() ? "height" : "outsideWorld", px, py, pz);
+            if (teardown) state = State.TEARDOWN_PAUSED;
+            return false;
+        }
+        if (!world.blockExists(px, py, pz) && !workChunks.load(this, world, px >> 4, pz >> 4)) {
+            reason = "unloaded";
+            pointAt(px, py, pz);
+            return false;
+        }
+        if ("unloaded".equals(reason) && issue != null
+                && (issue.posX >> 4) == (px >> 4) && (issue.posZ >> 4) == (pz >> 4)) {
+            reason = "";
+            issue = null;
+            changed();
+        }
+        return true;
+    }
+
     void scan(EntityPlayerMP actor, WorldServer world, long deadline) {
         if (plan == null || !plan.ready) return;
         for (int n = 0;
@@ -208,26 +302,24 @@ final class BuildTask {
                 n++, cursor++) {
             Blueprint.Cell c = plan.at(cursor, xyz);
             int px = xyz[0], py = xyz[1], pz = xyz[2];
-            if (py < 0 || py >= world.getHeight()) {
-                stop("height", px, py, pz);
-                return;
-            }
-            if (!world.blockExists(px, py, pz)) {
-                reason = "unloaded";
-                return;
-            }
-            if (cursor == 0 && anchorValid(world)) continue;
+            if (!requireChunk(world, px, py, pz)) return;
+            boolean matches = cursor == 0 ? anchorValid(world) : plan.matches(c, world, px, py, pz);
+            if (!c.air) confirm(cursor, matches);
+            if (matches) continue;
             if (cursor == 0
                     && (existing || !plan.controller.isFacingValid(facing.getDirection()))) {
                 stop("anchor", px, py, pz);
                 return;
             }
-            if (cursor != 0 && plan.matches(c, world, px, py, pz)) continue;
-            if (!world.isAirBlock(px, py, pz) || c.item == null) {
+            boolean blankRitual =
+                    c.inscribedRitual
+                            && world.getBlock(px, py, pz) == c.block
+                            && world.getBlockMetadata(px, py, pz) == 0;
+            if ((!blankRitual && !world.isAirBlock(px, py, pz)) || c.item == null) {
                 stop("obstruction", px, py, pz);
                 return;
             }
-            needed.add(c.item, 1);
+            if (!blankRitual) needed.add(c.item, 1);
             pending.set(cursor);
             total++;
         }
@@ -261,7 +353,7 @@ final class BuildTask {
     }
 
     boolean hasReserved() {
-        return !backpack.rows.isEmpty() || !held.rows.isEmpty();
+        return !backpack.rows.isEmpty() || !held.rows.isEmpty() || !salvage.rows.isEmpty();
     }
 
     int reserved(ItemStack item) {
@@ -423,9 +515,11 @@ final class BuildTask {
         boolean manualRecovery = state == State.REFUND && key.isEmpty();
         if (state != State.REFUND) {
             state = State.REFUND;
+            previewLayers = 0;
             funding.clear();
             plan = null;
             reason = "";
+            issue = null;
             detail = "";
             // Preserve a detached link until its CPU can see the cancellation.
             if (order != null) order.saveLink();
@@ -437,7 +531,7 @@ final class BuildTask {
             revision++;
             changed();
         }
-        retryRefund(actor, world);
+        if (world != null && actor.worldObj == world) retryRefund(actor, world);
     }
 
     void retryRefund(EntityPlayerMP actor, WorldServer world) {
@@ -453,12 +547,11 @@ final class BuildTask {
         String status = "";
         if (hasReserved()) {
             Wireless net = Wireless.find(this, world, actor);
-            if (key.isEmpty()) status = "refundUnbound";
-            else if (net == null) status = "network";
-            else if (!net.allows(SecurityPermissions.INJECT)) status = "refundPermission";
-            else {
+            status = depositProblem(net, !salvage.rows.isEmpty());
+            if (status.isEmpty()) {
                 deposit(net, held);
                 deposit(net, backpack);
+                deposit(net, salvage);
                 if (hasReserved()) status = "refundSpace";
             }
         }
@@ -503,6 +596,87 @@ final class BuildTask {
             held.add(e.item, -giveToInventory(actor, e.item, e.count));
     }
 
+    void requestDismantle(EntityPlayerMP actor, WorldServer world) {
+        if (ledger.count == 0 || state == State.DISMANTLING) return;
+        deleteRequested = false;
+        dismantleRequested = true;
+        if (state != State.REFUND) cancel(actor, world);
+        beginDismantle();
+        changed();
+    }
+
+    void beginDismantle() {
+        if (!dismantleRequested || state != State.REFUND || hasReserved() || savedLink != null)
+            return;
+        state = State.DISMANTLING;
+        total = ledger.count;
+        placed = 0;
+        reason = detail = "";
+        issue = null;
+        changed();
+    }
+
+    int dismantle(EntityPlayerMP actor, WorldServer world, ItemStack blueprint, int budget, long deadline) {
+        int used = 0;
+        if (world.getTotalWorldTime() < nextSalvageRetry) return 0;
+        if (key.isEmpty()) key = BuilderTasks.tag(blueprint).getString("network");
+        // A wireless access point at the build site can itself be in the unloaded controller chunk.
+        if (!key.isEmpty() && !requireChunk(world, x, y, z)) return 0;
+        Wireless net = Wireless.find(this, world, actor);
+        if ((!actor.capabilities.isCreativeMode || !salvage.rows.isEmpty()) && !returnSalvage(net, world)) return 0;
+        while (ledger.count > 0 && used < budget && System.nanoTime() < deadline) {
+            ChunkCoordinates p = ledger.next();
+            int x = p.posX, y = p.posY, z = p.posZ;
+            if (!requireChunk(world, x, y, z)) break;
+            if (ledger.matches(world, x, y, z) && !ledger.harvest(actor, world, blueprint, x, y, z)) {
+                stop("harvest", x, y, z);
+                state = State.TEARDOWN_PAUSED;
+                changed();
+                break;
+            }
+            ledger.forget(x, y, z);
+            used++;
+            reason = "";
+            placed = total - ledger.count;
+            changed();
+            if (!salvage.rows.isEmpty() && !returnSalvage(net, world)) break;
+        }
+        if (ledger.count == 0 && salvage.rows.isEmpty()) {
+            placed = total;
+            state = State.DISMANTLED;
+            dismantleRequested = false;
+            reason = detail = "";
+            issue = null;
+            notify(actor, "dismantled");
+            changed();
+            store.completed(this, actor, world);
+        }
+        return used;
+    }
+
+    private String depositProblem(Wireless net, boolean requiresME) {
+        if (key.isEmpty()) return requiresME ? "dismantleUnbound" : "refundUnbound";
+        if (net == null || !net.node.isActive() || net.node.getGrid() != net.grid) return "network";
+        return net.allows(SecurityPermissions.INJECT) ? "" : "refundPermission";
+    }
+
+    private boolean returnSalvage(Wireless net, WorldServer world) {
+        String status = depositProblem(net, true);
+        if (status.isEmpty() && !salvage.rows.isEmpty()) {
+            deposit(net, salvage);
+            if (!salvage.rows.isEmpty()) status = "refundSpace";
+        }
+        if (!status.equals(reason)) {
+            reason = status;
+            changed();
+        }
+        if (!status.isEmpty()) {
+            if (!"network".equals(status)) workChunks.release();
+            nextSalvageRetry = world.getTotalWorldTime() + 20;
+        }
+        return status.isEmpty();
+    }
+
     void verify(EntityPlayerMP actor, WorldServer world, long deadline) {
         if (plan == null || !plan.ready) return;
         for (int n = 0;
@@ -510,11 +684,10 @@ final class BuildTask {
                 n++, cursor++) {
             Blueprint.Cell c = plan.at(cursor, xyz);
             int px = xyz[0], py = xyz[1], pz = xyz[2];
-            if (!world.blockExists(px, py, pz)) {
-                reason = "unloaded";
-                return;
-            }
-            if (cursor == 0 ? !anchorValid(world) : !plan.matches(c, world, px, py, pz)) {
+            if (!requireChunk(world, px, py, pz)) return;
+            boolean matches = cursor == 0 ? anchorValid(world) : plan.matches(c, world, px, py, pz);
+            if (!c.air) confirm(cursor, matches);
+            if (!matches) {
                 stop("obstruction", px, py, pz);
                 return;
             }
@@ -527,21 +700,23 @@ final class BuildTask {
         refund(Wireless.find(this, world, actor));
         returnBackpack(actor);
         funding.clear();
+        confirmed = new BitSet();
+        issue = null;
         state = State.DONE;
+        previewLayers = 0;
         reason = "";
         changed();
         notify(actor, "done");
         plan = null;
+        store.completed(this, actor, world);
     }
 
     int build(EntityPlayerMP actor, WorldServer world, int budget, long deadline) {
         if (plan == null || !plan.ready || budget <= 0) return 0;
         boolean creative = actor.capabilities.isCreativeMode;
-        if (!world.blockExists(x, y, z)) {
-            reason = "unloaded";
-            return 0;
-        }
+        if (!requireChunk(world, x, y, z)) return 0;
         if (cursor > 0 && !anchorValid(world)) {
+            confirm(0, false);
             stop("anchor", x, y, z);
             return 0;
         }
@@ -553,29 +728,36 @@ final class BuildTask {
                 n++, cursor++) {
             Blueprint.Cell c = plan.at(cursor, xyz);
             int px = xyz[0], py = xyz[1], pz = xyz[2];
-            if (!world.blockExists(px, py, pz)) {
-                reason = "unloaded";
-                break;
-            }
-            if (cursor == 0 ? anchorValid(world) : plan.matches(c, world, px, py, pz)) {
+            if (!requireChunk(world, px, py, pz)) break;
+            boolean matches = cursor == 0 ? anchorValid(world) : plan.matches(c, world, px, py, pz);
+            if (!c.air) confirm(cursor, matches);
+            if (matches) {
                 if (pending.get(cursor)) {
                     placed++;
                     pending.clear(cursor);
                 }
                 continue;
             }
-            if (cursor == 0 && existing || c.item == null || !world.isAirBlock(px, py, pz)) {
+            boolean blankRitual =
+                    c.inscribedRitual
+                            && world.getBlock(px, py, pz) == c.block
+                            && world.getBlockMetadata(px, py, pz) == 0;
+            if (cursor == 0 && existing
+                    || c.item == null
+                    || !blankRitual && !world.isAirBlock(px, py, pz)) {
                 stop("obstruction", px, py, pz);
                 break;
             }
-            ItemStack input = creative ? null : funding.next(c.item);
+            ItemStack input = creative || blankRitual ? null : funding.next(c.item);
             if (!creative
+                    && !blankRitual
                     && (input == null || backpack.count(input) == 0 && held.count(input) == 0)) {
                 stop("rescan", px, py, pz);
                 break;
             }
             if (!world.checkNoEntityCollision(
                     AxisAlignedBB.getBoundingBox(px, py, pz, px + 1, py + 1, pz + 1))) {
+                pointAt(px, py, pz);
                 reason = "occupied";
                 break;
             }
@@ -584,13 +766,37 @@ final class BuildTask {
                 stop("denied", px, py, pz);
                 break;
             }
+            if (blankRitual) {
+                net.minecraftforge.event.entity.player.PlayerInteractEvent interaction =
+                        net.minecraftforge.event.ForgeEventFactory.onPlayerInteract(
+                                actor,
+                                net.minecraftforge.event.entity.player.PlayerInteractEvent.Action
+                                        .RIGHT_CLICK_BLOCK,
+                                px,
+                                py,
+                                pz,
+                                1,
+                                world);
+                if (interaction.isCanceled()
+                        || interaction.useBlock
+                                == cpw.mods.fml.common.eventhandler.Event.Result.DENY) {
+                    stop("denied", px, py, pz);
+                    break;
+                }
+            }
             ItemStack unit = c.item.copy();
             unit.stackSize = 1;
-            if (!unit.tryPlaceItemIntoWorld(actor, world, px, py, pz, 1, .5f, .5f, .5f)) {
+            if (!blankRitual
+                    && !unit.tryPlaceItemIntoWorld(actor, world, px, py, pz, 1, .5f, .5f, .5f)) {
                 stop("denied", px, py, pz);
                 break;
             }
-            if (!creative) {
+            if (c.inscribedRitual
+                    && world.getBlock(px, py, pz) == c.block
+                    && world.getBlockMetadata(px, py, pz) == 0) {
+                world.setBlockMetadataWithNotify(px, py, pz, c.meta, 3);
+            }
+            if (!creative && !blankRitual) {
                 if (backpack.count(input) > 0) backpack.add(input, -1);
                 else held.add(input, -1);
                 funding.add(c.item, input, -1);
@@ -616,6 +822,8 @@ final class BuildTask {
                 stop("obstruction", px, py, pz);
                 break;
             }
+            if (!blankRitual && !c.air) ledger.record(world, px, py, pz);
+            if (!c.air) confirm(cursor, true);
         }
         changed();
         if (cursor >= plan.size) {
@@ -628,6 +836,9 @@ final class BuildTask {
 
     NBTTagCompound save() {
         NBTTagCompound n = new NBTTagCompound();
+        if (ledger.count > 0) n.setTag("placements", ledger.save());
+        n.setBoolean("deleteRequested",deleteRequested);
+        n.setBoolean("dismantleRequested",dismantleRequested);
         n.setString("id", id);
         n.setString("owner", owner);
         n.setString("tool", tool);
@@ -641,13 +852,17 @@ final class BuildTask {
         n.setString("state", state.name());
         n.setString("reason", reason);
         n.setString("detail", detail);
+        if (issue != null) n.setIntArray("issue", new int[]{issue.posX, issue.posY, issue.posZ});
         n.setBoolean("auto", auto);
         n.setBoolean("received", received);
         n.setInteger("tier", tier);
+        n.setByte("previewLayers", (byte) previewLayers);
+        if (!pendingDefaults.hasNoTags()) n.setTag("pendingDefaults", pendingDefaults);
         n.setInteger("cursor", cursor);
         n.setInteger("total", total);
         n.setInteger("placed", placed);
         n.setByteArray("pending", pending.toByteArray());
+        if (confirmed != null) n.setByteArray("previewConfirmed", confirmed.toByteArray());
         n.setTag("channels", channels);
         if (target != null) n.setTag("target", target.writeToNBT(new NBTTagCompound()));
         n.setTag("backpack", backpack.save());
@@ -655,6 +870,7 @@ final class BuildTask {
         n.setTag("orderFunding", orderFunding.save());
         n.setTag("needed", needed.save());
         n.setTag("held", held.save());
+        if (!salvage.rows.isEmpty()) n.setTag("salvage", salvage.save());
         n.setTag("short", shortage.save());
         n.setTag("order", orderItems.save());
         n.setTag("errors", errors.save());
@@ -677,21 +893,59 @@ final class BuildTask {
                         n.getInteger("z"),
                         ExtendedFacing.byIndex(n.getInteger("facing")),
                         n.getBoolean("existing"));
+        t.ledger.load(n.getCompoundTag("placements"));
+        t.deleteRequested = n.getBoolean("deleteRequested");
+        t.dismantleRequested = n.getBoolean("dismantleRequested");
         t.key = n.getString("key");
         t.state = State.valueOf(n.getString("state"));
         t.reason = n.getString("reason");
+        if (t.state == State.DISMANTLING && "harvestTool".equals(t.reason)) t.reason = "";
         t.detail = n.getString("detail");
+        int[] problem = n.getIntArray("issue");
+        if (problem.length == 3) t.issue = new ChunkCoordinates(problem[0], problem[1], problem[2]);
+        else if (t.state == State.BLOCKED) {
+            String[] old = t.detail.split(", ");
+            if (old.length == 3) try {
+                t.issue = new ChunkCoordinates(Integer.parseInt(old[0]), Integer.parseInt(old[1]), Integer.parseInt(old[2]));
+            } catch (NumberFormatException ignored) {}
+        }
         t.auto = n.getBoolean("auto");
         t.received = n.getBoolean("received");
         t.tier = n.getInteger("tier");
+        t.previewLayers = n.getByte("previewLayers") & 7;
+        t.pendingDefaults = n.getCompoundTag("pendingDefaults");
         t.cursor = n.getInteger("cursor");
         t.total = n.getInteger("total");
         t.placed = n.getInteger("placed");
         t.channels = n.getCompoundTag("channels");
         t.pending = BitSet.valueOf(n.getByteArray("pending"));
+        if (n.hasKey("previewConfirmed")) {
+            t.confirmed = BitSet.valueOf(n.getByteArray("previewConfirmed"));
+        } else {
+            switch (t.state) {
+                case SCANNING:
+                case BLOCKED:
+                    t.confirmed.set(0, t.cursor);
+                    t.confirmed.andNot(t.pending);
+                    break;
+                case MISSING:
+                case PLANNING:
+                case CPU:
+                case ORDERED:
+                case READY:
+                case QUEUED:
+                case BUILDING:
+                case VERIFYING:
+                    t.confirmed = null;
+                    break;
+                default:
+                    break;
+            }
+        }
         t.target = ItemStack.loadItemStackFromNBT(n.getCompoundTag("target"));
         t.needed.read(n.getTagList("needed", 10));
         t.held.read(n.getTagList("held", 10));
+        t.salvage.read(n.getTagList("salvage", 10));
         t.backpack.read(n.getTagList("backpack", 10));
         // The old controller slot held one actual item outside the material ledger.
         ItemStack legacy = ItemStack.loadItemStackFromNBT(n.getCompoundTag("physical"));
