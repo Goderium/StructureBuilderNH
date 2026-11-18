@@ -25,6 +25,6 @@ tasks.processResources {
 }
 tasks.jar {
     from('LICENSE') { into 'META-INF' }
-    manifest.attributes('FMLCorePlugin': 'com.Goderium.StructureRebuildNH.loader.EarlyLoader',
+    manifest.attributes('FMLCorePlugin': 'com.Goderium.StructureBuilderNH.loader.EarlyLoader',
         'FMLCorePluginContainsFMLMod': 'true', 'ForceLoadAsMod': 'true')
 }
