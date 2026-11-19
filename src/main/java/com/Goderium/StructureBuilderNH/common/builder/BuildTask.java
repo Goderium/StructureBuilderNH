@@ -64,6 +64,7 @@ final class BuildTask {
     int tier = 1, cursor, total, placed, revision;
     int siteRevision = -1, siteInstalled, siteTotal, siteUnknown;
     int previewLayers;
+    boolean texturedPreview;
     final Set<String> upgradeChannels = new LinkedHashSet<>();
     private final UpgradeBill upgradeReview = new UpgradeBill(), upgradeScan = new UpgradeBill();
     private UpgradeSnapshot upgradeReviewSources = new UpgradeSnapshot(), upgradeScanSources = new UpgradeSnapshot();
@@ -714,10 +715,21 @@ final class BuildTask {
     }
 
     void togglePreview(int layer) {
-        if (target == null || state == State.DONE || state == State.REFUND || dismantleRequested || state == State.DISMANTLED) return;
+        if (!canChangePreview()) return;
         previewLayers ^= layer;
         if (state == State.DRAFT || state == State.PREVIEW)
             state = previewLayers == 0 ? State.DRAFT : State.PREVIEW;
+        changed();
+    }
+
+    private boolean canChangePreview() {
+        return target != null && state != State.DONE && state != State.REFUND && !dismantleRequested
+                && state != State.DISMANTLED && state != State.DISMANTLING && state != State.TEARDOWN_PAUSED;
+    }
+
+    void setTexturedPreview(boolean textured) {
+        if (!canChangePreview() || textured == texturedPreview) return;
+        texturedPreview = textured;
         changed();
     }
 
@@ -1674,6 +1686,7 @@ final class BuildTask {
         n.setBoolean("received", received);
         n.setInteger("tier", tier);
         n.setByte("previewLayers", (byte) previewLayers);
+        if (texturedPreview) n.setBoolean("texturedPreview", true);
         if (!pendingDefaults.hasNoTags()) n.setTag("pendingDefaults", pendingDefaults);
         n.setInteger("cursor", cursor);
         n.setInteger("total", total);
@@ -1765,6 +1778,7 @@ final class BuildTask {
         t.received = n.getBoolean("received");
         t.tier = n.getInteger("tier");
         t.previewLayers = n.getByte("previewLayers") & 7;
+        t.texturedPreview = n.getBoolean("texturedPreview");
         t.pendingDefaults = n.getCompoundTag("pendingDefaults");
         t.cursor = n.getInteger("cursor");
         t.total = n.getInteger("total");

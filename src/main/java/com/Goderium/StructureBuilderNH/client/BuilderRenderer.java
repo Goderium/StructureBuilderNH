@@ -14,11 +14,14 @@ import cpw.mods.fml.common.eventhandler.SubscribeEvent;
 import cpw.mods.fml.common.gameevent.TickEvent;
 
 import gregtech.api.GregTechAPI;
+import net.minecraft.block.Block;
+import net.minecraft.init.Blocks;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.Tessellator;
 import net.minecraft.client.renderer.culling.Frustrum;
 import net.minecraft.client.renderer.texture.AbstractTexture;
 import net.minecraft.client.renderer.texture.TextureManager;
+import net.minecraft.client.renderer.texture.TextureMap;
 import net.minecraft.client.renderer.texture.TextureUtil;
 import net.minecraft.client.resources.IResourceManager;
 import net.minecraft.client.resources.IReloadableResourceManager;
@@ -33,8 +36,10 @@ import net.minecraft.util.StatCollector;
 import net.minecraft.util.AxisAlignedBB;
 import net.minecraft.world.ChunkPosition;
 import net.minecraft.world.World;
+import net.minecraft.world.IBlockAccess;
 import net.minecraftforge.client.event.RenderWorldLastEvent;
 import net.minecraftforge.client.event.MouseEvent;
+import net.minecraftforge.client.event.TextureStitchEvent;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.world.WorldEvent;
 
@@ -63,6 +68,9 @@ public final class BuilderRenderer extends BuilderProxy {
         }
     });
     private final List<Section> visibleHatches = new ArrayList<>();
+    private final List<Section> transparentSections = new ArrayList<>();
+    private final List<Section> texturedOutlines = new ArrayList<>();
+    private double cameraX, cameraY, cameraZ;
     private final List<net.minecraft.util.ChunkCoordinates> visibleControllers = new ArrayList<>();
     private long compilations;
     private String aimedMarker;
@@ -71,6 +79,7 @@ public final class BuilderRenderer extends BuilderProxy {
     private String aimedHint;
     private boolean aimedHatch;
     private final PreviewTooltip tooltip = new PreviewTooltip();
+    private volatile boolean textureReload;
 
     public static final class Pick {
         public final UUID taskId;
@@ -244,7 +253,7 @@ public final class BuilderRenderer extends BuilderProxy {
         String[] dotHints;
         final Map<List<String>, HatchInfo[]> labels = new HashMap<>();
         int epoch, revision;
-        boolean editable;
+        boolean editable, textured;
         long controllerCheckTick = Long.MIN_VALUE;
         boolean showController;
         final Map<Integer, Assembly> fragments = new HashMap<>();
@@ -318,10 +327,16 @@ public final class BuilderRenderer extends BuilderProxy {
         final int[] colors;
         final int[] choiceTypes;
         final int epoch, revision;
+        boolean textured;
+        short[] renderSlots;
+        List<PreviewStream.RenderMaterial> renders;
+        BlockPreviewTextures.Appearance[] appearances;
         long[] confirmed;
         final Section[] near = new Section[6];
         final AxisAlignedBB box;
-        int faces, marks, outline;
+        int faces, glassFaces, marks, outline;
+        double sortDistance;
+        boolean facesTextured;
         boolean dirty = true, marksDirty = true, outlineDirty = true, hasHatches, hasShell, hasChoices;
         long lastCompilation;
 
@@ -339,6 +354,9 @@ public final class BuilderRenderer extends BuilderProxy {
             styles = p.styles;
             epoch = p.epoch;
             revision = p.revision;
+            textured = view.textured && p.textured;
+            renderSlots = textured ? p.renderSlots : null;
+            renders = !textured || p.renders == null ? Collections.emptyList() : p.renders;
             colors = new int[styles.size()];
             choiceTypes = new int[styles.size()];
             for (int i = 0; i < colors.length; i++) {
@@ -353,6 +371,33 @@ public final class BuilderRenderer extends BuilderProxy {
             if (styleSlots == null) return null;
             int index = styleSlots[slot] & 65535;
             return index == 0 ? null : styles.get(index - 1);
+        }
+
+        BlockPreviewTextures.Appearance appearance(int slot) {
+            int index = renderSlots == null ? 0 : renderSlots[slot] & 65535;
+            if (index == 0 || index > renders.size()) return BlockPreviewTextures.FALLBACK;
+            if (appearances == null) appearances = new BlockPreviewTextures.Appearance[renders.size()];
+            BlockPreviewTextures.Appearance appearance = appearances[index - 1];
+            if (appearance == null) {
+                PreviewStream.RenderMaterial material = renders.get(index - 1);
+                appearance = BlockPreviewTextures.get(material.block, material.meta, material.machine, material.front);
+                appearances[index - 1] = appearance;
+            }
+            return appearance;
+        }
+
+        void dropTextures(boolean keepVisibleMesh) {
+            textured = false;
+            renderSlots = null;
+            renders = Collections.emptyList();
+            appearances = null;
+            if (!keepVisibleMesh && facesTextured) clearFaces();
+        }
+
+        void clearFaces() {
+            if (faces != 0) GL11.glDeleteLists(faces, 1);
+            if (glassFaces != 0) GL11.glDeleteLists(glassFaces, 1);
+            faces = glassFaces = 0;
         }
 
         int color(int slot) {
@@ -426,10 +471,7 @@ public final class BuilderRenderer extends BuilderProxy {
                     break;
                 }
             }
-            if (!hasShell && faces != 0) {
-                GL11.glDeleteLists(faces, 1);
-                faces = 0;
-            }
+            if (!hasShell) clearFaces();
             if (!hasChoices && outline != 0) {
                 GL11.glDeleteLists(outline, 1);
                 outline = 0;
@@ -438,7 +480,7 @@ public final class BuilderRenderer extends BuilderProxy {
         }
 
         void clear() {
-            if (faces != 0) GL11.glDeleteLists(faces, 1);
+            clearFaces();
             if (marks != 0) GL11.glDeleteLists(marks, 1);
             if (outline != 0) GL11.glDeleteLists(outline, 1);
         }
@@ -453,9 +495,28 @@ public final class BuilderRenderer extends BuilderProxy {
                 HatchLabels.clear();
                 for (View view : views.values()) view.invalidateLabels();
                 tooltip.clear();
+                textureReload = true;
             });
         MinecraftForge.EVENT_BUS.register(this);
         FMLCommonHandler.instance().bus().register(this);
+    }
+
+    @SubscribeEvent
+    public void textureStitch(TextureStitchEvent.Post event) { textureReload = true; }
+
+    private void reloadPreviewTextures() {
+        if (!textureReload) return;
+        textureReload = false;
+        BlockPreviewTextures.clear();
+        PreviewConnectedTextures.clear();
+        for (View view : views.values()) for (Section section : view.sections.values()) {
+            section.appearances = null;
+            if (section.facesTextured && (section.faces != 0 || section.glassFaces != 0)) {
+                // Old atlas UVs cannot be retained across a resource-pack rebuild.
+                section.clearFaces();
+                section.dirty = true;
+            }
+        }
     }
 
     @Override
@@ -474,12 +535,19 @@ public final class BuilderRenderer extends BuilderProxy {
     private void remove(UUID id) {
         View view = views.remove(id);
         if (view != null) view.clear();
+        transparentSections.clear();
+        texturedOutlines.clear();
     }
 
     @SubscribeEvent
     public void tick(TickEvent.ClientTickEvent e) {
         if (e.phase != TickEvent.Phase.END) return;
+        reloadPreviewTextures();
         if (unload) {
+            BlockPreviewTextures.clear();
+            PreviewConnectedTextures.clear();
+            transparentSections.clear();
+            texturedOutlines.clear();
             for (View view : views.values()) view.clear();
             views.clear();
             unload = false;
@@ -514,6 +582,12 @@ public final class BuilderRenderer extends BuilderProxy {
                 view.epoch = p.epoch;
                 view.revision = p.revision;
                 view.editable = p.editable;
+                if (view.textured != p.textured)
+                    for (Section s : view.sections.values()) {
+                        if (s.hasShell) s.dirty = true;
+                        if (!p.textured) s.dropTextures((p.layers & PreviewStream.SHELL) != 0);
+                    }
+                view.textured = p.textured;
                 view.tool = p.tool;
                 view.bounds = p.bounds;
                 view.box = AxisAlignedBB.getBoundingBox(p.bounds.minX, p.bounds.minY, p.bounds.minZ,
@@ -547,7 +621,8 @@ public final class BuilderRenderer extends BuilderProxy {
                 try {
                     PreviewStream.Packet complete = new PreviewStream.Packet();
                     complete.fromBytes(bytes);
-                    if (complete.type != 2 || !complete.id.equals(p.id) || complete.epoch != view.epoch) continue;
+                    if ((complete.type != 2 && complete.type != 7) || !complete.id.equals(p.id)
+                            || complete.epoch != view.epoch) continue;
                     p = complete;
                 } finally {
                     bytes.release();
@@ -559,11 +634,14 @@ public final class BuilderRenderer extends BuilderProxy {
                 if (section != null) {
                     if (section.updateProgress(p.confirmed)) invalidateOutlineNeighbors(view, p.x, p.y, p.z);
                     for (Section near : section.near) if (near != null) near.dirty = true;
+                    invalidateTextureNeighbors(view, p.x, p.y, p.z);
                 }
                 continue;
             }
+            if (p.type != 2 && p.type != 7) continue;
             Section s = new Section(view, p);
             Section old = view.sections.put(pos, s);
+            invalidateTextureNeighbors(view, p.x, p.y, p.z);
             int changedBorders = changedHatchBorders(old, s);
             boolean sameChoices = s.hasChoices && old != null && s.sameChoices(old);
             if (!sameChoices && (s.hasChoices || old != null && old.hasChoices)) {
@@ -578,7 +656,9 @@ public final class BuilderRenderer extends BuilderProxy {
                 }
                 if (s.hasShell) {
                     s.faces = old.faces;
-                    old.faces = 0;
+                    s.glassFaces = old.glassFaces;
+                    s.facesTextured = old.facesTextured;
+                    old.faces = old.glassFaces = 0;
                 }
                 if (Arrays.equals(old.hatch, s.hatch) && Arrays.equals(old.dots, s.dots) && s.hatchTypes.sameAs(old.hatchTypes)
                         && Arrays.equals(old.confirmed, s.confirmed)) {
@@ -617,6 +697,15 @@ public final class BuilderRenderer extends BuilderProxy {
             if (Math.abs(dx) + Math.abs(dy) + Math.abs(dz) > 2 || (dx | dy | dz) == 0) continue;
             Section near = view.sections.get(new ChunkPosition(x + dx, y + dy, z + dz));
             if (near != null && near.hasChoices) near.outlineDirty = true;
+        }
+    }
+
+    private static void invalidateTextureNeighbors(View view, int x, int y, int z) {
+        if (!view.textured) return;
+        // CTM and native world icons can consult diagonals and the previous/next section layer.
+        for (int dz = -1; dz <= 1; dz++) for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
+            Section neighbor = view.sections.get(new ChunkPosition(x + dx, y + dy, z + dz));
+            if (neighbor != null && neighbor.hasShell) neighbor.dirty = true;
         }
     }
 
@@ -716,6 +805,7 @@ public final class BuilderRenderer extends BuilderProxy {
 
     @SubscribeEvent(priority = EventPriority.LOWEST)
     public void render(RenderWorldLastEvent e) {
+        reloadPreviewTextures();
         if (views.isEmpty()) return;
         Minecraft mc = Minecraft.getMinecraft();
         Entity eye = mc.renderViewEntity;
@@ -723,6 +813,7 @@ public final class BuilderRenderer extends BuilderProxy {
         double x = eye.lastTickPosX + (eye.posX - eye.lastTickPosX) * e.partialTicks;
         double y = eye.lastTickPosY + (eye.posY - eye.lastTickPosY) * e.partialTicks;
         double z = eye.lastTickPosZ + (eye.posZ - eye.lastTickPosZ) * e.partialTicks;
+        cameraX = x; cameraY = y; cameraZ = z;
         Frustrum camera = new Frustrum();
         camera.setPosition(x, y, z);
         GL11.glPushAttrib(
@@ -741,6 +832,8 @@ public final class BuilderRenderer extends BuilderProxy {
             GL11.glDisable(GL11.GL_ALPHA_TEST);
             GL11.glDepthMask(false);
             visibleHatches.clear();
+            transparentSections.clear();
+            texturedOutlines.clear();
             visibleControllers.clear();
             View nextView = null;
             Section nextSection = null;
@@ -762,6 +855,8 @@ public final class BuilderRenderer extends BuilderProxy {
                     nextSection = candidate;
                 }
             }
+            drawTransparentSections();
+            drawTexturedOutlines();
             drawMarkers(terminal);
             if (terminal && aimed != null) drawPick(aimed);
             for (View view : views.values())
@@ -773,7 +868,14 @@ public final class BuilderRenderer extends BuilderProxy {
                     nextSection.marks = compileHatches(nextView, nextSection);
                     nextSection.marksDirty = nextSection.marks == 0;
                 } else if (nextSection.dirty && nextSection.hasShell && (nextView.layers & PreviewStream.SHELL) != 0) {
-                    nextSection.faces = compileShell(nextView, nextSection, nextSection.faces);
+                    boolean textured = nextView.textured && nextSection.textured;
+                    nextSection.faces = textured ? compileTexturedShell(nextView, nextSection, nextSection.faces)
+                            : compileShell(nextView, nextSection, nextSection.faces);
+                    if (!textured && nextSection.faces != 0 && nextSection.glassFaces != 0) {
+                        GL11.glDeleteLists(nextSection.glassFaces, 1);
+                        nextSection.glassFaces = 0;
+                    }
+                    if (nextSection.faces != 0) nextSection.facesTextured = textured;
                     nextSection.dirty = nextSection.faces == 0;
                 } else {
                     nextSection.outline = compileOutline(nextView, nextSection);
@@ -954,10 +1056,26 @@ public final class BuilderRenderer extends BuilderProxy {
                     && (candidate == null || s.lastCompilation < candidate.lastCompilation)) candidate = s;
             if (shell && s.faces != 0) {
                 GL11.glEnable(GL11.GL_POLYGON_OFFSET_FILL);
+                if (s.facesTextured) {
+                    Minecraft.getMinecraft().getTextureManager().bindTexture(TextureMap.locationBlocksTexture);
+                    GL11.glEnable(GL11.GL_TEXTURE_2D);
+                    GL11.glEnable(GL11.GL_ALPHA_TEST);
+                    GL11.glAlphaFunc(GL11.GL_GREATER, 1f / 255f);
+                }
                 GL11.glCallList(s.faces);
+                if (s.facesTextured) {
+                    GL11.glDisable(GL11.GL_TEXTURE_2D);
+                    GL11.glDisable(GL11.GL_ALPHA_TEST);
+                }
                 GL11.glDisable(GL11.GL_POLYGON_OFFSET_FILL);
             }
-            if (outline && s.outline != 0) {
+            if (shell && s.facesTextured && s.glassFaces != 0) {
+                double dx = s.x + 8 - cameraX, dy = s.y + 8 - cameraY, dz = s.z + 8 - cameraZ;
+                s.sortDistance = dx * dx + dy * dy + dz * dz;
+                transparentSections.add(s);
+            }
+            if (outline && s.outline != 0 && s.facesTextured) texturedOutlines.add(s);
+            if (outline && s.outline != 0 && !s.facesTextured) {
                 GL11.glDisable(GL11.GL_LINE_STIPPLE);
                 GL11.glLineWidth(1.5f);
                 GL11.glColor4f(.90f, .95f, .96f, .90f);
@@ -966,6 +1084,50 @@ public final class BuilderRenderer extends BuilderProxy {
             GL11.glPopMatrix();
         }
         return candidate;
+    }
+
+    private void drawTransparentSections() {
+        if (transparentSections.isEmpty()) return;
+        transparentSections.sort((a, b) -> Double.compare(b.sortDistance, a.sortDistance));
+        GL11.glEnable(GL11.GL_DEPTH_TEST);
+        GL11.glEnable(GL11.GL_CULL_FACE);
+        GL11.glCullFace(GL11.GL_BACK);
+        GL11.glDepthFunc(GL11.GL_LEQUAL);
+        Minecraft.getMinecraft().getTextureManager().bindTexture(TextureMap.locationBlocksTexture);
+        GL11.glEnable(GL11.GL_TEXTURE_2D);
+        GL11.glEnable(GL11.GL_ALPHA_TEST);
+        GL11.glAlphaFunc(GL11.GL_GREATER, 1f / 255f);
+        GL11.glEnable(GL11.GL_BLEND);
+        GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
+        GL11.glDepthMask(false);
+        GL11.glPolygonOffset(1f, 1f);
+        GL11.glEnable(GL11.GL_POLYGON_OFFSET_FILL);
+        for (Section section : transparentSections) {
+            GL11.glPushMatrix();
+            GL11.glTranslatef(section.x, section.y, section.z);
+            GL11.glCallList(section.glassFaces);
+            GL11.glPopMatrix();
+        }
+        GL11.glDisable(GL11.GL_POLYGON_OFFSET_FILL);
+        GL11.glDisable(GL11.GL_ALPHA_TEST);
+        GL11.glDisable(GL11.GL_TEXTURE_2D);
+    }
+
+    private void drawTexturedOutlines() {
+        if (texturedOutlines.isEmpty()) return;
+        GL11.glEnable(GL11.GL_DEPTH_TEST);
+        GL11.glEnable(GL11.GL_BLEND);
+        GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
+        GL11.glDisable(GL11.GL_TEXTURE_2D);
+        GL11.glDisable(GL11.GL_LINE_STIPPLE);
+        GL11.glLineWidth(1.5f);
+        GL11.glColor4f(.90f, .95f, .96f, .90f);
+        for (Section section : texturedOutlines) {
+            GL11.glPushMatrix();
+            GL11.glTranslatef(section.x, section.y, section.z);
+            GL11.glCallList(section.outline);
+            GL11.glPopMatrix();
+        }
     }
 
     private static int compileHatches(View view, Section s) {
@@ -982,6 +1144,134 @@ public final class BuilderRenderer extends BuilderProxy {
         t.draw();
         GL11.glEndList();
         return list;
+    }
+
+    private static int compileTexturedShell(View view, Section s, int previous) {
+        int list = previous == 0 ? GL11.glGenLists(1) : previous;
+        if (list == 0) return 0;
+        IBlockAccess access = textureAccess(view, s);
+        boolean roles = (view.layers & PreviewStream.HATCH) != 0;
+        ChunkCoordinates controller = view.controller;
+        int host = roles && controller != null && (controller.posX & ~15) == s.x
+                && (controller.posY & ~15) == s.y && (controller.posZ & ~15) == s.z
+                ? (controller.posX & 15) | ((controller.posZ & 15) << 4) | ((controller.posY & 15) << 8) : -1;
+        ProjectedBlockFaces.Boundary boundary = (side, slot, neighbor, crossing) -> {
+            BlockPreviewTextures.Appearance current = s.appearance(slot);
+            if (current.textured()) {
+                int x = s.x + (slot & 15), y = s.y + (slot >> 8), z = s.z + (slot >> 4 & 15);
+                int nativeSide = BlockPreviewTextures.nativeSide(side);
+                net.minecraftforge.common.util.ForgeDirection direction =
+                        net.minecraftforge.common.util.ForgeDirection.getOrientation(nativeSide);
+                try {
+                    return !current.block.shouldSideBeRendered(access, x + direction.offsetX,
+                            y + direction.offsetY, z + direction.offsetZ, nativeSide);
+                } catch (RuntimeException | LinkageError unsupported) {
+                    // Unknown context-sensitive blocks retain the previous conservative mask rule.
+                }
+            }
+            Section adjacent = crossing ? s.near[side] : s;
+            if (adjacent == null) return false;
+            long bit = 1L << (neighbor & 63);
+            if (((adjacent.solid[neighbor >> 6] | adjacent.optional[neighbor >> 6]) & bit) == 0) return false;
+            // Installed blocks still occlude. Glass keeps the opaque faces behind it visible.
+            return BlockPreviewTextures.occludes(adjacent.appearance(neighbor), current);
+        };
+        long[][][] deferred = new long[2][][];
+        GL11.glNewList(list, GL11.GL_COMPILE);
+        try {
+            Tessellator tessellator = Tessellator.instance;
+            GL11.glEnable(GL11.GL_TEXTURE_2D);
+            tessellator.startDrawingQuads();
+            tessellator.setBrightness(0xf000f0);
+            ProjectedBlockFaces.emit(s.solid, s.optional, s.confirmed, s.hatch, host, roles, boundary, (side, slot) -> {
+                BlockPreviewTextures.Appearance appearance = s.appearance(slot);
+                if (!appearance.textured()) deferred[0] = ProjectedBlockFaces.remember(deferred[0], side, slot);
+                else if (appearance.translucent) deferred[1] = ProjectedBlockFaces.remember(deferred[1], side, slot);
+                else BlockPreviewTextures.face(tessellator, appearance, side, slot, SHELL_ALPHA, access,
+                            s.x + (slot & 15), s.y + (slot >> 8), s.z + (slot >> 4 & 15));
+            });
+            tessellator.draw();
+            // An unsupported model retains its semantic color without sampling a misleading atlas placeholder.
+            GL11.glDisable(GL11.GL_TEXTURE_2D);
+            if (deferred[0] != null) {
+                tessellator.startDrawingQuads();
+                ProjectedBlockFaces.emit(deferred[0], (side, slot) -> {
+                    int color = s.color(slot);
+                    color = color == 0 ? COLORS[side] : shade(color, side == 3 ? 100 : side < 2 ? 82 : 69);
+                    tessellator.setColorRGBA_I(color, SHELL_ALPHA);
+                    int axis = side / 2, dir = (side & 1) * 2 - 1;
+                    int x = slot & 15, y = slot >> 8, z = slot >> 4 & 15;
+                    int plane = (axis == 0 ? x : axis == 1 ? y : z) + (side & 1);
+                    int u = axis == 0 ? y : axis == 1 ? z : x;
+                    int v = axis == 0 ? z : axis == 1 ? x : y;
+                    vertex(tessellator, axis, plane, u, v);
+                    vertex(tessellator, axis, plane, dir > 0 ? u + 1 : u, dir > 0 ? v : v + 1);
+                    vertex(tessellator, axis, plane, u + 1, v + 1);
+                    vertex(tessellator, axis, plane, dir > 0 ? u : u + 1, dir > 0 ? v + 1 : v);
+                });
+                tessellator.draw();
+            }
+        } finally {
+            GL11.glEndList();
+        }
+        if (deferred[1] != null) {
+            int glass = s.glassFaces == 0 ? GL11.glGenLists(1) : s.glassFaces;
+            if (glass != 0) {
+                GL11.glNewList(glass, GL11.GL_COMPILE);
+                try {
+                    Tessellator tessellator = Tessellator.instance;
+                    tessellator.startDrawingQuads();
+                    tessellator.setBrightness(0xf000f0);
+                    ProjectedBlockFaces.emit(deferred[1], (side, slot) -> {
+                        BlockPreviewTextures.Appearance appearance = s.appearance(slot);
+                        if (appearance.textured() && appearance.translucent)
+                            BlockPreviewTextures.face(tessellator, appearance, side, slot, SHELL_ALPHA, access,
+                                    s.x + (slot & 15), s.y + (slot >> 8), s.z + (slot >> 4 & 15));
+                    });
+                    tessellator.draw();
+                } finally { GL11.glEndList(); }
+                s.glassFaces = glass;
+            }
+        } else if (s.glassFaces != 0) {
+            GL11.glDeleteLists(s.glassFaces, 1);
+            s.glassFaces = 0;
+        }
+        return list;
+    }
+
+    private static IBlockAccess textureAccess(View view, Section section) {
+        World world = Minecraft.getMinecraft().theWorld;
+        Section[] halo = new Section[27];
+        for (int dz = -1; dz <= 1; dz++) for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++)
+            halo[13 + dx + 3 * dy + 9 * dz] = view.sections.get(
+                    new ChunkPosition((section.x >> 4) + dx, (section.y >> 4) + dy, (section.z >> 4) + dz));
+        return PreviewBlockAccess.snapshot(section.x, section.y, section.z, (x, y, z) -> {
+            int dx = (x >> 4) - (section.x >> 4), dy = (y >> 4) - (section.y >> 4), dz = (z >> 4) - (section.z >> 4);
+            if (dx < -1 || dx > 1 || dy < -1 || dy > 1 || dz < -1 || dz > 1) return 0;
+            Section source = halo[13 + dx + 3 * dy + 9 * dz];
+            if (source == null) return 0;
+            int slot = (x & 15) | ((z & 15) << 4) | ((y & 15) << 8);
+            if ((source.confirmed[slot >> 6] & (1L << (slot & 63))) != 0 && world != null
+                    && world.provider.dimensionId == view.dim) {
+                try {
+                    if (world.blockExists(x, y, z)) {
+                        Block installed = world.getBlock(x, y, z);
+                        if (installed != Blocks.air)
+                            return PreviewBlockAccess.state(installed, world.getBlockMetadata(x, y, z));
+                    }
+                } catch (RuntimeException | LinkageError unavailable) {
+                    // An unavailable native client chunk never replaces a proved packet identity with air.
+                }
+            }
+            if (source.renderSlots == null) return 0;
+            int index = source.renderSlots[slot] & 65535;
+            if (index == 0 || index > source.renders.size()) return 0;
+            // Confirmed material remains part of the projection, without constructing a real tile.
+            BlockPreviewTextures.Appearance appearance = source.appearance(slot);
+            if (appearance.textured()) return PreviewBlockAccess.state(appearance.block, appearance.meta);
+            PreviewStream.RenderMaterial material = source.renders.get(index - 1);
+            return PreviewBlockAccess.state(material.block, material.meta);
+        });
     }
 
     private static int compileShell(View view, Section s, int previous) {

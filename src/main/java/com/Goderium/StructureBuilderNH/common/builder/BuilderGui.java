@@ -60,12 +60,14 @@ final class BuilderGui {
             PRIMARY = 0xff346759;
     private static final int LIST_WIDTH = W - 18, ROW_WIDTH = LIST_WIDTH - 7;
     private static final int OPTIONS_X = 220, OPTIONS_WIDTH = W - 9 - OPTIONS_X, OPTION_TEXT = 18;
+    private static final int STYLE_ROW_HEIGHT = 11;
     private static final int MATERIAL_WIDTH = OPTIONS_X - 23, ACTION_WIDTH = 49;
     private static final int TASK_BODY = ROW_WIDTH - ACTION_WIDTH - 4;
     private static final int EDGE = 9, FOOTER_Y = 206, BUTTON_H = 17;
     private static final int LEVEL_X = ROW_WIDTH - 49, LEVEL_WIDTH = 43;
     private static final int UPGRADE = 512, CAN_CONFIGURE = 1024, HAS_REPLACEMENTS = 2048;
     private static final int SITE_COUNTS = 4096, PARTIAL_BUILD = 8192, CHECKING_SITE = 16384;
+    private static final int TEXTURED_PREVIEW = 1 << 15;
     final PlayerInventoryGuiData data;
     final PanelSyncManager sync;
     final ModularPanel panel = ModularPanel.defaultPanel("wireless_builder", W, H);
@@ -393,6 +395,7 @@ final class BuilderGui {
                                                 | (site == null && checkingSite != null ? CHECKING_SITE : 0)
                                                 | (site != null && site.installedCells > 0 && site.installedCells < site.totalCells
                                                         ? PARTIAL_BUILD : 0)
+                                                | (task.texturedPreview ? TEXTURED_PREVIEW : 0)
                                                 | (task.previewLayers << 4));
         sync.syncValue("flags", flags);
         IntSyncValue rate =
@@ -445,15 +448,19 @@ final class BuilderGui {
                 .height(15).padding(OPTION_TEXT, 2, 0, 0)
                 .overlay(IKey.str(tr("channels")).color(INK).shadow(false).alignment(Alignment.CenterLeft))
                 .setEnabledIf(w -> target.getValue() != null && !settled.getAsBoolean());
-        label(main, () -> tr("preview"), OPTIONS_X + 3, 55, OPTIONS_WIDTH - 3, 12, ACCENT)
+        ParentWidget<?> preview = new ParentWidget<>().pos(OPTIONS_X, 55).size(OPTIONS_WIDTH, 76)
                 .setEnabledIf(w -> target.getValue() != null && !settled.getAsBoolean());
-        for (int i = 0; i < 3; i++) {
-            final int mask = 16 << i;
-            String key = new String[] {"box", "shell", "hatches"}[i];
-            checkbox(main, OPTIONS_X, 68 + i * 16, OPTIONS_WIDTH, key, () -> (flags.getIntValue() & mask) != 0)
-                    .height(15)
-                    .setEnabledIf(w -> target.getValue() != null && !settled.getAsBoolean());
-        }
+        main.child(preview);
+        label(preview, () -> tr("preview"), 3, 0, OPTIONS_WIDTH - 3, 12, ACCENT);
+        checkbox(preview, 0, 13, OPTIONS_WIDTH, "hatches", () -> layerVisible(PreviewStream.HATCH)).height(15);
+        checkbox(preview, 0, 29, OPTIONS_WIDTH, "box", () -> layerVisible(PreviewStream.BOX)).height(15);
+        checkbox(preview, 0, 45, OPTIONS_WIDTH, "shell", () -> layerVisible(PreviewStream.SHELL)).height(20);
+        ParentWidget<?> shellStyles = new ParentWidget<>().pos(0, 65).size(OPTIONS_WIDTH, STYLE_ROW_HEIGHT)
+                .setEnabledIf(w -> layerVisible(PreviewStream.SHELL));
+        preview.child(shellStyles);
+        int solidWidth = 31;
+        previewStyle(shellStyles, 0, solidWidth, false);
+        previewStyle(shellStyles, solidWidth + 1, OPTIONS_WIDTH - solidWidth - 1, true);
         singleLine(main, status, 10, 133, LIST_WIDTH - 2, 13, MUTED);
         rule(main, EDGE, 147, LIST_WIDTH);
         main.child(SlotGroupWidget.playerInventory(false).left(EDGE).top(152));
@@ -657,6 +664,11 @@ final class BuilderGui {
             case "hatches":
                 if (page == Page.MAIN)
                     task.togglePreview(action.equals("box") ? 1 : action.equals("shell") ? 2 : 4);
+                return;
+            case "previewSolid":
+            case "previewTextured":
+                if (page == Page.MAIN && (task.previewLayers & PreviewStream.SHELL) != 0)
+                    task.setTexturedPreview(action.equals("previewTextured"));
                 return;
             case "go":
                 if (page != Page.MAIN) return;
@@ -913,6 +925,24 @@ final class BuilderGui {
                     .draw(ctx, left + 3, top + (h - 12) / 2, 12, 12, theme);
             text.draw(ctx, left + OPTION_TEXT, top, w - OPTION_TEXT - 2, h, theme);
         }).tooltip(t -> t.addLine(IKey.str(tr(action))));
+    }
+
+    private boolean layerVisible(int layer) {
+        return (flags.getIntValue() & (layer << 4)) != 0;
+    }
+
+    private void previewStyle(ParentWidget<?> group, int x, int width, boolean textured) {
+        String key = textured ? "previewTextured" : "previewSolid";
+        IDrawable text = IKey.str(tr(key)).color(INK).shadow(false).scale(0.875f).alignment(Alignment.CENTER);
+        Rectangle selected = fill(PRIMARY), underline = fill(ACCENT);
+        button(group, x, 0, width, () -> tr(key), key, false).height(STYLE_ROW_HEIGHT).background(fill(STRIPE))
+                .overlay((ctx, left, top, w, h, theme) -> {
+                    if (((flags.getIntValue() & TEXTURED_PREVIEW) != 0) == textured) {
+                        selected.draw(ctx, left, top, w, h, theme);
+                        underline.draw(ctx, left, top + h - 1, w, 1, theme);
+                    }
+                    text.draw(ctx, left, top, w, h, theme);
+                }).tooltip(t -> t.addLine(IKey.str(tr(key + "Hint"))));
     }
 
     private ButtonWidget<?> control(
