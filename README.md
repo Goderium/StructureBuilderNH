@@ -1,4 +1,7 @@
 # StructureBuilderNH
 
-- 新增无线结构终端, 支持预览和自动搭建 GTNH 多方块结构, 也可按任务拆除已放置的方块. 建造材料可从背包或 ME 网络取用, 缺料时可向 ME 网络请求合成
-- 为 StructureLib 蓝图新增 `rebuild` 信道. 启用后, 在创造模式下潜行使用蓝图即可清理目标区域并重建结构
+**English** | [简体中文](README.zh-CN.md)
+
+- A better construction blueprint designed to reduce lag and save time when building very large structures
+- The Wireless Structure Terminal can preview and automatically build GTNH multiblocks, or dismantle the blocks placed by a specific task. It draws materials from your inventory or an ME network and can request missing items through ME autocrafting
+- StructureLib blueprints gain a `rebuild` channel. With the channel enabled, sneak-right-click in Creative mode to clear the target area and rebuild the structure
