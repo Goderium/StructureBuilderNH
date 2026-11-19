@@ -11,6 +11,7 @@ import com.cleanroommc.modularui.drawable.text.TextRenderer;
 import com.cleanroommc.modularui.factory.PlayerInventoryGuiData;
 import com.cleanroommc.modularui.screen.ModularPanel;
 import com.cleanroommc.modularui.screen.viewport.GuiContext;
+import com.cleanroommc.modularui.screen.viewport.ModularGuiContext;
 import com.cleanroommc.modularui.theme.WidgetTheme;
 import com.cleanroommc.modularui.utils.Alignment;
 import com.cleanroommc.modularui.utils.item.ItemStackHandler;
@@ -63,6 +64,8 @@ final class BuilderGui {
     private static final int TASK_BODY = ROW_WIDTH - ACTION_WIDTH - 4;
     private static final int EDGE = 9, FOOTER_Y = 206, BUTTON_H = 17;
     private static final int LEVEL_X = ROW_WIDTH - 49, LEVEL_WIDTH = 43;
+    private static final int UPGRADE = 512, CAN_CONFIGURE = 1024, HAS_REPLACEMENTS = 2048;
+    private static final int SITE_COUNTS = 4096, PARTIAL_BUILD = 8192, CHECKING_SITE = 16384;
     final PlayerInventoryGuiData data;
     final PanelSyncManager sync;
     final ModularPanel panel = ModularPanel.defaultPanel("wireless_builder", W, H);
@@ -73,6 +76,13 @@ final class BuilderGui {
     private final Map<String, String> sentProgress = new HashMap<>();
     private final Map<String, QueueLine> lines = new HashMap<>();
     private final Map<String, IntValue> channelValues = new LinkedHashMap<>();
+    private final Set<String> editedChannels = new LinkedHashSet<>(), upgradeable = new HashSet<>();
+    private final Map<String, String> siteLevels = new HashMap<>();
+    private ChannelSurvey survey;
+    private boolean surveySent;
+    private OrdinaryBuildSurvey checkingSite, site, sentSite;
+    private int nextSiteCheck;
+    private final Map<ItemId, SiteRow> siteRows = new HashMap<>();
     private int channelRevision;
     private final ListWidget<IWidget, ?> alternatives = new ListWidget<>();
     private final List<IntValue> amounts = new ArrayList<>();
@@ -95,7 +105,7 @@ final class BuilderGui {
         final String name, position;
         String phase = "", progress = "";
         int placed, total;
-        boolean canDismantle, confirmDismantle;
+        boolean canDismantle, confirmDismantle, surveyed;
         final ParentWidget<?> entry = new ParentWidget<>().size(ROW_WIDTH, HEIGHT).marginBottom(2);
         final ParentWidget<?> actions = new ParentWidget<>().size(ACTION_WIDTH, BUTTON_H)
                 .left(TASK_BODY + 4).verticalCenter();
@@ -148,7 +158,7 @@ final class BuilderGui {
         }
 
         String description() {
-            return name + "  " + position + "  " + phase + "  " + progress;
+            return name + "  " + position + "  " + phase + "  " + (surveyed ? tr("lastSiteCheck") + " " : "") + progress;
         }
     }
 
@@ -198,6 +208,8 @@ final class BuilderGui {
             channelReads = -1;
             channels = Collections.emptyList();
             observed = null;
+            survey = null;
+            checkingSite = site = sentSite = null;
             previous = "";
         }
         if (task == null) return;
@@ -317,7 +329,9 @@ final class BuilderGui {
         sync.onServerTick(
                 () -> {
                     update();
-                    if (data.getPlayer().ticksExisted % 5 == 0) sendRows();
+                    surveyBuildSite();
+                    if (page == Page.CHANNELS || data.getPlayer().ticksExisted % 5 == 0) sendRows();
+                    if (page == Page.CHANNELS) surveyChannels();
                 });
         target =
                 GenericSyncValue.builder(ItemStack.class)
@@ -333,24 +347,25 @@ final class BuilderGui {
                 str("phase", () -> task == null ? "pick" : "state." + task.state.name());
         StringSyncValue reason = str("reason", () -> task == null ? "" : task.reason);
         StringSyncValue detail = str("detail", () -> task == null ? "" : task.detail);
-        StringSyncValue progress =
-                str(
-                        "progress",
-                        () ->
-                                task == null
-                                        ? ""
-                                        : task.total > 0
-                                                ? task.placed + " / " + task.total
-                                                : task.plan != null && task.plan.ready
-                                                        ? dimensions()
-                                                        : "");
+        StringSyncValue progress = str("progress", this::mainProgress);
+        IntSyncValue unknownAtSite = new IntSyncValue(() -> site == null ? 0 : site.unknownCells);
+        IntSyncValue blockedAtSite = new IntSyncValue(() -> site == null ? 0 : site.blockedCells);
+        sync.syncValue("unknownAtSite", unknownAtSite);
+        sync.syncValue("blockedAtSite", blockedAtSite);
         Supplier<String> status = () -> {
             String state = phase.getStringValue();
             if (target.getValue() == null && state.equals("state.DRAFT")) return tr("markController");
-            String message = tr(state.equals("state.REFUND") && (flags.getIntValue() & 264) == 0 ? "refundDone" : state);
+            String message = tr(state.equals("state.REFUND") && (flags.getIntValue() & 264) == 0 ? "refundDone"
+                    : (flags.getIntValue() & UPGRADE) != 0 && state.equals("state.DONE") ? "upgradeDone"
+                    : (flags.getIntValue() & UPGRADE) != 0 && state.equals("state.BUILDING") ? "upgrading" : state);
             if (!reason.getStringValue().isEmpty()) {
                 String why = tr(reason.getStringValue());
                 if (!why.equals(message)) message += ": " + why;
+            }
+            if (in(phase, "DRAFT", "PREVIEW") && (flags.getIntValue() & UPGRADE) == 0) {
+                if ((flags.getIntValue() & CHECKING_SITE) != 0) message = tr("checkingSite");
+                if (unknownAtSite.getIntValue() > 0) message += "  " + quantity("siteUnverified", unknownAtSite.getIntValue());
+                if (blockedAtSite.getIntValue() > 0) message += "  " + quantity("siteBlocked", blockedAtSite.getIntValue());
             }
             return detail.getStringValue().isEmpty() ? message
                     : message + "  " + StatCollector.translateToLocal(detail.getStringValue());
@@ -370,6 +385,14 @@ final class BuilderGui {
                                                         : 0)
                                                 | (task.key.isEmpty() && task.salvage.rows.isEmpty() ? 128 : 0)
                                                 | (task.hasReserved() ? 8 : 0)
+                                                | (task.upgrading() ? UPGRADE : 0)
+                                                | (task.canConfigureChannels() && (!task.existing || task.plan != null && task.plan.ready)
+                                                        ? CAN_CONFIGURE : 0)
+                                                | (task.upgradeCount > 0 ? HAS_REPLACEMENTS : 0)
+                                                | (site != null ? SITE_COUNTS : 0)
+                                                | (site == null && checkingSite != null ? CHECKING_SITE : 0)
+                                                | (site != null && site.installedCells > 0 && site.installedCells < site.totalCells
+                                                        ? PARTIAL_BUILD : 0)
                                                 | (task.previewLayers << 4));
         sync.syncValue("flags", flags);
         IntSyncValue rate =
@@ -405,13 +428,17 @@ final class BuilderGui {
                 () -> in(phase, "DONE", "REFUND", "DISMANTLING", "DISMANTLED", "TEARDOWN_PAUSED");
         label(
                 main,
-                () -> tr(in(phase, "DISMANTLING") ? "salvage" : in(phase, "REFUND") ? "leftovers" : "materials"),
+                () -> tr(in(phase, "DISMANTLING") ? "salvage" : in(phase, "REFUND") ? "leftovers"
+                        : (flags.getIntValue() & UPGRADE) != 0 ? "replacementList"
+                        : (flags.getIntValue() & SITE_COUNTS) != 0 ? "installedTotal" : "materials"),
                 10,
                 38,
                 99,
                 13,
                 ACCENT);
-        label(main, progress::getStringValue, 104, 38, EDGE + MATERIAL_WIDTH - 104, 13, MUTED, Alignment.CenterRight)
+        label(main, () -> in(phase, "UPGRADE_REVIEW")
+                ? StatCollector.translateToLocalFormatted("structurebuildernh.replaceCount", progress.getStringValue())
+                : progress.getStringValue(), 104, 38, EDGE + MATERIAL_WIDTH - 104, 13, MUTED, Alignment.CenterRight)
                 .setEnabledIf(w -> !in(phase, "REFUND"));
         list(main, materials, EDGE, 52, MATERIAL_WIDTH + 7, 80);
         button(main, OPTIONS_X, 39, OPTIONS_WIDTH, () -> tr("channels"), "channels", false)
@@ -444,17 +471,17 @@ final class BuilderGui {
                         w ->
                                 target.getValue() != null
                                         && !settled.getAsBoolean()
-                                        && !in(phase, "DRAFT", "PREVIEW"));
+                                        && !in(phase, "DRAFT", "PREVIEW")
+                                        && !(in(phase, "UPGRADE_REVIEW") && (flags.getIntValue() & HAS_REPLACEMENTS) != 0));
+        button(main, 178, FOOTER_Y, 60,
+                () -> tr((flags.getIntValue() & 8) != 0 ? "refundAndReturn" : "buildList"), "buildList", false)
+                .setEnabledIf(w -> in(phase, "UPGRADE_REVIEW") && (flags.getIntValue() & HAS_REPLACEMENTS) != 0);
         button(
                         main,
                         242,
                         FOOTER_Y,
                         65,
-                        () ->
-                                tr(
-                                        in(phase, "BLOCKED")
-                                                ? "resume"
-                                                : in(phase, "MISSING") ? "shortage" : "start"),
+                        () -> primaryAction(phase.getStringValue()),
                         "go",
                         true)
                 .setEnabledIf(
@@ -462,7 +489,7 @@ final class BuilderGui {
                                 target.getValue() != null
                                         && in(
                                                 phase, "DRAFT", "PREVIEW", "BLOCKED", "READY",
-                                                "MISSING"));
+                                                "MISSING", "UPGRADE_REVIEW"));
         button(
                         main,
                         178,
@@ -492,12 +519,12 @@ final class BuilderGui {
         label(channel, () -> tr("channelName"), EDGE + 25, 44, LEVEL_X - 29, 12, ACCENT);
         label(channel, () -> tr("level"), EDGE + LEVEL_X, 44, LEVEL_WIDTH, 12, ACCENT, Alignment.CENTER);
         list(channel, settings, EDGE, 59, LIST_WIDTH, 128);
-        label(channel, () -> tr("inherit"), 10, 190, LIST_WIDTH - 2, 14, MUTED);
+        label(channel, () -> tr(upgradeable.isEmpty() ? "inherit" : "upgradeChannelHelp"), 10, 190, LIST_WIDTH - 2, 14, MUTED);
         control(channel, 121, FOOTER_Y, 112, () -> tr("shareDefaults"), () -> submitChannels(true), false)
                 .tooltip(t -> t.addLine(IKey.str(tr("shareHelp"))))
-                .setEnabledIf(w -> (flags.getIntValue() & 1) != 0);
-        control(channel, 239, FOOTER_Y, 68, () -> tr("apply"), () -> submitChannels(false), true)
-                .setEnabledIf(w -> (flags.getIntValue() & 1) != 0);
+                .setEnabledIf(w -> (flags.getIntValue() & CAN_CONFIGURE) != 0);
+        control(channel, 239, FOOTER_Y, 68, () -> tr(Collections.disjoint(editedChannels, upgradeable) ? "apply" : "checkUpgrade"),
+                () -> submitChannels(false), true).setEnabledIf(w -> (flags.getIntValue() & CAN_CONFIGURE) != 0);
 
         heading(groups, "materialRoles", this::name);
         list(groups, roles, EDGE, 44, LIST_WIDTH, 150);
@@ -531,6 +558,19 @@ final class BuilderGui {
         checkbox(tasks, EDGE, FOOTER_Y, 178, "autoRemove", () -> autoRemove.getIntValue() != 0)
                 .tooltip(t -> t.addLine(IKey.str(tr("autoRemoveHelp"))));
         return panel;
+    }
+
+    private String primaryAction(String phase) {
+        switch (phase) {
+            case "state.DRAFT":
+            case "state.PREVIEW": return tr((flags.getIntValue() & PARTIAL_BUILD) != 0 ? "resumeBuild" : "start");
+            case "state.BLOCKED": return tr("resume");
+            case "state.MISSING": return tr("shortage");
+            case "state.UPGRADE_REVIEW":
+                if ((flags.getIntValue() & HAS_REPLACEMENTS) != 0) return tr("startUpgrade");
+                return tr((flags.getIntValue() & 8) != 0 ? "refundAndReturn" : "continueBuilding");
+            default: return tr("start");
+        }
     }
 
     private static boolean in(StringSyncValue phase, String... states) {
@@ -599,6 +639,10 @@ final class BuilderGui {
         if (task == null) return;
         WorldServer world = DimensionManager.getWorld(task.dim);
         switch (action) {
+            case "buildList":
+                if (page == Page.MAIN && task.state == BuildTask.State.UPGRADE_REVIEW
+                        && world != null && player().worldObj == world) task.continueOrdinaryBuild(player(), world);
+                break;
             case "channels":
                 if (task.target != null) show(Page.CHANNELS);
                 return;
@@ -616,6 +660,10 @@ final class BuilderGui {
                 return;
             case "go":
                 if (page != Page.MAIN) return;
+                if (task.state == BuildTask.State.UPGRADE_REVIEW && task.upgradeCount == 0) {
+                    if (world != null && player().worldObj == world) task.continueOrdinaryBuild(player(), world);
+                    break;
+                }
                 if (task.state == BuildTask.State.MISSING) {
                     show(Page.ORDER);
                     return;
@@ -672,6 +720,7 @@ final class BuilderGui {
     }
 
     private void show(Page next) {
+        if (next == Page.CHANNELS || page == Page.CHANNELS) survey = null;
         page = next;
         previous = "";
         update();
@@ -679,6 +728,7 @@ final class BuilderGui {
     }
 
     private void submitChannels(boolean share) {
+        panel.getContext().removeFocus();
         sync.callSyncedAction(
                 "apply",
                 b -> {
@@ -688,6 +738,7 @@ final class BuilderGui {
                     for (Map.Entry<String, IntValue> e : channelValues.entrySet()) {
                         writeStringSafe(b, e.getKey());
                         b.writeVarIntToBuffer(e.getValue().getIntValue());
+                        b.writeBoolean(editedChannels.contains(e.getKey()));
                     }
                     b.writeBoolean(share);
                 });
@@ -702,11 +753,17 @@ final class BuilderGui {
                 || task == null
                 || task.target == null
                 || !task.id.equals(id)
-                || !task.editable()
+                || !task.canConfigureChannels()
+                || task.existing && (task.plan == null || !task.plan.ready)
                 || task.revision != revision
                 || count != channels.size() + 1) return;
         Map<String, Integer> values = new HashMap<>();
-        for (int i = 0; i < count; i++) values.put(readStringSafe(b), b.readVarIntFromBuffer());
+        Set<String> specified = new LinkedHashSet<>();
+        for (int i = 0; i < count; i++) {
+            String name = readStringSafe(b);
+            if (values.put(name, b.readVarIntFromBuffer()) != null) return;
+            if (b.readBoolean()) specified.add(name);
+        }
         boolean share = b.isReadable() && b.readBoolean();
         if (!values.containsKey("")) return;
         int tier = Math.max(1, Math.min(4096, values.get("")));
@@ -715,8 +772,19 @@ final class BuilderGui {
             Integer v = values.get(d.getChannel());
             if (v == null) return;
             if (v > 0) next.setInteger(d.getChannel(), d.normalizeValue(v));
+            if (task.channels.getInteger(d.getChannel()) != next.getInteger(d.getChannel()))
+                specified.add(d.getChannel());
         }
-        if (task.tier != tier || !task.channels.equals(next)) {
+        boolean changed = task.tier != tier || !task.channels.equals(next);
+        if (!share && task.existing && task.plan != null && task.plan.ready) {
+            specified.retainAll(task.plan.upgradeChannels());
+        } else specified.clear();
+        if (!specified.isEmpty()) {
+            if (!task.setUpgradeChannels(specified)) return;
+            task.tier = tier;
+            task.channels = next;
+        } else if (changed) {
+            if (task.upgrading() && !task.setUpgradeChannels(Collections.emptySet())) return;
             task.tier = tier;
             task.channels = next;
             task.resetDraft();
@@ -732,6 +800,50 @@ final class BuilderGui {
                 + (b.maxY - b.minY + 1)
                 + " x "
                 + (b.maxZ - b.minZ + 1);
+    }
+
+    private String mainProgress() {
+        if (task == null) return "";
+        if (task.state == BuildTask.State.UPGRADE_REVIEW) return String.valueOf(task.upgradeCount);
+        boolean live = task.state == BuildTask.State.BUILDING || task.state == BuildTask.State.VERIFYING
+                || task.state == BuildTask.State.QUEUED;
+        if (site != null && (!live || task.total == 0))
+            return site.installedCells + " / " + site.totalCells + (site.unknownCells > 0 ? " *" : "");
+        if (task.total > 0) return task.placed + " / " + task.total;
+        return task.plan != null && task.plan.ready ? dimensions() : "";
+    }
+
+    private static String quantity(String key, int count) {
+        return StatCollector.translateToLocalFormatted("structurebuildernh." + key, String.format(Locale.ROOT, "%,d", count));
+    }
+
+    private void surveyBuildSite() {
+        if (page != Page.MAIN || task == null || task.plan == null || !task.plan.ready || task.upgrading()
+                || player().dimension != task.dim || task.state == BuildTask.State.REFUND
+                || task.state == BuildTask.State.DONE || task.state == BuildTask.State.DISMANTLED
+                || task.state == BuildTask.State.DISMANTLING || task.state == BuildTask.State.TEARDOWN_PAUSED) {
+            checkingSite = site = null;
+            return;
+        }
+        if (site != null && !site.valid(task)) site = null;
+        if (checkingSite != null && !checkingSite.valid(task)) checkingSite = null;
+        int now = player().ticksExisted;
+        if (checkingSite == null) {
+            if (site != null && now - nextSiteCheck < 0) return;
+            checkingSite = new OrdinaryBuildSurvey(task);
+        }
+        if (checkingSite.advance(player().worldObj)) {
+            site = checkingSite;
+            checkingSite = null;
+            if (task.state == BuildTask.State.DRAFT || task.state == BuildTask.State.PREVIEW) {
+                task.siteInstalled = site.installedCells;
+                task.siteTotal = site.totalCells;
+                task.siteUnknown = site.unknownCells;
+                task.siteRevision = task.revision;
+            }
+            // Allow edits by other players to appear while the material list is open.
+            nextSiteCheck = now + 60;
+        }
     }
 
     private StringSyncValue str(String id, Supplier<String> get) {
@@ -973,9 +1085,11 @@ final class BuilderGui {
         }
         if (page == Page.CHANNELS) {
             if (task == null) return;
-            String key = "channels/" + task.id + "/" + task.revision + "/" + channels.size();
+            boolean ready = task.existing && task.plan != null && task.plan.ready;
+            String key = "channels/" + task.id + "/" + task.revision + "/" + channels.size() + "/" + ready;
             if (key.equals(previous)) return;
             previous = key;
+            survey = null;
             sync.callSyncedAction(
                     "rows",
                     b -> {
@@ -988,6 +1102,7 @@ final class BuilderGui {
                             b.writeVarIntToBuffer(task.channels.getInteger(d.getChannel()));
                             b.writeVarIntToBuffer(d.getMinimumValue());
                             b.writeVarIntToBuffer(d.getMaximumValue());
+                            b.writeBoolean(ready && task.plan.upgradeChannels().contains(d.getChannel()));
                         }
                     });
             return;
@@ -1002,12 +1117,19 @@ final class BuilderGui {
                 sync.callSyncedAction("rows", b -> b.writeByte(0));
             }
             for (BuildTask t : tasks) {
+                boolean surveyed = t.siteRevision == t.revision
+                        && (t.state == BuildTask.State.DRAFT || t.state == BuildTask.State.PREVIEW);
+                int installed = surveyed ? t.siteInstalled : t.placed;
+                int total = surveyed ? t.siteTotal : t.total;
+                int unknown = surveyed ? t.siteUnknown : 0;
                 String progress =
                         t.state.name()
                                 + "/"
-                                + t.placed
+                                + installed
                                 + "/"
-                                + t.total
+                                + total
+                                + "/"
+                                + (surveyed ? unknown : -1)
                                 + "/"
                                 + t.revision
                                 + "/"
@@ -1032,17 +1154,25 @@ final class BuilderGui {
                                                     && t.savedLink == null
                                             ? "REFUNDED"
                                             : t.state.name());
-                            b.writeVarIntToBuffer(t.placed);
-                            b.writeVarIntToBuffer(t.total);
+                            b.writeVarIntToBuffer(installed);
+                            b.writeVarIntToBuffer(total);
                             b.writeBoolean(t.previewLayers != 0 && t.state != BuildTask.State.PREVIEW);
                             b.writeBoolean(t.dim == player().dimension && t.ledger.count > 0
                                     && t.state != BuildTask.State.DISMANTLING && !t.deleteRequested
                                     && (!t.dismantleRequested || t.state == BuildTask.State.TEARDOWN_PAUSED));
+                            b.writeBoolean(t.upgrading());
+                            b.writeBoolean(surveyed);
+                            if (surveyed) b.writeVarIntToBuffer(unknown);
                         });
             }
             return;
         }
         boolean missing = page == Page.ORDER;
+        OrdinaryBuildSurvey currentSite = !missing && site != null && site.valid(task) ? site : null;
+        // Building updates the placement ledger every block; the approved replacement rows stay the same.
+        boolean stableRows = task != null && (task.state == BuildTask.State.DISMANTLING && task.salvage.rows.isEmpty()
+                || !missing && task.upgrading() && (task.state == BuildTask.State.QUEUED
+                        || task.state == BuildTask.State.BUILDING || task.state == BuildTask.State.VERIFYING));
         String key =
                 task == null
                         ? "empty"
@@ -1050,16 +1180,48 @@ final class BuilderGui {
                                 + "/"
                                 + task.id
                                 + "/"
-                                + (task.state == BuildTask.State.DISMANTLING && task.salvage.rows.isEmpty()
-                                        ? -1 : task.revision)
+                                + (stableRows ? -1 : task.revision)
                                 + "/"
                                 + task.state
                                 + "/"
                                 + (task.plan != null && task.plan.ready);
-        if (previous.equals(key)) return;
+        if (previous.equals(key)) {
+            if (sentSite == currentSite) return;
+            if (sentSite != null && currentSite != null && currentSite.total.same(sentSite.total)) {
+                // Keep the scroll position and selectable rows while only the counts change.
+                for (Materials.Entry entry : currentSite.total.rows.values()) {
+                    ItemStack item = entry.item;
+                    if (currentSite.installed.count(item) == sentSite.installed.count(item)
+                            && currentSite.missing.count(item) == sentSite.missing.count(item)
+                            && currentSite.blocked.count(item) == sentSite.blocked.count(item)
+                            && currentSite.unverified.count(item) == sentSite.unverified.count(item)) continue;
+                    sync.callSyncedAction("rows", b -> {
+                        b.writeByte(14);
+                        ByteBufAdapters.ITEM_STACK.serializeSafe(b, item);
+                        writeSiteCounts(b, currentSite, item);
+                    });
+                }
+                sentSite = currentSite;
+                return;
+            }
+        }
         previous = key;
+        sentSite = currentSite;
         sync.callSyncedAction("rows", b -> b.writeByte(0));
         if (task == null) return;
+        if (task.upgrading() && !missing && task.state != BuildTask.State.REFUND
+                && !(task.state == BuildTask.State.DONE && task.hasReserved())
+                && task.state != BuildTask.State.DISMANTLING && task.state != BuildTask.State.TEARDOWN_PAUSED) {
+            if (task.state != BuildTask.State.INSPECTING_UPGRADE) {
+                for (UpgradeBill.Row row : task.upgradeRows) sync.callSyncedAction("rows", b -> {
+                    b.writeByte(11);
+                    ByteBufAdapters.ITEM_STACK.serializeSafe(b, row.previous);
+                    ByteBufAdapters.ITEM_STACK.serializeSafe(b, row.target);
+                    b.writeVarIntToBuffer(row.count);
+                });
+            }
+            return;
+        }
         Materials list =
                 missing
                         ? (task.errors.rows.isEmpty() ? task.shortage : task.errors)
@@ -1095,20 +1257,42 @@ final class BuilderGui {
                     entry.allocated += quantities[i];
                 }
             }
-            for (ChoiceEntry entry : alternatives.values())
-                combined.add(entry.item, list.count(entry.item) + entry.allocated);
-            for (Map.Entry<ItemId, Materials.Entry> row : list.rows.entrySet())
-                if (!alternatives.containsKey(row.getKey())) combined.add(row.getValue().item, row.getValue().count);
-            list = combined;
+            if (currentSite != null) {
+                list = currentSite.total;
+            } else {
+                for (ChoiceEntry entry : alternatives.values())
+                    combined.add(entry.item, list.count(entry.item) + entry.allocated);
+                for (Map.Entry<ItemId, Materials.Entry> row : list.rows.entrySet())
+                    if (!alternatives.containsKey(row.getKey())) combined.add(row.getValue().item, row.getValue().count);
+                list = combined;
+            }
         }
         for (Materials.Entry e : list.rows.values()) {
             int amount = e.count;
-            if (catalog
+            if (catalog && currentSite == null
                     && task.existing
                     && Materials.equal(e.item, task.target)) amount--;
             if (amount <= 0) continue;
             final int n = amount;
             ChoiceEntry entry = alternatives.get(ItemId.create(e.item));
+            if (catalog && currentSite != null) {
+                boolean selectable = entry != null && task.editable();
+                sync.callSyncedAction("rows", b -> {
+                    b.writeByte(13);
+                    b.writeBoolean(selectable);
+                    if (selectable) {
+                        b.writeInt(task.revision);
+                        b.writeVarIntToBuffer(entry.group);
+                        b.writeVarIntToBuffer(entry.option);
+                        b.writeVarIntToBuffer(entry.allocated);
+                        b.writeVarIntToBuffer(task.plan.bill.count(e.item));
+                    }
+                    ByteBufAdapters.ITEM_STACK.serializeSafe(b, e.item);
+                    b.writeVarIntToBuffer(n);
+                    writeSiteCounts(b, currentSite, e.item);
+                });
+                continue;
+            }
             if (entry != null && task.editable()) {
                 sync.callSyncedAction("rows", b -> {
                     b.writeByte(6);
@@ -1137,9 +1321,87 @@ final class BuilderGui {
         }
     }
 
+    private static void writeSiteCounts(PacketBuffer b, OrdinaryBuildSurvey site, ItemStack item) {
+        b.writeVarIntToBuffer(site.installed.count(item));
+        b.writeVarIntToBuffer(site.missing.count(item));
+        b.writeVarIntToBuffer(site.blocked.count(item));
+        b.writeVarIntToBuffer(site.unverified.count(item));
+    }
+
+    private static final class SiteRow {
+        final int total;
+        int installed, missing, blocked, unverified;
+        String count;
+
+        SiteRow(int total) { this.total = total; }
+
+        void read(PacketBuffer b) {
+            installed = b.readVarIntFromBuffer();
+            missing = b.readVarIntFromBuffer();
+            blocked = b.readVarIntFromBuffer();
+            unverified = b.readVarIntFromBuffer();
+            count = String.format(Locale.ROOT, "%,d / %,d", installed, total);
+            if (unverified > 0) count += " *";
+        }
+
+        String details() {
+            String text = quantity("siteToSupply", missing);
+            int inPlace = total - installed - missing - blocked - unverified;
+            if (inPlace > 0) text += "  " + quantity("siteInPlace", inPlace);
+            if (blocked > 0) text += "  " + quantity("siteBlocked", blocked);
+            if (unverified > 0) text += "  " + quantity("siteUnverified", unverified);
+            return text;
+        }
+    }
+
+    private void surveyChannels() {
+        if (task == null || !task.existing || task.plan == null || !task.plan.ready
+                || player().dimension != task.dim || task.plan.upgradeChannels().isEmpty()) return;
+        if (survey == null || survey.plan != task.plan) {
+            survey = new ChannelSurvey(task.plan);
+            surveySent = false;
+        }
+        if (surveySent || !survey.advance(player().worldObj)) return;
+        surveySent = true;
+        for (String channel : survey.plan.upgradeChannels()) sync.callSyncedAction("rows", buf -> {
+            buf.writeByte(12);
+            buf.writeInt(task.revision);
+            writeStringSafe(buf, channel);
+            Set<Integer> levels = survey.levels.getOrDefault(channel, Collections.emptySet());
+            buf.writeVarIntToBuffer(levels.size());
+            for (int level : levels) buf.writeVarIntToBuffer(level);
+            buf.writeBoolean(survey.incomplete.contains(channel));
+        });
+    }
+
     private void receive(PacketBuffer b) {
         int type = b.readUnsignedByte();
+        if (type == 14) {
+            ItemStack stack = ByteBufAdapters.ITEM_STACK.deserializeSafe(b);
+            SiteRow row = stack == null ? null : siteRows.get(ItemId.create(stack));
+            if (row != null) row.read(b);
+            return;
+        }
+        if (type == 11) {
+            ItemStack old = ByteBufAdapters.ITEM_STACK.deserializeSafe(b);
+            ItemStack next = ByteBufAdapters.ITEM_STACK.deserializeSafe(b);
+            int count = b.readVarIntFromBuffer();
+            if (old != null && next != null) replacementRow(old, next, count);
+            return;
+        }
+        if (type == 12) {
+            if (b.readInt() != channelRevision) return;
+            String channel = readStringSafe(b);
+            int count = b.readVarIntFromBuffer();
+            StringJoiner levels = new StringJoiner(" / ");
+            for (int i = 0; i < count; i++) levels.add(String.valueOf(b.readVarIntFromBuffer()));
+            boolean partial = b.readBoolean();
+            siteLevels.put(channel, count == 0 ? tr(partial ? "siteUnknown" : "siteEmpty")
+                    : StatCollector.translateToLocalFormatted("structurebuildernh." + (partial ? "siteLevelsPartial" : "siteLevels"), levels));
+            return;
+        }
         if (type == 0) {
+            siteRows.clear();
             lines.clear();
             jobs.removeAll();
             materials.removeAll();
@@ -1176,14 +1438,16 @@ final class BuilderGui {
             channelRevision = b.readInt();
             settings.removeAll();
             channelValues.clear();
+            editedChannels.clear();
+            upgradeable.clear();
+            siteLevels.clear();
             channelRow("", b.readVarIntFromBuffer(), 1, 4096);
             int count = b.readVarIntFromBuffer();
             for (int i = 0; i < count; i++) {
-                channelRow(
-                        readStringSafe(b),
-                        b.readVarIntFromBuffer(),
-                        b.readVarIntFromBuffer(),
-                        b.readVarIntFromBuffer());
+                String channel = readStringSafe(b);
+                int value = b.readVarIntFromBuffer(), min = b.readVarIntFromBuffer(), max = b.readVarIntFromBuffer();
+                if (b.readBoolean()) upgradeable.add(channel);
+                channelRow(channel, value, min, max);
             }
             return;
         }
@@ -1195,14 +1459,23 @@ final class BuilderGui {
                 row = new QueueLine(target == null ? terminalName() : target.getDisplayName(), site(readStringSafe(b)));
                 lines.put(id, row);
             } else row = lines.get(id);
-            String phase = tr("state." + readStringSafe(b));
+            String state = readStringSafe(b);
             int placed = b.readVarIntFromBuffer(), total = b.readVarIntFromBuffer();
             boolean preview = b.readBoolean(), canDismantle = b.readBoolean();
+            boolean upgrade = b.readBoolean();
+            boolean surveyed = b.readBoolean();
+            boolean partial = surveyed && b.readVarIntFromBuffer() > 0;
+            String phase = tr(upgrade && state.equals("DONE") ? "upgradeDone"
+                    : upgrade && state.equals("BUILDING") ? "upgrading" : "state." + state);
+            if (upgrade && !state.equals("DONE") && !state.equals("BUILDING")
+                    && !state.equals("INSPECTING_UPGRADE") && !state.equals("UPGRADE_REVIEW"))
+                phase = tr("upgradeTask") + " | " + phase;
             if (row == null) return;
             row.phase = preview ? phase + " | " + tr("state.PREVIEW") : phase;
             row.placed = placed;
             row.total = total;
-            row.progress = total == 0 ? "" : placed + " / " + total;
+            row.surveyed = surveyed;
+            row.progress = total == 0 ? "" : placed + " / " + total + (partial ? " *" : "");
             if (!canDismantle) row.confirmDismantle = false;
             row.layout(canDismantle);
             if (type == 2) {
@@ -1226,19 +1499,26 @@ final class BuilderGui {
             }
             return;
         }
-        boolean selectable = type == 6;
+        boolean surveyed = type == 13;
+        boolean selectable = surveyed ? b.readBoolean() : type == 6;
         int revision = selectable ? b.readInt() : 0;
         int group = selectable ? b.readVarIntFromBuffer() : 0;
         int option = selectable ? b.readVarIntFromBuffer() : 0;
         int flexible = selectable ? b.readVarIntFromBuffer() : 0;
+        int fixed = surveyed && selectable ? b.readVarIntFromBuffer() : 0;
         ItemStack s = ByteBufAdapters.ITEM_STACK.deserializeSafe(b);
         int n = b.readVarIntFromBuffer();
-        boolean quoted = !selectable && b.readBoolean();
+        boolean quoted = !surveyed && !selectable && b.readBoolean();
         int required = quoted ? b.readVarIntFromBuffer() : 0,
                 reserved = quoted ? b.readVarIntFromBuffer() : 0;
         if (s == null) return;
         String count = String.format(Locale.ROOT, "%,d", n);
-        int width = TextRenderer.getFontRenderer().getStringWidth(count) + 3;
+        SiteRow progress = surveyed ? new SiteRow(n) : null;
+        if (surveyed) {
+            progress.read(b);
+            siteRows.put(ItemId.create(s), progress);
+        }
+        int width = textWidth(surveyed ? count + " / " + count + " *" : count) + 3;
         ListWidget<IWidget, ?> rows = type == 5 ? deficits : materials;
         int rowWidth = type == 5 ? ROW_WIDTH : MATERIAL_WIDTH;
         int nameWidth = rowWidth - 26 - width;
@@ -1253,7 +1533,7 @@ final class BuilderGui {
                                                         : 0xff304248))
                         .child(new ItemDrawable(s).asWidget().pos(1, 0))
                         .child(
-                                IKey.str(count)
+                                (surveyed ? IKey.dynamic(() -> progress.count) : IKey.str(count))
                                         .asWidget()
                                         .pos(rowWidth - 3 - width, 0)
                                         .size(width, 16)
@@ -1263,6 +1543,7 @@ final class BuilderGui {
                         .tooltip(
                                 t -> {
                                     t.addFromItem(s);
+                                    if (surveyed) t.addLine(IKey.dynamic(progress::details));
                                     if (quoted)
                                         t.addLine(
                                                 IKey.str(
@@ -1289,13 +1570,27 @@ final class BuilderGui {
                         return true;
                     }).tooltip(t -> {
                         t.addFromItem(s);
+                        if (surveyed) t.addLine(IKey.dynamic(progress::details));
                         t.addLine(IKey.str(StatCollector.translateToLocalFormatted(
-                                "structurebuildernh.choiceHint", String.format(Locale.ROOT, "%,d", n - flexible),
+                                "structurebuildernh.choiceHint", String.format(Locale.ROOT, "%,d", surveyed ? fixed : n - flexible),
                                 String.format(Locale.ROOT, "%,d", flexible))));
                     });
             row.child(hit);
         }
         rows.child(row);
+    }
+
+    private void replacementRow(ItemStack old, ItemStack next, int count) {
+        ParentWidget<?> row = new ParentWidget<>().size(MATERIAL_WIDTH, 32)
+                .background(fill(materials.getChildren().size() % 2 == 0 ? STRIPE : SURFACE));
+        row.child(new ItemDrawable(old).asWidget().pos(1, 0));
+        row.child(new ItemDrawable(next).asWidget().pos(1, 16));
+        String quantity = String.format(Locale.ROOT, "%,d", count);
+        int countWidth = textWidth(quantity) + 6;
+        singleLine(row, old::getDisplayName, 20, 1, MATERIAL_WIDTH - 23, 14, MUTED);
+        singleLine(row, () -> "→ " + next.getDisplayName(), 20, 17, MATERIAL_WIDTH - 23 - countWidth, 14, INK);
+        label(row, () -> quantity, MATERIAL_WIDTH - countWidth - 2, 17, countWidth, 14, ACCENT, Alignment.CenterRight);
+        materials.child(row);
     }
 
     private long remainder() {
@@ -1355,21 +1650,27 @@ final class BuilderGui {
         ParentWidget<?> row = new ParentWidget<>().size(ROW_WIDTH, rowHeight)
                 .background(fill(settings.getChildren().size() % 2 == 0 ? STRIPE : SURFACE));
         ItemDrawable icon = new ItemDrawable();
+        Supplier<ItemStack> selectedBlock = main ? target::getValue : sample;
         row.child(
                 new Widget<>()
                         .left(4).verticalCenter()
                         .size(16)
                         .background(
                                 (ctx, x, y, w, h, theme) -> {
-                                    ItemStack stack = main ? target.getValue() : sample.get();
+                                    ItemStack stack = selectedBlock.get();
                                     if (stack != null)
                                         icon.setItem(stack).draw(ctx, x, y, w, h, theme);
-                                }));
+                                })
+                        .tooltip(t -> t.addLine(IKey.dynamic(() -> {
+                            ItemStack stack = selectedBlock.get();
+                            return stack == null ? fallback : stack.getDisplayName();
+                        }))));
         singleLine(row, () -> title, 25, 3, textWidth, 12, INK);
         singleLine(
                 row,
                 () -> {
                     ItemStack block = sample.get();
+                    if (siteLevels.containsKey(key)) return siteLevels.get(key);
                     if (block != null) return block.getDisplayName();
                     return fallback;
                 },
@@ -1379,14 +1680,21 @@ final class BuilderGui {
                 12,
                 MUTED);
         row.child(
-                new TextFieldWidget()
+                new TextFieldWidget() {
+                    @Override
+                    public void onFocus(ModularGuiContext context) {
+                        super.onFocus(context);
+                        // Selecting a target is intentional even if it matches the terminal's remembered value.
+                        if (upgradeable.contains(key)) editedChannels.add(key);
+                    }
+                }
                         .value(value)
                         .numbersInt(main ? 1 : 0, max)
                         .left(LEVEL_X).verticalCenter()
                         .size(LEVEL_WIDTH, 16)
-                        .setEnabledIf(w -> (flags.getIntValue() & 1) != 0));
+                        .setEnabledIf(w -> (flags.getIntValue() & CAN_CONFIGURE) != 0));
         label(row, value::getStringValue, LEVEL_X, (rowHeight - 16) / 2, LEVEL_WIDTH, 16, INK, Alignment.CENTER)
-                .setEnabledIf(w -> (flags.getIntValue() & 1) == 0);
+                .setEnabledIf(w -> (flags.getIntValue() & CAN_CONFIGURE) == 0);
         settings.child(row);
     }
 }

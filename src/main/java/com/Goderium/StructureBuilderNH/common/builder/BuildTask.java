@@ -24,6 +24,8 @@ final class BuildTask {
     enum State {
         DRAFT,
         PREVIEW,
+        INSPECTING_UPGRADE,
+        UPGRADE_REVIEW,
         SCANNING,
         MISSING,
         PLANNING,
@@ -45,7 +47,7 @@ final class BuildTask {
     final String id, owner, tool;
     final int dim, x, y, z;
     final ExtendedFacing facing;
-    final boolean existing;
+    boolean existing;
     String key = "", orderId = "", detail = "", reason = "";
     State state = State.DRAFT;
     boolean auto, received;
@@ -60,7 +62,19 @@ final class BuildTask {
 
     ItemStack target;
     int tier = 1, cursor, total, placed, revision;
+    int siteRevision = -1, siteInstalled, siteTotal, siteUnknown;
     int previewLayers;
+    final Set<String> upgradeChannels = new LinkedHashSet<>();
+    private final UpgradeBill upgradeReview = new UpgradeBill(), upgradeScan = new UpgradeBill();
+    private UpgradeSnapshot upgradeReviewSources = new UpgradeSnapshot(), upgradeScanSources = new UpgradeSnapshot();
+    final List<UpgradeBill.Row> upgradeRows = Collections.unmodifiableList(upgradeReview.rows);
+    int upgradeCount;
+    private boolean upgradeApproved, upgradeRecoveryFault;
+    private boolean upgradeReturnToBuild;
+    private int upgradeReturnLayers;
+    private String upgradeNetwork = "";
+    private BitSet upgradeCommitted = new BitSet();
+    private UpgradePlacement.Recovery upgradeRecovery;
     NBTTagCompound materialSelections = new NBTTagCompound();
     NBTTagCompound materialCells = new NBTTagCompound(), materialGroups = new NBTTagCompound();
     private Blueprint selectionPlan;
@@ -84,6 +98,137 @@ final class BuildTask {
     private BitSet pending = new BitSet();
     private BitSet confirmed = new BitSet();
     private long nextSalvageRetry;
+    private Blueprint ordinaryProgressPlan;
+    private BitSet ordinaryCounted = new BitSet(), ordinaryInstalled = new BitSet();
+    private int ordinaryProgressCursor;
+    private boolean ordinaryProgressReady;
+    private final OrdinaryCell ordinaryWork = new OrdinaryCell();
+
+    enum OrdinaryStatus { INSTALLED, MISSING, BLOCKED, UNLOADED, UNKNOWN, AIR }
+
+    /** Reusable read-only result; neither classification nor material lookup acquires chunks. */
+    static final class OrdinaryCell {
+        Blueprint.Cell cell;
+        ItemStack material, installedMaterial;
+        OrdinaryStatus status = OrdinaryStatus.UNKNOWN;
+        int x, y, z;
+        boolean counted, matches, blankRitual, host;
+        private final int[] position = new int[3];
+    }
+
+    void ordinaryCell(int index, World world, OrdinaryCell result) {
+        ordinaryCell(index, world, result, true);
+    }
+
+    private void ordinaryCell(int index, World world, OrdinaryCell result, boolean itemDetails) {
+        result.cell = null;
+        result.material = result.installedMaterial = null;
+        result.status = OrdinaryStatus.UNKNOWN;
+        result.x = result.y = result.z = 0;
+        result.counted = result.matches = result.blankRitual = result.host = false;
+        if (upgrading() || plan == null || !plan.ready || index < 0 || index >= plan.size) return;
+        try {
+            Blueprint.Cell cell = plan.at(index, result.position);
+            result.cell = cell;
+            result.x = result.position[0]; result.y = result.position[1]; result.z = result.position[2];
+            result.host = index == 0;
+            MaterialSelection selection = cell.choice == null ? null : selection(result.x, result.y, result.z);
+            result.material = result.host ? target : selection == null ? cell.item : selection.item();
+            result.counted = result.material != null && result.material.getItem() != null
+                    && (result.host || selection != null || !cell.air);
+            if (world == null || !world.blockExists(result.x, result.y, result.z)) {
+                result.status = OrdinaryStatus.UNLOADED;
+                return;
+            }
+            boolean air = world.isAirBlock(result.x, result.y, result.z);
+            result.matches = result.host ? anchorValid(world)
+                    : materialMatches(cell, world, result.x, result.y, result.z);
+            if (result.matches) {
+                if (air) {
+                    result.counted = false;
+                    result.status = OrdinaryStatus.AIR;
+                } else {
+                    result.status = OrdinaryStatus.INSTALLED;
+                    if (itemDetails || result.material == null && selection != null && !selection.explicit)
+                        result.installedMaterial = ordinaryInstalledMaterial(world, result);
+                    // An implicit optional-air choice preserves an already installed native-valid solid.
+                    if (result.material == null && selection != null && !selection.explicit)
+                        result.counted = result.installedMaterial != null;
+                }
+                return;
+            }
+            result.blankRitual = cell.inscribedRitual
+                    && world.getBlock(result.x, result.y, result.z) == cell.block
+                    && world.getBlockMetadata(result.x, result.y, result.z) == 0;
+            if (result.host && (existing || !plan.controller.isFacingValid(facing.getDirection()))
+                    || selection != null && selection.conflict || !air && !result.blankRitual) {
+                result.status = OrdinaryStatus.BLOCKED;
+            } else result.status = result.material == null ? OrdinaryStatus.UNKNOWN : OrdinaryStatus.MISSING;
+        } catch (RuntimeException | LinkageError failure) {
+            result.matches = false;
+            result.status = OrdinaryStatus.UNKNOWN;
+        }
+    }
+
+    private ItemStack ordinaryInstalledMaterial(World world, OrdinaryCell cell) {
+        TileEntity tile = world.getTileEntity(cell.x, cell.y, cell.z);
+        if (tile instanceof IGregTechTileEntity) {
+            IGregTechTileEntity gt = (IGregTechTileEntity) tile;
+            if (gt.getMetaTileEntity() != null) {
+                ItemStack stack = gt.getMetaTileEntity().getStackForm(1);
+                if (stack != null && stack.getItem() != null) return stack;
+            }
+            return cell.material;
+        }
+        IStructureElement.BlocksToPlace present = IStructureElement.BlocksToPlace.create(
+                world.getBlock(cell.x, cell.y, cell.z), world.getBlockMetadata(cell.x, cell.y, cell.z));
+        if (present != null && present.getStacks() != null)
+            for (ItemStack item : present.getStacks()) if (item != null && item.getItem() != null) return item;
+        return cell.material;
+    }
+
+    private void invalidateOrdinaryProgress() {
+        ordinaryProgressPlan = null;
+        ordinaryProgressCursor = 0;
+        ordinaryProgressReady = false;
+        ordinaryCounted = new BitSet();
+        ordinaryInstalled = new BitSet();
+    }
+
+    /** Rebuild once for an executing/resumed plan, without trusting persisted historical counters. */
+    private boolean prepareOrdinaryProgress(World world, long deadline) {
+        if (ordinaryProgressPlan != plan) {
+            invalidateOrdinaryProgress();
+            ordinaryProgressPlan = plan;
+        }
+        for (int n = 0; ordinaryProgressCursor < plan.size && n < 8192 && System.nanoTime() < deadline;
+                n++, ordinaryProgressCursor++) {
+            ordinaryCell(ordinaryProgressCursor, world, ordinaryWork, false);
+            updateOrdinaryProgress(ordinaryProgressCursor, ordinaryWork);
+        }
+        if (ordinaryProgressCursor < plan.size) return false;
+        if (!ordinaryProgressReady) {
+            total = ordinaryCounted.cardinality();
+            placed = ordinaryInstalled.cardinality();
+            ordinaryProgressReady = true;
+            changed();
+        }
+        return true;
+    }
+
+    private void updateOrdinaryProgress(int index, OrdinaryCell cell) {
+        boolean installed = cell.counted && cell.status == OrdinaryStatus.INSTALLED;
+        if (ordinaryCounted.get(index) != cell.counted) {
+            if (ordinaryProgressReady) total += cell.counted ? 1 : -1;
+            ordinaryCounted.set(index, cell.counted);
+            if (ordinaryProgressReady) changed();
+        }
+        if (ordinaryInstalled.get(index) != installed) {
+            if (ordinaryProgressReady) placed += installed ? 1 : -1;
+            ordinaryInstalled.set(index, installed);
+            if (ordinaryProgressReady) changed();
+        }
+    }
 
     static final class MaterialSelection {
         final int x, y, z;
@@ -335,7 +480,7 @@ final class BuildTask {
         changed();
     }
 
-    private boolean materialMatches(Blueprint.Cell cell, WorldServer world, int px, int py, int pz) {
+    private boolean materialMatches(Blueprint.Cell cell, World world, int px, int py, int pz) {
         if (cell.choice == null) return plan.matches(cell, world, px, py, pz);
         MaterialSelection selection = selection(px, py, pz);
         if (selection != null && selection.supported) {
@@ -386,11 +531,26 @@ final class BuildTask {
         store.markDirty();
     }
 
-    void resetPlan() {
+    void discardCachedPlan() {
         plan = null;
+        invalidateOrdinaryProgress();
         selectionPlan = null;
         selectedMaterials = null;
+        materialTotals.clear();
+        ordinaryWork.cell = null;
+        ordinaryWork.material = ordinaryWork.installedMaterial = null;
+    }
+
+    void resetPlan() {
+        discardCachedPlan();
         confirmed = new BitSet();
+        if (upgrading()) {
+            cursor=0;
+            if (state==State.INSPECTING_UPGRADE) { upgradeReview.clear(); upgradeReviewSources.clear(); upgradeCount=0; }
+            if (state==State.SCANNING) {
+                upgradeScan.clear(); upgradeScanSources.clear(); needed.rows.clear(); pending.clear(); total=placed=0;
+            }
+        }
         revision++;
         reason = "";
         issue = null;
@@ -398,7 +558,140 @@ final class BuildTask {
     }
 
     boolean editable() {
-        return state == State.DRAFT || state == State.PREVIEW || state == State.MISSING && !hasReserved();
+        return !upgrading() && (state == State.DRAFT || state == State.PREVIEW || state == State.MISSING && !hasReserved());
+    }
+
+    boolean upgrading() { return !upgradeChannels.isEmpty(); }
+
+    /** Channel-page permission only; review must never enable the world/material editor. */
+    boolean canConfigureChannels() {
+        return !hasReserved() && savedLink == null && !ordering()
+                && (state == State.DRAFT || state == State.PREVIEW || state == State.MISSING
+                    || state == State.UPGRADE_REVIEW || state == State.BLOCKED && upgrading() && !upgradeApproved);
+    }
+
+    boolean keepsUpgradeBinding() { return !upgradeNetwork.isEmpty(); }
+
+    private void releaseUpgradePhaseData() {
+        upgradeReviewSources=new UpgradeSnapshot(); upgradeScanSources=new UpgradeSnapshot();
+        upgradeCommitted=new BitSet(); upgradeScan.clear(); upgradeReview.releaseIndex();
+    }
+
+    boolean attachExisting(WorldServer world) {
+        if (!canConfigureChannels() || target == null || world == null || world.provider.dimensionId != dim
+                || !world.blockExists(x,y,z) || !anchorValid(world)) return false;
+        if (!existing) { existing = true; changed(); }
+        return true;
+    }
+
+    /** Call before writing new tier/channel values, while the old ready plan can validate the selected scope. */
+    boolean setUpgradeChannels(Collection<String> enabled) {
+        if (!canConfigureChannels() || enabled == null) return false;
+        Set<String> selected = new TreeSet<>();
+        for (String channel : enabled) {
+            if (channel == null || channel.trim().isEmpty()) return false;
+            selected.add(channel);
+        }
+        if (selected.size()>256) return false;
+        if (!selected.isEmpty() && (!existing || plan == null || !plan.ready
+                || !plan.upgradeChannels().containsAll(selected))) return false;
+        upgradeChannels.clear(); upgradeChannels.addAll(selected);
+        upgradeReview.clear(); releaseUpgradePhaseData();
+        upgradeCount = 0; upgradeApproved = false; upgradeNetwork = "";
+        needed.rows.clear(); shortage.rows.clear(); errors.rows.clear(); funding.clear();
+        pending.clear(); cursor = total = placed = 0;
+        auto = false;
+        resetPlan();
+        state = selected.isEmpty() ? (previewLayers == 0 ? State.DRAFT : State.PREVIEW) : State.INSPECTING_UPGRADE;
+        changed();
+        return true;
+    }
+
+    private boolean upgradeAnchor(WorldServer world) {
+        if (!requireChunk(world,x,y,z)) return false;
+        if (!existing || !anchorValid(world)) { stop("upgradeAnchor",x,y,z); return false; }
+        return true;
+    }
+
+    private void restartReplacementInspection() {
+        upgradeReview.clear();
+        upgradeReviewSources.clear();
+        upgradeCount = cursor = total = placed = 0;
+        reason = detail = "";
+        issue = null;
+        state = State.INSPECTING_UPGRADE;
+        revision++;
+        changed();
+    }
+
+    void inspectUpgrade(EntityPlayerMP actor, WorldServer world, long deadline) {
+        if (state != State.INSPECTING_UPGRADE || plan == null || !plan.ready || !upgradeAnchor(world)) return;
+        if (!plan.upgradeChannels().containsAll(upgradeChannels)) { stop("upgradeScope",x,y,z); return; }
+        for (int n = 0; cursor < plan.size && n < 8192 && System.nanoTime() < deadline; n++,cursor++) {
+            Blueprint.Cell cell = plan.at(cursor,xyz);
+            if (!upgradeChannels.contains(plan.upgradeChannel(cell))) continue;
+            int px=xyz[0],py=xyz[1],pz=xyz[2];
+            if (!requireChunk(world,px,py,pz)) return;
+            ChannelUpgrade.Result result = plan.upgrade(cell,world,px,py,pz,upgradeChannels);
+            if (result.kind == ChannelUpgrade.Kind.BLOCKED) { stop("obstruction",px,py,pz); return; }
+            if (result.kind != ChannelUpgrade.Kind.REPLACE) continue;
+            if (!UpgradePlacement.supports(result)) { stop("upgradePlacement",px,py,pz); return; }
+            if (!upgradeReview.add(result)) { stop("upgradeRows",px,py,pz); return; }
+            if (!upgradeReviewSources.add(px,py,pz,result)) { stop("upgradeRows",px,py,pz); return; }
+            upgradeCount = upgradeReview.count;
+        }
+        changed();
+        if (cursor == plan.size) {
+            cursor = 0; total = upgradeCount; placed = 0;
+            reason = upgradeCount == 0 ? "upgradeEmpty" : "";
+            state = State.UPGRADE_REVIEW;
+            upgradeReview.releaseIndex();
+            revision++;
+            changed();
+        }
+    }
+
+    boolean startUpgrade() {
+        if (!upgrading() || state != State.UPGRADE_REVIEW || upgradeCount == 0) return false;
+        upgradeApproved = true;
+        beginUpgradeScan();
+        return true;
+    }
+
+    /** An unexecuted review returns to ordinary mode only after every real reserved item is recovered. */
+    boolean continueOrdinaryBuild(EntityPlayerMP actor, WorldServer world) {
+        if (!upgrading() || state!=State.UPGRADE_REVIEW || upgradeApproved
+                || deleteRequested || dismantleRequested) return false;
+        if (!hasReserved() && savedLink==null) return setUpgradeChannels(Collections.emptySet());
+        upgradeReturnToBuild=true;
+        upgradeReturnLayers=previewLayers;
+        auto=false;
+        cancelForRefund(actor,world);
+        return true;
+    }
+
+    private void resumeOrdinaryAfterUpgradeRefund() {
+        if (!upgradeReturnToBuild || hasReserved() || savedLink!=null || deleteRequested || dismantleRequested) return;
+        upgradeReturnToBuild=false;
+        upgradeChannels.clear(); upgradeReview.clear(); releaseUpgradePhaseData();
+        upgradeCount=0; upgradeApproved=false; upgradeNetwork="";
+        cursor=total=placed=0; pending.clear();
+        needed.rows.clear(); shortage.rows.clear(); errors.rows.clear(); funding.clear();
+        previewLayers=upgradeReturnLayers;
+        state=previewLayers==0 ? State.DRAFT : State.PREVIEW;
+        resetPlan();
+        changed();
+    }
+
+    private void beginUpgradeScan() {
+        upgradeScan.clear();
+        if (upgradeScanSources==upgradeReviewSources) upgradeScanSources=new UpgradeSnapshot(); else upgradeScanSources.clear();
+        needed.rows.clear(); shortage.rows.clear(); errors.rows.clear();
+        pending.clear(); cursor = total = placed = 0;
+        reason = detail = ""; issue = null;
+        state = State.SCANNING;
+        revision++;
+        changed();
     }
 
     void configureTarget(ItemStack stack) {
@@ -492,7 +785,17 @@ final class BuildTask {
     }
 
     void start() {
+        if (upgrading()) {
+            if (state == State.UPGRADE_REVIEW) { startUpgrade(); return; }
+            if (state == State.BLOCKED && !upgradeApproved) {
+                restartReplacementInspection();
+                return;
+            }
+            if (!upgradeApproved) return;
+            if (state == State.BLOCKED || state == State.MISSING) { beginUpgradeScan(); return; }
+        }
         if (state == State.READY) {
+            invalidateOrdinaryProgress();
             state = State.QUEUED;
             changed();
             return;
@@ -500,11 +803,11 @@ final class BuildTask {
         if (state != State.DRAFT && state != State.PREVIEW && state != State.MISSING && state != State.BLOCKED) return;
         if (target == null) return;
         if (confirmed == null) resetPlan();
-        if (state != State.BLOCKED) placed = 0;
+        invalidateOrdinaryProgress();
+        total = placed = 0;
         issue = null;
         state = State.SCANNING;
         cursor = 0;
-        total = placed;
         pending.clear();
         needed.rows.clear();
         errors.rows.clear();
@@ -538,7 +841,7 @@ final class BuildTask {
         changed();
     }
 
-    private boolean anchorValid(WorldServer world) {
+    private boolean anchorValid(World world) {
         TileEntity te = world.getTileEntity(x, y, z);
         if (!(te instanceof IGregTechTileEntity)) return false;
         IGregTechTileEntity gt = (IGregTechTileEntity) te;
@@ -571,16 +874,19 @@ final class BuildTask {
     }
 
     void scan(EntityPlayerMP actor, WorldServer world, long deadline) {
+        if (upgrading()) { scanUpgrade(actor,world,deadline); return; }
         if (plan == null || !plan.ready) return;
+        if (!prepareOrdinaryProgress(world, deadline)) return;
         for (int n = 0;
                 cursor < plan.size && n < 8192 && System.nanoTime() < deadline;
                 n++, cursor++) {
-            Blueprint.Cell c = plan.at(cursor, xyz);
+            plan.at(cursor, xyz);
             int px = xyz[0], py = xyz[1], pz = xyz[2];
             if (!requireChunk(world, px, py, pz)) return;
-            boolean matches = cursor == 0 ? anchorValid(world) : materialMatches(c, world, px, py, pz);
-            confirm(cursor, matches && !world.isAirBlock(px, py, pz));
-            if (matches) {
+            ordinaryCell(cursor, world, ordinaryWork, false);
+            updateOrdinaryProgress(cursor, ordinaryWork);
+            confirm(cursor, ordinaryWork.status == OrdinaryStatus.INSTALLED);
+            if (ordinaryWork.matches) {
                 continue;
             }
             if (cursor == 0
@@ -588,24 +894,17 @@ final class BuildTask {
                 stop("anchor", px, py, pz);
                 return;
             }
-            boolean blankRitual =
-                    c.inscribedRitual
-                            && world.getBlock(px, py, pz) == c.block
-                            && world.getBlockMetadata(px, py, pz) == 0;
-            MaterialSelection selection = c.choice == null ? null : selection(px, py, pz);
-            ItemStack material = selection == null ? c.item : selection.item();
-            if ((!blankRitual && !world.isAirBlock(px, py, pz)) || material == null
-                    || selection != null && selection.conflict) {
+            ItemStack material = ordinaryWork.material;
+            if (ordinaryWork.status != OrdinaryStatus.MISSING) {
                 stop("obstruction", px, py, pz);
                 return;
             }
-            if (!blankRitual) needed.add(material, 1);
+            if (!ordinaryWork.blankRitual) needed.add(material, 1);
             pending.set(cursor);
-            total++;
         }
         changed();
         if (cursor < plan.size) return;
-        if (total == placed) {
+        if (pending.isEmpty()) {
             finish(actor, world);
             return;
         }
@@ -633,7 +932,83 @@ final class BuildTask {
     }
 
     boolean hasReserved() {
-        return !backpack.rows.isEmpty() || !held.rows.isEmpty() || !salvage.rows.isEmpty();
+        return !backpack.rows.isEmpty() || !held.rows.isEmpty() || !salvage.rows.isEmpty()
+                || upgradeRecovery != null || upgradeRecoveryFault;
+    }
+
+    private void scanUpgrade(EntityPlayerMP actor, WorldServer world, long deadline) {
+        if (plan == null || !plan.ready || !upgradeApproved || !recoverUpgrade(world) || !upgradeAnchor(world)) return;
+        if (!plan.upgradeChannels().containsAll(upgradeChannels)) { stop("upgradeScope",x,y,z); return; }
+        for (int n=0; cursor<plan.size && n<8192 && System.nanoTime()<deadline; n++,cursor++) {
+            Blueprint.Cell cell=plan.at(cursor,xyz);
+            if (!upgradeChannels.contains(plan.upgradeChannel(cell))) continue;
+            int px=xyz[0],py=xyz[1],pz=xyz[2];
+            if (!requireChunk(world,px,py,pz)) return;
+            ChannelUpgrade.Result result=plan.upgrade(cell,world,px,py,pz,upgradeChannels);
+            if (result.kind==ChannelUpgrade.Kind.BLOCKED) { stop("obstruction",px,py,pz); return; }
+            if (result.kind!=ChannelUpgrade.Kind.REPLACE) continue;
+            if (!UpgradePlacement.supports(result)) { stop("upgradePlacement",px,py,pz); return; }
+            if (!upgradeScan.add(result)) { stop("upgradeRows",px,py,pz); return; }
+            if (!upgradeScanSources.add(px,py,pz,result)) { stop("upgradeRows",px,py,pz); return; }
+            needed.add(result.target,1);
+            pending.set(cursor);
+            total++;
+        }
+        changed();
+        if (cursor<plan.size) return;
+        cursor=0;
+        // A changed live bill is reviewable before any new extraction, even when resuming a partial run.
+        if (!upgradeScan.same(upgradeReview) || !upgradeScanSources.same(upgradeReviewSources) || upgradeScan.count==0) {
+            upgradeReview.copyFrom(upgradeScan); upgradeCount=upgradeReview.count;
+            upgradeReviewSources=upgradeScanSources;
+            upgradeScan.clear();
+            upgradeReview.releaseIndex();
+            upgradeApproved=false;
+            state=State.UPGRADE_REVIEW;
+            reason=upgradeCount==0 ? "upgradeEmpty" : "upgradeChanged";
+            revision++; changed(); return;
+        }
+        // The approved scan is identical to the review: keep one coordinate mask, not two.
+        upgradeReviewSources=upgradeScanSources;
+        upgradeScan.clear();
+        if (actor.capabilities.isCreativeMode) {
+            state=State.QUEUED; reason=""; changed(); return;
+        }
+        Wireless net=Wireless.find(this,world,actor);
+        String status=upgradeDepositProblem(net);
+        if (!status.isEmpty()) { reason=status; state=State.MISSING; changed(); return; }
+        if (upgradeNetwork.isEmpty()) { upgradeNetwork=key; changed(); }
+        quote(actor,net,false);
+        if (shortage.rows.isEmpty()) {
+            quote(actor,net,true);
+            if (shortage.rows.isEmpty()) { state=State.QUEUED; reason=""; changed(); return; }
+        }
+        state=State.MISSING;
+        revision++; changed(); notify(actor,"missing");
+    }
+
+    private String upgradeDepositProblem(Wireless net) {
+        if (!upgradeNetwork.isEmpty() && !upgradeNetwork.equals(key)) return "upgradeNetwork";
+        if (key.isEmpty()) return "upgradeUnbound";
+        return depositProblem(net,true);
+    }
+
+    private boolean recoverUpgrade(WorldServer world) {
+        if (upgradeRecoveryFault) {
+            reason="upgradeRollback"; if (state!=State.REFUND) state=State.BLOCKED; changed(); return false;
+        }
+        if (upgradeRecovery==null) return true;
+        UpgradePlacement.Recovery cell=upgradeRecovery;
+        if (!requireChunk(world,cell.x,cell.y,cell.z)) return false;
+        if (!UpgradePlacement.recover(cell,world)) {
+            pointAt(cell.x,cell.y,cell.z); reason="upgradeRollback";
+            if (state!=State.REFUND) state=State.BLOCKED;
+            changed(); return false;
+        }
+        ledger.restoreOwnership(world,cell.x,cell.y,cell.z,cell.owned);
+        upgradeRecovery=null;
+        changed();
+        return true;
     }
 
     int reserved(ItemStack item) {
@@ -647,6 +1022,11 @@ final class BuildTask {
     void submit(EntityPlayerMP actor, WorldServer world) {
         if (state != State.MISSING) return;
         Wireless net = Wireless.find(this, world, actor);
+        if (upgrading()) {
+            String status=upgradeDepositProblem(net);
+            if (!status.isEmpty()) { reason=status; changed(); return; }
+            if (upgradeNetwork.isEmpty()) { upgradeNetwork=key; changed(); }
+        }
         if (net == null || !net.allows(SecurityPermissions.EXTRACT)) {
             reason = "permission";
             changed();
@@ -702,6 +1082,9 @@ final class BuildTask {
     }
 
     void tickOrder(WorldServer world, EntityPlayerMP actor, boolean online) throws Exception {
+        if (!upgradeNetwork.isEmpty() && !upgradeNetwork.equals(key)) {
+            reason="upgradeNetwork"; detach(); changed(); return;
+        }
         Wireless net = Wireless.find(this, world, actor);
         if (net == null) {
             reason = "network";
@@ -777,6 +1160,7 @@ final class BuildTask {
     }
 
     private void refund(Wireless net) {
+        if (!upgradeNetwork.isEmpty() && !upgradeNetwork.equals(key)) { reason="upgradeNetwork"; changed(); return; }
         if (net != null) deposit(net, held);
     }
 
@@ -792,18 +1176,26 @@ final class BuildTask {
     }
 
     void cancel(EntityPlayerMP actor, WorldServer world) {
+        // In REFUND the existing GUI uses cancel again as its retry action. Preserve the requested
+        // return-to-build intent there, while explicit deletion/dismantling always takes precedence.
+        if (state!=State.REFUND || deleteRequested || dismantleRequested) upgradeReturnToBuild=false;
+        cancelForRefund(actor,world);
+    }
+
+    private void cancelForRefund(EntityPlayerMP actor, WorldServer world) {
         boolean manualRecovery = state == State.REFUND && key.isEmpty();
         if (state != State.REFUND) {
             state = State.REFUND;
             previewLayers = 0;
             funding.clear();
-            plan = null;
+            discardCachedPlan();
             reason = "";
             issue = null;
             detail = "";
             // Preserve a detached link until its CPU can see the cancellation.
             if (order != null) order.saveLink();
             if (savedLink == null) clearOrder();
+            releaseUpgradePhaseData();
             changed();
         }
         if (manualRecovery && savedLink == null) {
@@ -815,6 +1207,10 @@ final class BuildTask {
     }
 
     void retryRefund(EntityPlayerMP actor, WorldServer world) {
+        if (!recoverUpgrade(world)) return;
+        if (!upgradeNetwork.isEmpty() && !upgradeNetwork.equals(key)) {
+            reason="upgradeNetwork"; changed(); return;
+        }
         if (savedLink != null) {
             try {
                 tickOrder(world, actor, false);
@@ -829,6 +1225,7 @@ final class BuildTask {
             Wireless net = Wireless.find(this, world, actor);
             status = depositProblem(net, !salvage.rows.isEmpty());
             if (status.isEmpty()) {
+                if (upgrading()) deposit(net, salvage);
                 deposit(net, held);
                 deposit(net, backpack);
                 deposit(net, salvage);
@@ -839,6 +1236,9 @@ final class BuildTask {
             reason = status;
             changed();
         }
+        if (!hasReserved() && savedLink==null) { upgradeNetwork=""; changed(); }
+        if (!hasReserved() && savedLink==null) releaseUpgradePhaseData();
+        resumeOrdinaryAfterUpgradeRefund();
     }
 
     private static int giveToInventory(EntityPlayerMP actor, ItemStack type, int count) {
@@ -927,6 +1327,7 @@ final class BuildTask {
             dismantleRequested = false;
             reason = detail = "";
             issue = null;
+            releaseUpgradePhaseData();
             notify(actor, "dismantled");
             changed();
             store.completed(this, actor, world);
@@ -941,7 +1342,8 @@ final class BuildTask {
     }
 
     private boolean returnSalvage(Wireless net, WorldServer world) {
-        String status = depositProblem(net, true);
+        if (!salvage.rows.isEmpty() && world.getTotalWorldTime()<nextSalvageRetry) return false;
+        String status = upgrading() ? upgradeDepositProblem(net) : depositProblem(net, true);
         if (status.isEmpty() && !salvage.rows.isEmpty()) {
             deposit(net, salvage);
             if (!salvage.rows.isEmpty()) status = "refundSpace";
@@ -958,16 +1360,19 @@ final class BuildTask {
     }
 
     void verify(EntityPlayerMP actor, WorldServer world, long deadline) {
+        if (upgrading()) { verifyUpgrade(actor,world,deadline); return; }
         if (plan == null || !plan.ready) return;
+        if (!prepareOrdinaryProgress(world, deadline)) return;
         for (int n = 0;
                 cursor < plan.size && n < 8192 && System.nanoTime() < deadline;
                 n++, cursor++) {
-            Blueprint.Cell c = plan.at(cursor, xyz);
+            plan.at(cursor, xyz);
             int px = xyz[0], py = xyz[1], pz = xyz[2];
             if (!requireChunk(world, px, py, pz)) return;
-            boolean matches = cursor == 0 ? anchorValid(world) : materialMatches(c, world, px, py, pz);
-            confirm(cursor, matches && !world.isAirBlock(px, py, pz));
-            if (!matches) {
+            ordinaryCell(cursor, world, ordinaryWork, false);
+            updateOrdinaryProgress(cursor, ordinaryWork);
+            confirm(cursor, ordinaryWork.status == OrdinaryStatus.INSTALLED);
+            if (!ordinaryWork.matches) {
                 stop("obstruction", px, py, pz);
                 return;
             }
@@ -977,6 +1382,8 @@ final class BuildTask {
     }
 
     void finish(EntityPlayerMP actor, WorldServer world) {
+        if (!upgradeNetwork.isEmpty() && !upgradeNetwork.equals(key)) { reason="upgradeNetwork"; changed(); return; }
+        if (upgrading() && !salvage.rows.isEmpty() && !returnSalvage(Wireless.find(this,world,actor),world)) return;
         refund(Wireless.find(this, world, actor));
         returnBackpack(actor);
         funding.clear();
@@ -986,16 +1393,22 @@ final class BuildTask {
         previewLayers = 0;
         reason = "";
         changed();
-        notify(actor, "done");
-        plan = null;
+        notify(actor, upgrading() ? "upgraded" : "done");
+        discardCachedPlan();
+        if (upgrading()) releaseUpgradePhaseData();
+        if (!hasReserved()) upgradeNetwork="";
         store.completed(this, actor, world);
     }
 
     int build(EntityPlayerMP actor, WorldServer world, int budget, long deadline) {
+        if (upgrading()) return buildUpgrade(actor,world,budget,deadline);
         if (plan == null || !plan.ready || budget <= 0) return 0;
+        if (!prepareOrdinaryProgress(world, deadline)) return 0;
         boolean creative = actor.capabilities.isCreativeMode;
         if (!requireChunk(world, x, y, z)) return 0;
         if (cursor > 0 && !anchorValid(world)) {
+            ordinaryCell(0, world, ordinaryWork, false);
+            updateOrdinaryProgress(0, ordinaryWork);
             confirm(0, false);
             stop("anchor", x, y, z);
             return 0;
@@ -1009,25 +1422,16 @@ final class BuildTask {
             Blueprint.Cell c = plan.at(cursor, xyz);
             int px = xyz[0], py = xyz[1], pz = xyz[2];
             if (!requireChunk(world, px, py, pz)) break;
-            boolean matches = cursor == 0 ? anchorValid(world) : materialMatches(c, world, px, py, pz);
-            confirm(cursor, matches && !world.isAirBlock(px, py, pz));
-            if (matches) {
-                if (pending.get(cursor)) {
-                    placed++;
-                    pending.clear(cursor);
-                }
+            ordinaryCell(cursor, world, ordinaryWork, false);
+            updateOrdinaryProgress(cursor, ordinaryWork);
+            confirm(cursor, ordinaryWork.status == OrdinaryStatus.INSTALLED);
+            if (ordinaryWork.matches) {
+                pending.clear(cursor);
                 continue;
             }
-            boolean blankRitual =
-                    c.inscribedRitual
-                            && world.getBlock(px, py, pz) == c.block
-                            && world.getBlockMetadata(px, py, pz) == 0;
-            MaterialSelection selection = c.choice == null ? null : selection(px, py, pz);
-            ItemStack material = selection == null ? c.item : selection.item();
-            if (cursor == 0 && existing
-                    || material == null
-                    || selection != null && selection.conflict
-                    || !blankRitual && !world.isAirBlock(px, py, pz)) {
+            boolean blankRitual = ordinaryWork.blankRitual;
+            ItemStack material = ordinaryWork.material;
+            if (ordinaryWork.status != OrdinaryStatus.MISSING) {
                 stop("obstruction", px, py, pz);
                 break;
             }
@@ -1092,9 +1496,7 @@ final class BuildTask {
                 else held.add(input, -1);
                 funding.add(material, input, -1);
             }
-            if (!pending.get(cursor)) total++;
             pending.clear(cursor);
-            placed++;
             used++;
             changed();
             if (cursor == 0) {
@@ -1106,16 +1508,22 @@ final class BuildTask {
                         ((IAlignment) gt.getMetaTileEntity()).setExtendedFacing(facing);
                 }
                 if (!anchorValid(world)) {
+                    ordinaryCell(cursor, world, ordinaryWork, false);
+                    updateOrdinaryProgress(cursor, ordinaryWork);
                     stop("anchor", px, py, pz);
                     break;
                 }
             } else if (!materialMatches(c, world, px, py, pz)) {
+                ordinaryCell(cursor, world, ordinaryWork, false);
+                updateOrdinaryProgress(cursor, ordinaryWork);
                 if (!blankRitual && !world.isAirBlock(px, py, pz)) ledger.record(world, px, py, pz);
                 stop("obstruction", px, py, pz);
                 break;
             }
             if (!blankRitual && !world.isAirBlock(px, py, pz)) ledger.record(world, px, py, pz);
-            if (material != null) confirm(cursor, true);
+            ordinaryCell(cursor, world, ordinaryWork, false);
+            updateOrdinaryProgress(cursor, ordinaryWork);
+            confirm(cursor, ordinaryWork.status == OrdinaryStatus.INSTALLED);
         }
         changed();
         if (cursor >= plan.size) {
@@ -1124,6 +1532,102 @@ final class BuildTask {
             changed();
         }
         return used;
+    }
+
+    private int buildUpgrade(EntityPlayerMP actor, WorldServer world, int budget, long deadline) {
+        if (plan==null || !plan.ready || budget<=0 || !recoverUpgrade(world) || !upgradeAnchor(world)) return 0;
+        if (world.getTotalWorldTime()<nextSalvageRetry) return 0;
+        Wireless net=Wireless.find(this,world,actor);
+        if (!salvage.rows.isEmpty() && !returnSalvage(net,world)) return 0;
+        boolean creative=actor.capabilities.isCreativeMode;
+        if (!creative) {
+            String status=upgradeDepositProblem(net);
+            if (!status.isEmpty()) { reason=status; changed(); return 0; }
+        }
+        state=State.BUILDING; reason="";
+        int used=0;
+        for (int n=0; cursor<plan.size && used<budget && n<8192 && System.nanoTime()<deadline; n++,cursor++) {
+            Blueprint.Cell cell=plan.at(cursor,xyz);
+            if (!upgradeChannels.contains(plan.upgradeChannel(cell))) continue;
+            int px=xyz[0],py=xyz[1],pz=xyz[2];
+            if (!requireChunk(world,px,py,pz)) break;
+            ChannelUpgrade.Result result=plan.upgrade(cell,world,px,py,pz,upgradeChannels);
+            if (result.kind==ChannelUpgrade.Kind.BLOCKED) { stop("obstruction",px,py,pz); break; }
+            if (pending.get(cursor) && !upgradeScanSources.matches(px,py,pz,result)) {
+                stop("rescan",px,py,pz); break;
+            }
+            if (result.kind==ChannelUpgrade.Kind.KEEP || result.kind==ChannelUpgrade.Kind.SKIP) {
+                if (pending.get(cursor)) { pending.clear(cursor); placed++; changed(); }
+                continue;
+            }
+            if (!pending.get(cursor)) { stop("rescan",px,py,pz); break; }
+            if (px==x && py==y && pz==z || !UpgradePlacement.supports(result)
+                    || !ledger.canRecord(result.targetBlock,result.targetMeta)) {
+                stop("upgradePlacement",px,py,pz); break;
+            }
+            ItemStack material=result.target;
+            ItemStack input=creative ? null : funding.next(material);
+            if (!creative && (input==null || funding.count(material)<1
+                    || backpack.count(input)==0 && held.count(input)==0)) { stop("rescan",px,py,pz); break; }
+            if (!world.checkNoEntityCollision(AxisAlignedBB.getBoundingBox(px,py,pz,px+1,py+1,pz+1))) {
+                pointAt(px,py,pz); reason="occupied"; changed(); break;
+            }
+            if (!creative) {
+                // Simulation is not a storage reservation. A later race leaves the real old item in
+                // persistent salvage and pauses before the next replacement instead of dropping it.
+                appeng.api.storage.data.IAEItemStack remainder=net.items.injectItems(
+                        appeng.util.item.AEItemStack.create(result.previous).setStackSize(1),Actionable.SIMULATE,net.source);
+                if (remainder!=null && remainder.getStackSize()>0) {
+                    reason="refundSpace"; pointAt(px,py,pz); nextSalvageRetry=world.getTotalWorldTime()+20; changed(); break;
+                }
+                if (salvage.count(result.previous)==Integer.MAX_VALUE) { stop("upgradeRows",px,py,pz); break; }
+            }
+            UpgradePlacement.Recovery transaction=new UpgradePlacement.Recovery(px,py,pz,result.oldBlock,result.oldMeta,
+                    result.targetBlock,result.targetMeta,ledger.matches(world,px,py,pz));
+            upgradeRecovery=transaction;
+            changed();
+            UpgradePlacement.Outcome outcome=UpgradePlacement.replace(transaction,actor,world,material);
+            if (outcome!=UpgradePlacement.Outcome.SUCCESS) {
+                if (transaction.oldMatches(world)) {
+                    ledger.restoreOwnership(world,px,py,pz,transaction.owned);
+                    upgradeRecovery=null;
+                }
+                stop(upgradeRecovery==null ? outcome==UpgradePlacement.Outcome.DENIED ? "denied" : "upgradePlacement"
+                        : "upgradeRollback",px,py,pz);
+                break;
+            }
+            // Commit exactly one reserved target and one proven old component. Creative contributes neither.
+            if (!creative) {
+                if (backpack.count(input)>0) backpack.add(input,-1); else held.add(input,-1);
+                funding.add(material,input,-1);
+                salvage.add(result.previous,1);
+            }
+            ledger.record(world,px,py,pz);
+            upgradeCommitted.set(cursor);
+            upgradeRecovery=null;
+            pending.clear(cursor); placed++; used++;
+            confirm(cursor,true);
+            revision++; changed();
+            if (!salvage.rows.isEmpty() && !returnSalvage(net,world)) {
+                cursor++;
+                break;
+            }
+        }
+        changed();
+        if (cursor>=plan.size) { cursor=0; state=State.VERIFYING; changed(); }
+        return used;
+    }
+
+    private void verifyUpgrade(EntityPlayerMP actor, WorldServer world, long deadline) {
+        if (plan==null || !plan.ready || !recoverUpgrade(world) || !upgradeAnchor(world)) return;
+        for (int n=0; cursor<plan.size && n<8192 && System.nanoTime()<deadline; n++,cursor++) {
+            if (!upgradeCommitted.get(cursor)) continue;
+            plan.at(cursor,xyz);
+            if (!requireChunk(world,xyz[0],xyz[1],xyz[2])) return;
+            if (!ledger.matches(world,xyz[0],xyz[1],xyz[2])) { stop("obstruction",xyz[0],xyz[1],xyz[2]); return; }
+        }
+        changed();
+        if (cursor==plan.size) finish(actor,world);
     }
 
     NBTTagCompound save() {
@@ -1141,6 +1645,27 @@ final class BuildTask {
         n.setInteger("z", z);
         n.setInteger("facing", facing.getIndex());
         n.setBoolean("existing", existing);
+        if (upgrading()) {
+            NBTTagList scope=new NBTTagList();
+            n.setBoolean("exactReplacement", true);
+            for (String channel : upgradeChannels) scope.appendTag(new NBTTagString(channel));
+            n.setTag("upgradeChannels",scope);
+            n.setTag("upgradeRows",upgradeReview.save());
+            if (state==State.SCANNING) n.setTag("upgradeScan",upgradeScan.save());
+            if (upgradeReviewSources.count>0) n.setTag("upgradeReviewSources",upgradeReviewSources.save());
+            if (upgradeScanSources==upgradeReviewSources && upgradeScanSources.count>0) n.setBoolean("upgradeSourcesShared",true);
+            else if (upgradeScanSources.count>0) n.setTag("upgradeScanSources",upgradeScanSources.save());
+            n.setInteger("upgradeCount",upgradeCount);
+            n.setBoolean("upgradeApproved",upgradeApproved);
+            if (!upgradeCommitted.isEmpty()) n.setByteArray("upgradeCommitted",upgradeCommitted.toByteArray());
+        }
+        if (!upgradeNetwork.isEmpty()) n.setString("upgradeNetwork",upgradeNetwork);
+        if (upgradeReturnToBuild) {
+            n.setBoolean("upgradeReturnToBuild",true);
+            n.setByte("upgradeReturnLayers",(byte)upgradeReturnLayers);
+        }
+        if (upgradeRecovery!=null) n.setTag("upgradeRecovery",upgradeRecovery.save());
+        if (upgradeRecoveryFault) n.setBoolean("upgradeRecoveryFault",true);
         n.setString("state", state.name());
         n.setString("reason", reason);
         n.setString("detail", detail);
@@ -1194,6 +1719,38 @@ final class BuildTask {
         t.key = n.getString("key");
         t.state = State.valueOf(n.getString("state"));
         t.reason = n.getString("reason");
+        NBTTagList scope=n.getTagList("upgradeChannels",8);
+        if (scope.tagCount()<=256)
+            for (int i=0;i<scope.tagCount();i++) {
+                String channel=scope.getStringTagAt(i);
+                if (!channel.trim().isEmpty()) t.upgradeChannels.add(channel);
+            }
+        t.upgradeApproved=n.getBoolean("upgradeApproved");
+        t.upgradeNetwork=n.getString("upgradeNetwork");
+        t.upgradeReturnToBuild=n.getBoolean("upgradeReturnToBuild");
+        t.upgradeReturnLayers=n.getByte("upgradeReturnLayers")&7;
+        t.upgradeCommitted=BitSet.valueOf(n.getByteArray("upgradeCommitted"));
+        boolean validReview=t.upgradeReview.load(n.getTagList("upgradeRows",10));
+        boolean validScan=t.upgradeScan.load(n.getTagList("upgradeScan",10));
+        boolean validReviewSources=t.upgradeReviewSources.load(n.getCompoundTag("upgradeReviewSources"));
+        boolean validScanSources;
+        if (n.getBoolean("upgradeSourcesShared")) {
+            t.upgradeScanSources=t.upgradeReviewSources; validScanSources=validReviewSources;
+        } else validScanSources=t.upgradeScanSources.load(n.getCompoundTag("upgradeScanSources"));
+        t.upgradeCount=t.upgradeReview.count;
+        if (n.hasKey("upgradeRecovery")) t.upgradeRecovery=UpgradePlacement.Recovery.load(n.getCompoundTag("upgradeRecovery"));
+        t.upgradeRecoveryFault=n.getBoolean("upgradeRecoveryFault") || n.hasKey("upgradeRecovery") && t.upgradeRecovery==null;
+        boolean reviewPhase=t.state==State.INSPECTING_UPGRADE || t.state==State.UPGRADE_REVIEW || t.state==State.SCANNING
+                || t.state==State.BLOCKED || t.state==State.MISSING || t.ordering() || t.state==State.READY
+                || t.state==State.QUEUED || t.state==State.BUILDING || t.state==State.VERIFYING;
+        boolean scanMismatch=t.state==State.SCANNING ? t.upgradeScan.count!=t.upgradeScanSources.count
+                : t.upgradeApproved && reviewPhase && t.upgradeReview.count!=t.upgradeScanSources.count;
+        if (scope.tagCount()>256 || !validReview || !validScan || !validReviewSources || !validScanSources
+                || t.upgrading() && reviewPhase && (t.upgradeReview.count!=t.upgradeReviewSources.count || scanMismatch)) {
+            t.state=State.BLOCKED; t.reason="upgradeRows"; t.upgradeApproved=false;
+        }
+        if (t.upgradeRecoveryFault) { t.state=State.REFUND; t.reason="upgradeRollback"; }
+        if (!t.upgrading() && t.upgradeRecovery!=null) { t.state=State.REFUND; t.reason="upgradeRollback"; }
         if (t.state == State.DISMANTLING && "harvestTool".equals(t.reason)) t.reason = "";
         t.detail = n.getString("detail");
         int[] problem = n.getIntArray("issue");
@@ -1264,6 +1821,14 @@ final class BuildTask {
         t.errors.read(n.getTagList("errors", 10));
         t.orderId = n.getString("orderId");
         if (n.hasKey("link")) t.savedLink = n.getCompoundTag("link");
+        // An old, unconfirmed list omits higher tiers and same-tier variants. Reinspect before presenting it.
+        if (t.upgrading() && !t.upgradeApproved && !n.getBoolean("exactReplacement")
+                && (t.state == State.UPGRADE_REVIEW || t.state == State.INSPECTING_UPGRADE)) {
+            t.restartReplacementInspection();
+        }
+        if (t.state!=State.INSPECTING_UPGRADE) t.upgradeReview.releaseIndex();
+        if (t.state==State.DONE || t.state==State.DISMANTLED || t.state==State.REFUND) t.releaseUpgradePhaseData();
+        t.resumeOrdinaryAfterUpgradeRefund();
         return t;
     }
 }

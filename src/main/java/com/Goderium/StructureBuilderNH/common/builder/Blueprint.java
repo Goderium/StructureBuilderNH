@@ -39,6 +39,7 @@ public final class Blueprint extends GTDummyWorld {
     private final Deque<Piece<?>> pieces = new ArrayDeque<>();
     private final Map<IStructureElement<?>, Integer> hatches = new IdentityHashMap<>();
     private final HatchNames hatchLabels = new HatchNames();
+    private final ChannelUpgrade upgrades = new ChannelUpgrade(this);
     private int ambiguousHatches = -1;
     private final Map<IStructureElement<?>, Cell> last = new IdentityHashMap<>();
     private final Map<IStructureElement<?>, Boolean> predicateCache = new IdentityHashMap<>();
@@ -446,6 +447,7 @@ public final class Blueprint extends GTDummyWorld {
         long bit = 1L << (i & 63);
         s.solid[i >> 6] = (s.solid[i >> 6] & ~bit) | (cell.air ? 0 : bit);
         s.hatch[i >> 6] = (s.hatch[i >> 6] & ~bit) | (cell.hatch ? bit : 0);
+        upgrades.record(old, cell, px, py, pz);
         if (!bounds.contains(px, py, pz)) bounds = bounds.union(Bounds.point(px, py, pz));
     }
 
@@ -480,6 +482,47 @@ public final class Blueprint extends GTDummyWorld {
     Cell cellAt(int px, int py, int pz) {
         Section section = index.get(new ChunkPosition(px >> 4, py >> 4, pz >> 4));
         return section == null ? null : section.cells[slot(px, py, pz)];
+    }
+
+    /** Actual supported native named channels, independent of the current world's blocks. */
+    Set<String> upgradeChannels() { return upgrades.channels(); }
+
+    /** O(1), populated by the normal incremental blueprint walk; never queries a world or loads a chunk. */
+    String upgradeChannel(Cell cell) { return upgrades.channel(cell); }
+
+    ChannelUpgrade.Result upgrade(Cell cell, World world, int px, int py, int pz, Set<String> enabled) {
+        return upgrades.inspect(cell, world, px, py, pz, enabled);
+    }
+
+    /** Native writes stay in this private world's one sampling slot and are restored before returning. */
+    ChannelUpgrade.Material sampleUpgrade(Cell cell, ItemStack trigger, int px, int py, int pz) {
+        int ox = sx, oy = sy, oz = sz, om = meta;
+        Block previous = sample;
+        TileEntity previousTile = tile;
+        boolean previousAir = wroteAir;
+        try {
+            sx = px; sy = py; sz = pz;
+            sample = Blocks.air; meta = 0; tile = null; wroteAir = false;
+            if (!cell.element.placeBlock(controller, this, px, py, pz, trigger)
+                    || sx != px || sy != py || sz != pz || sample == Blocks.air
+                    || sample == StructureLibAPI.getBlockHint() || tile != null || sample.hasTileEntity(meta)) return null;
+            Block block = sample;
+            int blockMeta = meta;
+            IStructureElement.BlocksToPlace choices = cell.element.getBlocksToPlace(
+                    controller, this, px, py, pz, trigger, env);
+            if (choices == null || choices.getStacks() == null) return null;
+            ItemStack item = null;
+            for (ItemStack candidate : choices.getStacks()) {
+                if (candidate == null || item != null || !(candidate.getItem() instanceof ItemBlock)
+                        || candidate.hasTagCompound() || candidate.getMetadata() == 32767) return null;
+                item = candidate;
+            }
+            if (item == null || Block.getBlockFromItem(item.getItem()) != block
+                    || item.getItem().getMetadata(item.getMetadata()) != blockMeta) return null;
+            return new ChannelUpgrade.Material(block, blockMeta, item);
+        } finally {
+            sx = ox; sy = oy; sz = oz; meta = om; sample = previous; tile = previousTile; wroteAir = previousAir;
+        }
     }
 
     void displayAir(int cursor, boolean air) {

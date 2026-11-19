@@ -146,6 +146,8 @@ public final class BuilderTasks extends WorldSavedData {
                     && t.z == z
                     && t.state != BuildTask.State.DONE
                     && t.state != BuildTask.State.REFUND && t.state != BuildTask.State.DISMANTLED) {
+                if (host != null && !t.existing && p.worldObj instanceof WorldServer)
+                    t.attachExisting((WorldServer) p.worldObj);
                 select(stack, t);
                 return;
             }
@@ -260,7 +262,8 @@ public final class BuilderTasks extends WorldSavedData {
             ItemStack item = tools.get(t.owner + t.tool);
             boolean present =
                     player != null && !player.isDead && player.worldObj == world && item != null;
-            boolean work = t.state == BuildTask.State.VERIFYING || t.state == BuildTask.State.SCANNING
+            boolean work = t.state == BuildTask.State.INSPECTING_UPGRADE
+                    || t.state == BuildTask.State.VERIFYING || t.state == BuildTask.State.SCANNING
                     || t.state == BuildTask.State.QUEUED || t.state == BuildTask.State.BUILDING;
             if (!present || (!work && t.state != BuildTask.State.DISMANTLING)) t.workChunks.release();
             if (world == null) {
@@ -286,7 +289,7 @@ public final class BuilderTasks extends WorldSavedData {
                 }
             }
             if (!present) {
-                if (turn - viewers.getOrDefault(t.id, turn - 2000) > 600) t.plan = null;
+                if (t.plan != null && turn - viewers.getOrDefault(t.id, turn - 2000) > 600) t.discardCachedPlan();
                 if (t.state == BuildTask.State.QUEUED || t.state == BuildTask.State.BUILDING)
                     t.reason = player == null ? "offline" : "tool";
                 continue;
@@ -300,6 +303,7 @@ public final class BuilderTasks extends WorldSavedData {
                 if (t.key.isEmpty()) t.key = tag(item).getString("network");
                 if (Math.floorMod(turn - t.id.hashCode(), 100) == 0
                         && (t.hasReserved() || t.savedLink != null)) t.retryRefund(player, world);
+                if (t.state != BuildTask.State.REFUND) continue;
                 if (t.deleteRequested && !t.hasReserved() && t.savedLink == null) remove(t,player);
                 else t.beginDismantle();
                 continue;
@@ -307,18 +311,19 @@ public final class BuilderTasks extends WorldSavedData {
             if (!t.ordering()
                     && t.state != BuildTask.State.DONE
                     && t.state != BuildTask.State.REFUND
-                    && t.held.rows.isEmpty()) t.key = tag(item).getString("network");
+                    && t.held.rows.isEmpty() && !t.keepsUpgradeBinding()) t.key = tag(item).getString("network");
             boolean viewed =
                     turn - viewers.getOrDefault(t.id, turn - 2000) < 30
                             || t.previewLayers != 0;
             if (!work && !viewed) {
-                if (turn - viewers.getOrDefault(t.id, turn - 2000) > 600) t.plan = null;
+                if (t.plan != null && turn - viewers.getOrDefault(t.id, turn - 2000) > 600) t.discardCachedPlan();
                 continue;
             }
             if (t.state == BuildTask.State.DONE || t.state == BuildTask.State.REFUND) continue;
             try {
                 if (System.nanoTime() < deadline) t.prepare(player, deadline);
-                if (t.state == BuildTask.State.SCANNING) t.scan(player, world, deadline);
+                if (t.state == BuildTask.State.INSPECTING_UPGRADE) t.inspectUpgrade(player, world, deadline);
+                else if (t.state == BuildTask.State.SCANNING) t.scan(player, world, deadline);
                 else if (t.state == BuildTask.State.VERIFYING) t.verify(player, world, deadline);
                 if (t.state == BuildTask.State.QUEUED || t.state == BuildTask.State.BUILDING)
                     running.computeIfAbsent(t.owner + t.tool, k -> new ArrayList<>()).add(t);
@@ -361,7 +366,7 @@ public final class BuilderTasks extends WorldSavedData {
         StructureBuilderNH.LOG.warn("Cannot process builder task {}", t.id, e);
         t.state = t.dismantleRequested ? BuildTask.State.TEARDOWN_PAUSED : BuildTask.State.BLOCKED;
         t.reason = "unsupported";
-        t.plan = null;
+        t.discardCachedPlan();
         t.changed();
     }
 

@@ -100,6 +100,16 @@ final class PlacementLedger {
                 && palette.get(section.types[i] & 65535).equals(identity(world, x, y, z));
     }
 
+    /** A rolled-back upgrade restores ownership only when this task owned the original cell. */
+    void restoreOwnership(World world, int x, int y, int z, boolean wasOwned) {
+        if (wasOwned) record(world, x, y, z);
+        else forget(x, y, z);
+    }
+
+    boolean canRecord(Block block, int meta) {
+        return palette.size()<65536 || types.containsKey(Block.blockRegistry.getNameForObject(block)+"/"+meta+"/-1");
+    }
+
     void forget(int x, int y, int z) {
         long key = key(x, y, z);
         Section section = sections.get(key);
