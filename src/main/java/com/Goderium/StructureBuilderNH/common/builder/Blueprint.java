@@ -14,6 +14,8 @@ import gregtech.api.interfaces.metatileentity.IMetaTileEntity;
 import gregtech.api.interfaces.tileentity.IGregTechTileEntity;
 import gregtech.api.metatileentity.implementations.MTEHatch;
 import gregtech.api.util.HatchElementBuilder;
+import gregtech.api.util.GlassTier;
+import gregtech.api.util.GTStructureUtility;
 import gregtech.common.GTDummyWorld;
 import gregtech.common.blocks.ItemMachines;
 
@@ -36,7 +38,16 @@ public final class Blueprint extends GTDummyWorld {
     private final Map<ChunkPosition, Section> index = new HashMap<>();
     private final Deque<Piece<?>> pieces = new ArrayDeque<>();
     private final Map<IStructureElement<?>, Integer> hatches = new IdentityHashMap<>();
+    private final HatchNames hatchLabels = new HatchNames();
+    private int ambiguousHatches = -1;
     private final Map<IStructureElement<?>, Cell> last = new IdentityHashMap<>();
+    private final Map<IStructureElement<?>, Boolean> predicateCache = new IdentityHashMap<>();
+    private final Map<IStructureElement<?>, MaterialChoice.NativeMaterial> materialDefaults = new IdentityHashMap<>();
+    final List<MaterialChoice> choices = new ArrayList<>();
+    private final Map<String, MaterialChoice> choiceCache = new HashMap<>();
+    private final Map<String, Cell> roleCells = new HashMap<>();
+    private final Map<ShapeRegistry.Shape, Integer> shapeScopes = new IdentityHashMap<>();
+    private final Map<String, Integer> pieceScopes = new HashMap<>();
     final Materials bill = new Materials();
     final ItemStack trigger;
     final int x, y, z;
@@ -49,12 +60,14 @@ public final class Blueprint extends GTDummyWorld {
     private int sx, sy, sz;
     private Block sample = Blocks.air;
     private int meta;
+    private boolean wroteAir;
     private TileEntity host, tile;
     boolean ready;
 
     static final class Section {
         final int x, y, z, id;
         final Cell[] cells = new Cell[4096];
+        final int[] ordinals = new int[4096];
         final long[] solid = new long[64], hatch = new long[64];
         final long[] confirmed = new long[64];
 
@@ -71,10 +84,15 @@ public final class Blueprint extends GTDummyWorld {
         final ItemStack item;
         final Block block;
         final int meta;
-        final boolean air, hatch, inscribedRitual;
+        final boolean air, hatch, inscribedRitual, nativePredicate;
         final int dots;
+        MaterialChoice choice;
+        String piece = "";
+        String role = "";
+        char symbol;
+        List<Cell> constraints;
 
-        Cell(IStructureElement<Object> e, ItemStack s, Block b, int m, boolean a, int dots) {
+        Cell(IStructureElement<Object> e, ItemStack s, Block b, int m, boolean a, int dots, boolean nativePredicate) {
             element = e;
             item = s;
             block = b;
@@ -83,6 +101,7 @@ public final class Blueprint extends GTDummyWorld {
             air = a;
             this.dots = dots;
             hatch = dots >= 0;
+            this.nativePredicate = nativePredicate;
         }
     }
 
@@ -92,6 +111,28 @@ public final class Blueprint extends GTDummyWorld {
         if (id <= 0 || id >= GregTechAPI.METATILEENTITIES.length) return null;
         IMetaTileEntity m = GregTechAPI.METATILEENTITIES[id];
         return m instanceof IConstructable ? m : null;
+    }
+
+    /** Shared logical type translation keys; callers must not modify the returned array. */
+    String[] hatchNames(Cell cell) {
+        return hatchLabels.resolve(cell == null || !cell.hatch ? null : cell.element, controller);
+    }
+
+    /** Same-dot elements with distinct logical categories cannot share one tooltip-only label. */
+    int ambiguousHatchDots() {
+        if (!ready) return 0;
+        if (ambiguousHatches >= 0) return ambiguousHatches;
+        int ambiguous = 0;
+        Map<Integer, String[]> categories = new HashMap<>();
+        for (Map.Entry<IStructureElement<?>, Integer> entry : hatches.entrySet()) {
+            int dots = entry.getValue();
+            if (dots < 0 || dots > 16) continue;
+            String[] names = hatchLabels.resolve(entry.getKey(), controller);
+            String[] previous = categories.putIfAbsent(dots, names);
+            if (previous != null && !Arrays.equals(previous, names)) ambiguous |= 1 << dots;
+        }
+        ambiguousHatches = ambiguous;
+        return ambiguous;
     }
 
     Blueprint(
@@ -122,7 +163,7 @@ public final class Blueprint extends GTDummyWorld {
         if (controller instanceof IAlignment) ((IAlignment) controller).setExtendedFacing(facing);
         if (controller instanceof INEIPreviewModifier)
             ((INEIPreviewModifier) controller).onPreviewConstruct(trigger);
-        put(x, y, z, new Cell(null, target, GregTechAPI.sBlockMachines, m, false, -1));
+        put(x, y, z, new Cell(null, target, GregTechAPI.sBlockMachines, m, false, -1, false));
         ((IConstructable) controller).construct(trigger, false);
         if (pieces.isEmpty() && size <= 1)
             throw new IllegalArgumentException("Controller supplied no structure");
@@ -143,7 +184,10 @@ public final class Blueprint extends GTDummyWorld {
         } catch (IllegalStateException unknown) {
             /* Explicit elements will extend the bounds as they arrive. */
         }
-        pieces.add(new Piece<>(elements, facing, px, py, pz, a, b, c, walker));
+        ShapeRegistry.Shape shape = ShapeRegistry.get(elements);
+        int scope = shape == null ? 0 : shapeScopes.computeIfAbsent(shape,
+                value -> pieceScopes.merge(value.piece, 1, Integer::sum) - 1);
+        pieces.add(new Piece<>(elements, facing, px, py, pz, a, b, c, walker, scope));
     }
 
     private static final class Piece<T> {
@@ -152,6 +196,8 @@ public final class Blueprint extends GTDummyWorld {
         final int x, y, z, a, b, c;
         final int[] abc, xyz = new int[3];
         final IStructureWalker<T> walker;
+        final ShapeRegistry.Shape shape;
+        final int scope;
         int cursor;
 
         Piece(
@@ -163,8 +209,10 @@ public final class Blueprint extends GTDummyWorld {
                 int a,
                 int b,
                 int c,
-                IStructureWalker<T> w) {
+                IStructureWalker<T> w, int scope) {
             elements = e;
+            shape = ShapeRegistry.get(e);
+            this.scope = scope;
             facing = f;
             this.x = x;
             this.y = y;
@@ -177,7 +225,8 @@ public final class Blueprint extends GTDummyWorld {
         }
 
         void next(Blueprint world) {
-            IStructureElement<T> e = elements[cursor++];
+            int elementIndex = cursor++;
+            IStructureElement<T> e = elements[elementIndex];
             if (e.isNavigating()) {
                 abc[0] = (e.resetA() ? a : abc[0]) + e.getStepA();
                 abc[1] = (e.resetB() ? b : abc[1]) + e.getStepB();
@@ -190,11 +239,14 @@ public final class Blueprint extends GTDummyWorld {
                 world.sx = px;
                 world.sy = py;
                 world.sz = pz;
+                world.wroteAir = false;
                 world.sample = Blocks.air;
                 world.meta = 0;
                 world.tile = null;
                 walker.visit(e, world, px, py, pz, abc[0], abc[1], abc[2]);
-                world.record(e, px, py, pz);
+                char symbol = shape == null ? '\0' : shape.symbol(elementIndex);
+                world.record(e, px, py, pz, shape == null ? "" : shape.piece, symbol,
+                        symbol == '\0' ? null : scope == 0 ? shape.role(symbol) : "scope:" + scope + ":" + shape.role(symbol));
             }
             abc[0]++;
         }
@@ -210,10 +262,14 @@ public final class Blueprint extends GTDummyWorld {
     }
 
     @SuppressWarnings("unchecked")
-    private void record(IStructureElement<?> raw, int px, int py, int pz) {
+    private void record(IStructureElement<?> raw, int px, int py, int pz, String piece, char symbol, String role) {
         IStructureElement<Object> e = (IStructureElement<Object>) raw;
-        boolean air = allowsAir(e);
+        boolean nativePredicate = predicateCache.computeIfAbsent(e, MaterialChoice::hasNativePredicate);
+        // The construction default can be air even when the native structure predicate rejects it.
+        boolean air = allowsAir(e) || wroteAir && sample == Blocks.air
+                && e.couldBeValid(controller, this, px, py, pz, trigger);
         ItemStack item = null;
+        ItemStack constructedItem = null;
         if (!air) {
             if (tile instanceof IGregTechTileEntity
                     && ((IGregTechTileEntity) tile).getMetaTileEntity() != null)
@@ -226,6 +282,7 @@ public final class Blueprint extends GTDummyWorld {
                                 .getStacks()
                                 .iterator()
                                 .next();
+            constructedItem = item;
             if (e == StructureUtility.notAir()) item = new ItemStack(Blocks.cobblestone);
             if (item == null || !(item.getItem() instanceof ItemBlock)) {
                 IStructureElement.BlocksToPlace choices =
@@ -254,23 +311,45 @@ public final class Blueprint extends GTDummyWorld {
                 }
             }
         }
+        Block block = sample;
+        int blockMeta = meta;
+        if (!air && nativePredicate) {
+            if (!materialDefaults.containsKey(e))
+                materialDefaults.put(e, MaterialChoice.nativeDefault(
+                        this, e, constructedItem, block, blockMeta, px, py, pz));
+            MaterialChoice.NativeMaterial material = materialDefaults.get(e);
+            if (material != null) {
+                item = material.item;
+                block = material.block;
+                blockMeta = material.meta;
+            }
+        }
         // Inscribed ritual stones have no obtainable item variant. Charge a blank and inscribe after placement.
-        if (isInscribedRitual(sample, meta))
-            item = new ItemStack(sample, 1, 0);
-        Cell cell = last.get(e);
-        if (cell == null
-                || cell.block != sample
-                || cell.meta != meta
-                || !Materials.equal(cell.item, item)) {
-            cell =
-                    new Cell(
-                            e,
-                            item,
-                            sample,
-                            meta,
-                            air,
-                            hatches.computeIfAbsent(e, Blueprint::hatchDots));
+        if (isInscribedRitual(block, blockMeta))
+            item = new ItemStack(block, 1, 0);
+        if (role == null) role = "cell:" + (px-x) + "," + (py-y) + "," + (pz-z);
+        Cell cell = roleCells.get(role);
+        if (cell == null || cell.element != e || cell.block != block || cell.meta != blockMeta
+                || cell.air != air || !Materials.equal(cell.item, item)) {
+            cell = new Cell(
+                    e,
+                    item,
+                    block,
+                    blockMeta,
+                    air,
+                    hatches.computeIfAbsent(e, Blueprint::hatchDots),
+                    nativePredicate);
+            cell.piece = piece;
+            cell.role = role;
+            cell.symbol = symbol;
+            if (!choiceCache.containsKey(role)) {
+                MaterialChoice group = MaterialChoice.discover(this, cell, px, py, pz);
+                choiceCache.put(role, group);
+                if (group != null) choices.add(group);
+            }
+            cell.choice = choiceCache.get(role);
             last.put(e, cell);
+            roleCells.put(role, cell);
         }
         put(px, py, pz, cell);
     }
@@ -281,7 +360,8 @@ public final class Blueprint extends GTDummyWorld {
                 && "AWWayofTime:ritualStone".equals(Block.blockRegistry.getNameForObject(block));
     }
 
-    private static boolean allowsAir(IStructureElement<?> e) {
+    static boolean allowsAir(IStructureElement<?> e) {
+        if (e == null) return false;
         if (e == StructureUtility.isAir()) return true;
         if (e instanceof IStructureElementChain)
             for (IStructureElement<?> child : ((IStructureElementChain<?>) e).fallbacks())
@@ -340,10 +420,29 @@ public final class Blueprint extends GTDummyWorld {
         if (old == null) {
             if (size == positions.length) positions = Arrays.copyOf(positions, size * 2);
             if (initiallyConfirmed.test(size)) s.confirmed[i >> 6] |= 1L << (i & 63);
+            s.ordinals[i] = size;
             positions[size++] = s.id << 12 | i;
-        } else if (old.item != null) bill.add(old.item, -1);
+        } else if (old.choice != null) old.choice.count--;
+        else if (old.item != null) bill.add(old.item, -1);
+        if (old != null && old.element != null) {
+            List<Cell> constraints = new ArrayList<>();
+            if (old.constraints == null) constraints.add(old);
+            else constraints.addAll(old.constraints);
+            if (cell.constraints == null) constraints.add(cell);
+            else constraints.addAll(cell.constraints);
+            Cell primary = old.choice != null ? old : cell;
+            Cell combined = new Cell(primary.element, primary.item, primary.block, primary.meta,
+                    primary.air, primary.dots, primary.nativePredicate);
+            combined.piece = primary.piece;
+            combined.role = primary.role;
+            combined.symbol = primary.symbol;
+            combined.choice = primary.choice;
+            combined.constraints = constraints;
+            cell = combined;
+        }
         s.cells[i] = cell;
-        if (cell.item != null) bill.add(cell.item, 1);
+        if (cell.choice != null) cell.choice.count++;
+        else if (cell.item != null) bill.add(cell.item, 1);
         long bit = 1L << (i & 63);
         s.solid[i >> 6] = (s.solid[i >> 6] & ~bit) | (cell.air ? 0 : bit);
         s.hatch[i >> 6] = (s.hatch[i >> 6] & ~bit) | (cell.hatch ? bit : 0);
@@ -372,12 +471,59 @@ public final class Blueprint extends GTDummyWorld {
         return s.cells[i];
     }
 
+    int indexAt(int px, int py, int pz) {
+        Section section = index.get(new ChunkPosition(px >> 4, py >> 4, pz >> 4));
+        if (section == null || section.cells[slot(px, py, pz)] == null) return -1;
+        return section.ordinals[slot(px, py, pz)];
+    }
+
+    Cell cellAt(int px, int py, int pz) {
+        Section section = index.get(new ChunkPosition(px >> 4, py >> 4, pz >> 4));
+        return section == null ? null : section.cells[slot(px, py, pz)];
+    }
+
+    void displayAir(int cursor, boolean air) {
+        int position = positions[cursor], slot = position & 4095;
+        Section section = sections.get(position >>> 12);
+        long bit = 1L << (slot & 63);
+        section.solid[slot >> 6] = section.solid[slot >> 6] & ~bit | (air ? 0 : bit);
+    }
+
+    boolean accepts(Cell cell, ItemStack item, int px, int py, int pz) {
+        int ox = sx, oy = sy, oz = sz, om = meta;
+        Block previous = sample;
+        TileEntity previousTile = tile;
+        try {
+            sx = px; sy = py; sz = pz;
+            sample = item == null ? Blocks.air : Block.getBlockFromItem(item.getItem());
+            meta = item == null ? 0 : item.getItem().getMetadata(item.getMetadata());
+            tile = null;
+            return matches(cell, this, px, py, pz);
+        } finally {
+            sx = ox; sy = oy; sz = oz; meta = om; sample = previous; tile = previousTile;
+        }
+    }
+
     boolean matches(Cell c, World world, int px, int py, int pz) {
+        if (c.constraints != null) {
+            for (Cell source : c.constraints) if (!matchesSingle(source, world, px, py, pz)) return false;
+            return true;
+        }
+        return matchesSingle(c, world, px, py, pz);
+    }
+
+    private boolean matchesSingle(Cell c, World world, int px, int py, int pz) {
         Block b = world.getBlock(px, py, pz);
         if (b == Blocks.air) return c.air;
         if (c.element == StructureUtility.notAir()) return true;
         if (c.element != null && !c.element.couldBeValid(controller, world, px, py, pz, trigger))
             return false;
+        if (c.choice != null) return c.choice.allowsAir || c.choice.indexAt(world, px, py, pz) >= 0;
+        if (c.nativePredicate) return true;
+        if (c.element != null && c.element.getClass().getEnclosingClass() == GTStructureUtility.class
+                && c.element.getClass().getEnclosingMethod() != null
+                && "triggerItemTransform".equals(c.element.getClass().getEnclosingMethod().getName())
+                && GlassTier.getGlassBlockTier(c.block, c.meta) != null) return true;
         TileEntity te = world.getTileEntity(px, py, pz);
         // The pack replaces vanilla beacons in the live world. Honor elements that accept the
         // replacement.
@@ -399,7 +545,7 @@ public final class Blueprint extends GTDummyWorld {
             return Item.getItemFromBlock(b) == c.item.getItem()
                     && b.damageDropped(world.getBlockMetadata(px, py, pz)) == c.item.getMetadata();
         }
-        return c.air && c.element != StructureUtility.isAir()
+        return c.air && c.element != StructureUtility.isAir() && allowsAir(c.element)
                 || b == c.block && world.getBlockMetadata(px, py, pz) == c.meta;
     }
 
@@ -429,6 +575,7 @@ public final class Blueprint extends GTDummyWorld {
         sx = px;
         sy = py;
         sz = pz;
+        wroteAir = b == Blocks.air;
         sample = b;
         meta = m;
         tile = null;

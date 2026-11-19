@@ -16,6 +16,7 @@ import net.minecraft.nbt.*;
 import net.minecraft.tileentity.TileEntity;
 import net.minecraft.util.*;
 import net.minecraft.world.WorldServer;
+import net.minecraft.world.World;
 
 import java.util.*;
 
@@ -60,6 +61,11 @@ final class BuildTask {
     ItemStack target;
     int tier = 1, cursor, total, placed, revision;
     int previewLayers;
+    NBTTagCompound materialSelections = new NBTTagCompound();
+    NBTTagCompound materialCells = new NBTTagCompound(), materialGroups = new NBTTagCompound();
+    private Blueprint selectionPlan;
+    private MaterialSelection[] selectedMaterials;
+    private final Map<MaterialChoice, int[]> materialTotals = new IdentityHashMap<>();
     NBTTagCompound pendingDefaults = new NBTTagCompound();
     NBTTagCompound channels = new NBTTagCompound(), savedLink;
     final Materials needed = new Materials(),
@@ -78,6 +84,267 @@ final class BuildTask {
     private BitSet pending = new BitSet();
     private BitSet confirmed = new BitSet();
     private long nextSalvageRetry;
+
+    static final class MaterialSelection {
+        final int x, y, z;
+        final String groupKey, piece;
+        final char symbol;
+        final Blueprint.Cell cell;
+        final MaterialChoice group;
+        final boolean supported;
+        int index;
+        boolean explicit, conflict;
+
+        MaterialSelection(Blueprint.Cell cell, int x, int y, int z) {
+            this.cell = cell;
+            this.x = x; this.y = y; this.z = z;
+            group = cell.choice;
+            supported = group != null;
+            groupKey = group == null ? "" : group.key;
+            piece = cell.piece;
+            symbol = cell.symbol;
+            index = group == null ? -1 : group.defaultIndex;
+        }
+
+        ItemStack item() { return supported ? group.optionItem(index) : cell.item; }
+        String name() { return supported ? group.optionName(index) : cell.item == null ? "" : cell.item.getDisplayName(); }
+    }
+
+    private String materialPosition(int px, int py, int pz) {
+        return (px-x) + "," + (py-y) + "," + (pz-z);
+    }
+
+    private void ensureSelections() {
+        if (plan == null || !plan.ready || selectionPlan == plan) return;
+        materialTotals.clear();
+        if (plan.choices.isEmpty()) {
+            selectedMaterials = null;
+            selectionPlan = plan;
+            return;
+        }
+        Map<String, Integer> legacyRoles = new HashMap<>();
+        Map<MaterialChoice, IStructureElement<?>> legacySources = new IdentityHashMap<>();
+        Map<IStructureElement<?>, Integer> sourceRoles = new IdentityHashMap<>();
+        for (MaterialChoice group : plan.choices) {
+            if (group.legacyKey != null) legacyRoles.merge(group.legacyKey, 1, Integer::sum);
+            Blueprint.Cell first = plan.cellAt(group.x, group.y, group.z);
+            if (first != null && first.choice == group) {
+                legacySources.put(group, first.element);
+                sourceRoles.merge(first.element, 1, Integer::sum);
+            }
+        }
+        for (MaterialChoice group : plan.choices) {
+            IStructureElement<?> source = legacySources.get(group);
+            if (group.allowsAir || group.legacyKey == null || materialSelections.hasKey(group.key)
+                    || source == null || sourceRoles.get(source) != 1
+                    || legacyRoles.get(group.legacyKey) != 1 || !materialSelections.hasKey(group.legacyKey, 11)) continue;
+            int[] legacy = materialSelections.getIntArray(group.legacyKey).clone();
+            long secondary = 0;
+            boolean valid = legacy.length == group.optionCount();
+            for (int i = 0; i < legacy.length; i++) {
+                if (legacy[i] < 0) valid = false;
+                if (i > 0) secondary += legacy[i];
+            }
+            // The old editor stored only secondary quantities; index zero was implicit.
+            if (valid && secondary <= group.count) {
+                legacy[0] = group.count - (int) secondary;
+                materialSelections.setIntArray(group.key, legacy);
+                changed();
+            }
+        }
+        selectedMaterials = new MaterialSelection[plan.size];
+        Map<MaterialChoice, List<MaterialSelection>> groups = new LinkedHashMap<>();
+        int[] position = new int[3];
+        for (int i = 0; i < plan.size; i++) {
+            Blueprint.Cell cell = plan.at(i, position);
+            if (cell.choice == null) continue;
+            MaterialSelection selection = new MaterialSelection(cell, position[0], position[1], position[2]);
+            selectedMaterials[i] = selection;
+            if (selection.supported) groups.computeIfAbsent(selection.group, g -> new ArrayList<>()).add(selection);
+        }
+        for (Map.Entry<MaterialChoice, List<MaterialSelection>> entry : groups.entrySet()) {
+            MaterialChoice group = entry.getKey();
+            List<MaterialSelection> cells = entry.getValue();
+            group.count = cells.size();
+            int[] remaining = group.allocation(materialSelections);
+            int groupIndex = materialGroups.hasKey(group.key) ? group.optionIndex(materialGroups.getString(group.key)) : -1;
+            boolean hasLocal = !materialCells.hasNoTags();
+            for (MaterialSelection selection : cells) {
+                NBTTagCompound local = hasLocal ? materialCells.getCompoundTag(materialPosition(selection.x, selection.y, selection.z)) : null;
+                int selected = local != null && group.key.equals(local.getString("group"))
+                        ? group.optionIndex(local.getString("option")) : -1;
+                if (selected < 0) selected = groupIndex;
+                if (selected >= 0) {
+                    selection.index = selected;
+                    selection.explicit = true;
+                    if (remaining[selected] > 0) remaining[selected]--;
+                }
+            }
+            int next = 0;
+            for (MaterialSelection selection : cells) {
+                if (!selection.explicit) {
+                    while (next < remaining.length && remaining[next] == 0) next++;
+                    selection.index = next < remaining.length ? next : group.defaultIndex;
+                    if (next < remaining.length) remaining[next]--;
+                }
+                if (!plan.accepts(selection.cell, selection.item(), selection.x, selection.y, selection.z)) {
+                    selection.conflict = true;
+                    if (!selection.explicit) {
+                        for (int i = 0; i < group.optionCount(); i++) {
+                            if (plan.accepts(selection.cell, group.optionItem(i), selection.x, selection.y, selection.z)) {
+                                selection.index = i;
+                                selection.conflict = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            materialTotals.put(group, new int[group.optionCount()]);
+        }
+        for (int i = 0; i < selectedMaterials.length; i++) {
+            MaterialSelection selection = selectedMaterials[i];
+            if (selection != null) {
+                plan.displayAir(i, selection.group.isAir(selection.index));
+                materialTotals.get(selection.group)[selection.index]++;
+            }
+        }
+        selectionPlan = plan;
+    }
+
+    MaterialSelection selection(int px, int py, int pz) {
+        ensureSelections();
+        if (plan == null || !plan.ready || selectedMaterials == null || plan.choices.isEmpty()) return null;
+        int index = plan.indexAt(px, py, pz);
+        return index < 0 ? null : selectedMaterials[index];
+    }
+
+    boolean materialSelectable(int px, int py, int pz) {
+        if (!editable() || plan == null || !plan.ready) return false;
+        int index = plan.indexAt(px, py, pz);
+        if (index < 0 || (confirmed == null ? !pending.get(index) : confirmed.get(index))) return false;
+        MaterialSelection selection = selection(px, py, pz);
+        return selection != null && selection.supported;
+    }
+
+    int previewIndex(MaterialSelection selection, World world) {
+        if (selection == null || !selection.supported) return -1;
+        if (!selection.explicit && world != null && !world.isAirBlock(selection.x, selection.y, selection.z)
+                && plan.matches(selection.cell, world, selection.x, selection.y, selection.z)) {
+            int present = selection.group.indexAt(world, selection.x, selection.y, selection.z);
+            if (present >= 0) return present;
+            if (selection.group.allowsAir) return 0;
+        }
+        return selection.index;
+    }
+
+    ItemStack previewItem(MaterialSelection selection, World world) {
+        if (selection == null || !selection.supported) return null;
+        if (!selection.explicit && world != null && !world.isAirBlock(selection.x, selection.y, selection.z)
+                && plan.matches(selection.cell, world, selection.x, selection.y, selection.z)) {
+            IStructureElement.BlocksToPlace present = IStructureElement.BlocksToPlace.create(
+                    world.getBlock(selection.x, selection.y, selection.z),
+                    world.getBlockMetadata(selection.x, selection.y, selection.z));
+            if (present != null && present.getStacks() != null)
+                for (ItemStack item : present.getStacks()) if (item != null) return item;
+        }
+        return selection.item();
+    }
+
+    boolean previewConflict(MaterialSelection selection, World world) {
+        return selection != null && (selection.conflict || selection.explicit && world != null
+                && !world.isAirBlock(selection.x, selection.y, selection.z)
+                && selection.group.indexAt(world, selection.x, selection.y, selection.z) != selection.index);
+    }
+
+    boolean setMaterialSelection(int px, int py, int pz, int index, boolean wholeGroup) {
+        if (!editable()) return false;
+        MaterialSelection selection = selection(px, py, pz);
+        if (selection == null || !selection.supported || index < 0 || index >= selection.group.optionCount()
+                || wholeGroup && !selection.group.groupSelectable()) return false;
+        if (wholeGroup) {
+            materialGroups.setString(selection.group.key, selection.group.optionToken(index));
+            for (Object value : new ArrayList<>(com.gtnewhorizon.structurelib.util.MiscUtils.getTagKeys(materialCells))) {
+                String key = (String) value;
+                if (selection.group.key.equals(materialCells.getCompoundTag(key).getString("group"))) materialCells.removeTag(key);
+            }
+            int[] quantities = new int[selection.group.optionCount()];
+            quantities[index] = selection.group.count;
+            materialSelections.setIntArray(selection.group.key, quantities);
+        } else {
+            NBTTagCompound local = new NBTTagCompound();
+            local.setString("group", selection.group.key);
+            local.setString("option", selection.group.optionToken(index));
+            materialCells.setTag(materialPosition(px, py, pz), local);
+        }
+        materialsChanged(selection.group, plan.indexAt(px, py, pz), wholeGroup);
+        return true;
+    }
+
+    int[] effectiveAllocation(MaterialChoice group) {
+        ensureSelections();
+        int[] counts = materialTotals.get(group);
+        return counts == null ? new int[group.optionCount()] : counts.clone();
+    }
+
+    void setMaterialQuantities(MaterialChoice group, int[] counts) {
+        if (!editable() || plan == null || !plan.ready || !plan.choices.contains(group) || counts.length != group.optionCount()) return;
+        ensureSelections();
+        int[] minimum = new int[group.optionCount()];
+        for (MaterialSelection selection : selectedMaterials) {
+            if (selection == null || selection.group != group || materialCells.hasNoTags()) continue;
+            NBTTagCompound local = materialCells.getCompoundTag(materialPosition(selection.x, selection.y, selection.z));
+            if (!group.key.equals(local.getString("group"))) continue;
+            int index = group.optionIndex(local.getString("option"));
+            if (index >= 0) minimum[index]++;
+        }
+        int left = group.count;
+        for (int value : minimum) left -= value;
+        int[] quantities = minimum.clone();
+        for (int i = 1; i < quantities.length; i++) {
+            int extra = Math.min(left, Math.max(0, counts[i] - quantities[i]));
+            quantities[i] += extra;
+            left -= extra;
+        }
+        quantities[0] += left;
+        materialSelections.setIntArray(group.key, quantities);
+        materialGroups.removeTag(group.key);
+        materialsChanged(group, -1, true);
+    }
+
+    private void materialsChanged(MaterialChoice group, int position, boolean wholeGroup) {
+        state = previewLayers == 0 ? State.DRAFT : State.PREVIEW;
+        needed.rows.clear(); shortage.rows.clear(); errors.rows.clear();
+        if (confirmed == null) {
+            confirmed = new BitSet(plan.size);
+            confirmed.set(0, plan.size);
+            confirmed.andNot(pending);
+        }
+        if (wholeGroup) {
+            for (int i = 0; i < selectedMaterials.length; i++) {
+                MaterialSelection selection = selectedMaterials[i];
+                if (selection != null && selection.group == group) confirm(i, false);
+            }
+        } else if (position >= 0) confirm(position, false);
+        pending.clear();
+        reason = detail = "";
+        issue = null;
+        selectionPlan = null;
+        revision++;
+        ensureSelections();
+        changed();
+    }
+
+    private boolean materialMatches(Blueprint.Cell cell, WorldServer world, int px, int py, int pz) {
+        if (cell.choice == null) return plan.matches(cell, world, px, py, pz);
+        MaterialSelection selection = selection(px, py, pz);
+        if (selection != null && selection.supported) {
+            if (selection.conflict) return false;
+            if (selection.explicit && selection.group.indexAt(world, px, py, pz) != selection.index) return false;
+            if (world.isAirBlock(px, py, pz) && selection.item() != null) return false;
+        }
+        return plan.matches(cell, world, px, py, pz);
+    }
 
     private boolean initiallyConfirmed(int index) {
         // Older tasks that finished scanning stored only the complementary pending mask.
@@ -121,6 +388,8 @@ final class BuildTask {
 
     void resetPlan() {
         plan = null;
+        selectionPlan = null;
+        selectedMaterials = null;
         confirmed = new BitSet();
         revision++;
         reason = "";
@@ -133,6 +402,11 @@ final class BuildTask {
     }
 
     void configureTarget(ItemStack stack) {
+        if (!Materials.equal(target, stack)) {
+            materialSelections = new NBTTagCompound();
+            materialCells = new NBTTagCompound();
+            materialGroups = new NBTTagCompound();
+        }
         target = ItemStack.copyItemStack(stack);
         if (target == null) previewLayers = 0;
         else target.stackSize = 1;
@@ -188,6 +462,7 @@ final class BuildTask {
                 plan = new Blueprint(target, trigger, facing, x, y, z, actor, this::initiallyConfirmed);
             }
             if (!plan.ready) plan.advance(deadline);
+            if (plan.ready) ensureSelections();
             if (plan.ready && confirmed == null) {
                 confirmed = new BitSet(plan.size);
                 confirmed.set(0, plan.size);
@@ -303,9 +578,11 @@ final class BuildTask {
             Blueprint.Cell c = plan.at(cursor, xyz);
             int px = xyz[0], py = xyz[1], pz = xyz[2];
             if (!requireChunk(world, px, py, pz)) return;
-            boolean matches = cursor == 0 ? anchorValid(world) : plan.matches(c, world, px, py, pz);
-            if (!c.air) confirm(cursor, matches);
-            if (matches) continue;
+            boolean matches = cursor == 0 ? anchorValid(world) : materialMatches(c, world, px, py, pz);
+            confirm(cursor, matches && !world.isAirBlock(px, py, pz));
+            if (matches) {
+                continue;
+            }
             if (cursor == 0
                     && (existing || !plan.controller.isFacingValid(facing.getDirection()))) {
                 stop("anchor", px, py, pz);
@@ -315,11 +592,14 @@ final class BuildTask {
                     c.inscribedRitual
                             && world.getBlock(px, py, pz) == c.block
                             && world.getBlockMetadata(px, py, pz) == 0;
-            if ((!blankRitual && !world.isAirBlock(px, py, pz)) || c.item == null) {
+            MaterialSelection selection = c.choice == null ? null : selection(px, py, pz);
+            ItemStack material = selection == null ? c.item : selection.item();
+            if ((!blankRitual && !world.isAirBlock(px, py, pz)) || material == null
+                    || selection != null && selection.conflict) {
                 stop("obstruction", px, py, pz);
                 return;
             }
-            if (!blankRitual) needed.add(c.item, 1);
+            if (!blankRitual) needed.add(material, 1);
             pending.set(cursor);
             total++;
         }
@@ -685,8 +965,8 @@ final class BuildTask {
             Blueprint.Cell c = plan.at(cursor, xyz);
             int px = xyz[0], py = xyz[1], pz = xyz[2];
             if (!requireChunk(world, px, py, pz)) return;
-            boolean matches = cursor == 0 ? anchorValid(world) : plan.matches(c, world, px, py, pz);
-            if (!c.air) confirm(cursor, matches);
+            boolean matches = cursor == 0 ? anchorValid(world) : materialMatches(c, world, px, py, pz);
+            confirm(cursor, matches && !world.isAirBlock(px, py, pz));
             if (!matches) {
                 stop("obstruction", px, py, pz);
                 return;
@@ -729,8 +1009,8 @@ final class BuildTask {
             Blueprint.Cell c = plan.at(cursor, xyz);
             int px = xyz[0], py = xyz[1], pz = xyz[2];
             if (!requireChunk(world, px, py, pz)) break;
-            boolean matches = cursor == 0 ? anchorValid(world) : plan.matches(c, world, px, py, pz);
-            if (!c.air) confirm(cursor, matches);
+            boolean matches = cursor == 0 ? anchorValid(world) : materialMatches(c, world, px, py, pz);
+            confirm(cursor, matches && !world.isAirBlock(px, py, pz));
             if (matches) {
                 if (pending.get(cursor)) {
                     placed++;
@@ -742,13 +1022,16 @@ final class BuildTask {
                     c.inscribedRitual
                             && world.getBlock(px, py, pz) == c.block
                             && world.getBlockMetadata(px, py, pz) == 0;
+            MaterialSelection selection = c.choice == null ? null : selection(px, py, pz);
+            ItemStack material = selection == null ? c.item : selection.item();
             if (cursor == 0 && existing
-                    || c.item == null
+                    || material == null
+                    || selection != null && selection.conflict
                     || !blankRitual && !world.isAirBlock(px, py, pz)) {
                 stop("obstruction", px, py, pz);
                 break;
             }
-            ItemStack input = creative || blankRitual ? null : funding.next(c.item);
+            ItemStack input = creative || blankRitual ? null : funding.next(material);
             if (!creative
                     && !blankRitual
                     && (input == null || backpack.count(input) == 0 && held.count(input) == 0)) {
@@ -762,7 +1045,7 @@ final class BuildTask {
                 break;
             }
             if (!world.canMineBlock(actor, px, py, pz)
-                    || !actor.canPlayerEdit(px, py, pz, 1, c.item)) {
+                    || !actor.canPlayerEdit(px, py, pz, 1, material)) {
                 stop("denied", px, py, pz);
                 break;
             }
@@ -784,8 +1067,10 @@ final class BuildTask {
                     break;
                 }
             }
-            ItemStack unit = c.item.copy();
+            ItemStack unit = material.copy();
             unit.stackSize = 1;
+            net.minecraft.block.Block beforeBlock = world.getBlock(px, py, pz);
+            int beforeMeta = world.getBlockMetadata(px, py, pz);
             if (!blankRitual
                     && !unit.tryPlaceItemIntoWorld(actor, world, px, py, pz, 1, .5f, .5f, .5f)) {
                 stop("denied", px, py, pz);
@@ -796,10 +1081,16 @@ final class BuildTask {
                     && world.getBlockMetadata(px, py, pz) == 0) {
                 world.setBlockMetadataWithNotify(px, py, pz, c.meta, 3);
             }
+            boolean mutated = beforeBlock != world.getBlock(px, py, pz)
+                    || beforeMeta != world.getBlockMetadata(px, py, pz);
+            if (!mutated) {
+                stop("denied", px, py, pz);
+                break;
+            }
             if (!creative && !blankRitual) {
                 if (backpack.count(input) > 0) backpack.add(input, -1);
                 else held.add(input, -1);
-                funding.add(c.item, input, -1);
+                funding.add(material, input, -1);
             }
             if (!pending.get(cursor)) total++;
             pending.clear(cursor);
@@ -818,12 +1109,13 @@ final class BuildTask {
                     stop("anchor", px, py, pz);
                     break;
                 }
-            } else if (!plan.matches(c, world, px, py, pz)) {
+            } else if (!materialMatches(c, world, px, py, pz)) {
+                if (!blankRitual && !world.isAirBlock(px, py, pz)) ledger.record(world, px, py, pz);
                 stop("obstruction", px, py, pz);
                 break;
             }
-            if (!blankRitual && !c.air) ledger.record(world, px, py, pz);
-            if (!c.air) confirm(cursor, true);
+            if (!blankRitual && !world.isAirBlock(px, py, pz)) ledger.record(world, px, py, pz);
+            if (material != null) confirm(cursor, true);
         }
         changed();
         if (cursor >= plan.size) {
@@ -864,6 +1156,9 @@ final class BuildTask {
         n.setByteArray("pending", pending.toByteArray());
         if (confirmed != null) n.setByteArray("previewConfirmed", confirmed.toByteArray());
         n.setTag("channels", channels);
+        if (!materialSelections.hasNoTags()) n.setTag("materialSelections", materialSelections);
+        if (!materialCells.hasNoTags()) n.setTag("materialCells", materialCells);
+        if (!materialGroups.hasNoTags()) n.setTag("materialGroups", materialGroups);
         if (target != null) n.setTag("target", target.writeToNBT(new NBTTagCompound()));
         n.setTag("backpack", backpack.save());
         n.setTag("funding", funding.save());
@@ -918,6 +1213,9 @@ final class BuildTask {
         t.total = n.getInteger("total");
         t.placed = n.getInteger("placed");
         t.channels = n.getCompoundTag("channels");
+        t.materialSelections = n.getCompoundTag("materialSelections");
+        t.materialCells = n.getCompoundTag("materialCells");
+        t.materialGroups = n.getCompoundTag("materialGroups");
         t.pending = BitSet.valueOf(n.getByteArray("pending"));
         if (n.hasKey("previewConfirmed")) {
             t.confirmed = BitSet.valueOf(n.getByteArray("previewConfirmed"));

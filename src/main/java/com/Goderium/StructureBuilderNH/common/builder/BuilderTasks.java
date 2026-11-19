@@ -43,6 +43,7 @@ public final class BuilderTasks extends WorldSavedData {
     }
 
     private void blockChanged(World world, int x, int y, int z) {
+        PreviewStream.worldChanged(world.provider.dimensionId, x, y, z);
         Map<Long, Set<PlacementLedger>> parts = watched.get(world.provider.dimensionId);
         if (parts == null) return;
         Set<PlacementLedger> ledgers = parts.get(PlacementLedger.key(x, y, z));
@@ -160,7 +161,14 @@ public final class BuilderTasks extends WorldSavedData {
                         z,
                         facing,
                         host != null);
-        if (host != null) t.configureTarget(host.getMetaTileEntity().getStackForm(1));
+        if (host != null) {
+            ItemStack target = host.getMetaTileEntity().getStackForm(1);
+            NBTTagCompound itemTag = target.hasTagCompound()
+                    ? target.getTagCompound() : new NBTTagCompound();
+            host.getMetaTileEntity().setItemNBT(itemTag);
+            if (!itemTag.hasNoTags()) target.setTagCompound(itemTag);
+            t.configureTarget(target);
+        }
         t.key = tag(stack).getString("network");
         if (host == null) unbound.put(t.owner, t);
         else register(t);
@@ -227,6 +235,7 @@ public final class BuilderTasks extends WorldSavedData {
     }
 
     private void tick() {
+        PreviewEdit.drain(this);
         turn++;
         chunkLoadsLeft = 2;
         Map<String, EntityPlayerMP> players = new HashMap<>();
@@ -371,6 +380,7 @@ public final class BuilderTasks extends WorldSavedData {
                 t.detach();
             }
         com.Goderium.StructureBuilderNH.common.WorldHooks.trackedChanges = null;
+        PreviewEdit.clear();
         PreviewStream.clear();
     }
 }

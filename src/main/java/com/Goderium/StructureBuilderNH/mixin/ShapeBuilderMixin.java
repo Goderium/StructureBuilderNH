@@ -26,7 +26,10 @@ public abstract class ShapeBuilderMixin {
     @Inject(method = "build", at = @At("RETURN"), require = 1, remap = false)
     private void rebuild$built(CallbackInfoReturnable<IStructureDefinition<?>> cir) {
         for (Map.Entry<String, int[]> entry : rebuild$sizes.entrySet()) {
-            ShapeRegistry.put(cir.getReturnValue().getStructureFor(entry.getKey()), entry.getValue());
+            IStructureDefinition<?> definition = cir.getReturnValue();
+            String symbols = definition instanceof StructureDefinition
+                    ? ((StructureDefinition<?>) definition).getShapes().get(entry.getKey()) : null;
+            ShapeRegistry.put(definition.getStructureFor(entry.getKey()), entry.getValue(), entry.getKey(), symbols);
         }
     }
 }

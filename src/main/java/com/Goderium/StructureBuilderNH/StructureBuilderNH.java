@@ -44,6 +44,7 @@ public class StructureBuilderNH {
     public void init(FMLInitializationEvent event) {
         FMLCommonHandler.instance().bus().register(new BuilderTasks.Events());
         PreviewStream.register();
+        PreviewEdit.register();
         proxy.register();
         ItemStack terminal =
                 appeng.api.AEApi.instance()

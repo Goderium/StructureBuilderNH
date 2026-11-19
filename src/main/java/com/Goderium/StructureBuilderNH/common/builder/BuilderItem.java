@@ -2,6 +2,8 @@ package com.Goderium.StructureBuilderNH.common.builder;
 
 import appeng.api.features.INetworkEncodable;
 
+import com.Goderium.StructureBuilderNH.StructureBuilderNH;
+
 import com.cleanroommc.modularui.api.IGuiHolder;
 import com.cleanroommc.modularui.factory.*;
 import com.cleanroommc.modularui.screen.*;
@@ -11,6 +13,7 @@ import com.gtnewhorizon.structurelib.alignment.IAlignment;
 import com.gtnewhorizon.structurelib.alignment.enumerable.ExtendedFacing;
 
 import cpw.mods.fml.common.registry.GameRegistry;
+import cpw.mods.fml.common.eventhandler.SubscribeEvent;
 import cpw.mods.fml.relauncher.*;
 
 import gregtech.api.GregTechAPI;
@@ -22,6 +25,8 @@ import net.minecraft.tileentity.TileEntity;
 import net.minecraft.util.*;
 import net.minecraft.world.World;
 import net.minecraftforge.common.util.ForgeDirection;
+import net.minecraftforge.common.MinecraftForge;
+import net.minecraftforge.event.entity.player.PlayerInteractEvent;
 
 import java.util.List;
 
@@ -55,6 +60,7 @@ public final class BuilderItem extends Item
         GameRegistry.registerItem(ITEM, "wireless_builder");
         GameRegistry.registerItem(RECEIPT, "material_receipt");
         GregTechAPI.addDummyWorld(Blueprint.class);
+        MinecraftForge.EVENT_BUS.register(ITEM);
     }
 
     public String getEncryptionKey(ItemStack s) {
@@ -97,7 +103,8 @@ public final class BuilderItem extends Item
             float a,
             float b,
             float c) {
-        if (w.isRemote) return false;
+        if (w.isRemote) return StructureBuilderNH.proxy.editPreview(p);
+        if (StructureBuilderNH.proxy.consumePreviewUse(p)) return true;
         TileEntity tile = w.getTileEntity(x, y, z);
         IGregTechTileEntity host = null;
         if (tile instanceof IGregTechTileEntity) {
@@ -123,8 +130,27 @@ public final class BuilderItem extends Item
         return true;
     }
 
+    @SubscribeEvent
+    public void pickPreview(PlayerInteractEvent event) {
+        if (event.action != PlayerInteractEvent.Action.RIGHT_CLICK_AIR
+                && event.action != PlayerInteractEvent.Action.RIGHT_CLICK_BLOCK) return;
+        EntityPlayer player = event.entityPlayer;
+        ItemStack held = player.getHeldItem();
+        if (held == null || held.getItem() != this) return;
+        if (event.world.isRemote) {
+            if (event.action == PlayerInteractEvent.Action.RIGHT_CLICK_AIR && StructureBuilderNH.proxy.editPreview(player))
+                event.setCanceled(true);
+        } else if (StructureBuilderNH.proxy.consumePreviewUse(player)) event.setCanceled(true);
+    }
+
     @Override
     public ItemStack onItemRightClick(ItemStack s, World w, EntityPlayer p) {
+        if (w.isRemote) {
+            // Some item-use callers bypass Forge's RIGHT_CLICK_AIR event.
+            StructureBuilderNH.proxy.editPreview(p);
+            return s;
+        }
+        if (StructureBuilderNH.proxy.consumePreviewUse(p)) return s;
         if (!w.isRemote && getMovingObjectPositionFromPlayer(w, p, false) == null) {
             BuilderTasks.tag(s).setBoolean("openQueue", p.isSneaking());
             if (!p.isSneaking()) selectAtFeet(p, s);

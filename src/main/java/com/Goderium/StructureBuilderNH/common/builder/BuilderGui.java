@@ -25,6 +25,8 @@ import com.cleanroommc.modularui.widgets.textfield.TextFieldWidget;
 import com.gtnewhorizon.structurelib.ChannelDescription;
 import com.gtnewhorizon.structurelib.structure.IChannelDefinition;
 
+import gregtech.api.util.GTUtility.ItemId;
+
 import net.minecraft.entity.player.EntityPlayerMP;
 import net.minecraft.item.ItemStack;
 import net.minecraft.nbt.NBTTagCompound;
@@ -42,7 +44,7 @@ final class BuilderGui {
         MAIN,
         CHANNELS,
         ORDER,
-        TASKS
+        TASKS, CHOICES, GROUPS
     }
 
     private static final int W = 316,
@@ -72,6 +74,11 @@ final class BuilderGui {
     private final Map<String, QueueLine> lines = new HashMap<>();
     private final Map<String, IntValue> channelValues = new LinkedHashMap<>();
     private int channelRevision;
+    private final ListWidget<IWidget, ?> alternatives = new ListWidget<>();
+    private final List<IntValue> amounts = new ArrayList<>();
+    private final ListWidget<IWidget, ?> roles = new ListWidget<>();
+    private final List<Integer> matchingGroups = new ArrayList<>();
+    private int choiceIndex = -1, choiceRevision, choiceSize;
     BuildTask task;
     Page page = Page.MAIN;
     BuildTask.State observed;
@@ -303,6 +310,8 @@ final class BuilderGui {
                         break;
                     }
                 });
+        sync.registerSyncedAction("openMaterial", false, true, this::openMaterial);
+        sync.registerSyncedAction("materialChoice", false, true, this::editChoice);
         sync.registerSyncedAction("apply", false, true, this::applyChannels);
         sync.registerSyncedAction("rows", true, false, this::receive);
         sync.onServerTick(
@@ -378,7 +387,9 @@ final class BuilderGui {
         ParentWidget<?> main = page(Page.MAIN),
                 channel = page(Page.CHANNELS),
                 order = page(Page.ORDER),
-                tasks = page(Page.TASKS);
+                tasks = page(Page.TASKS),
+                choice = page(Page.CHOICES),
+                groups = page(Page.GROUPS);
         main.child(
                 new PhantomItemSlot()
                         .slot(markerSlot())
@@ -487,6 +498,17 @@ final class BuilderGui {
                 .setEnabledIf(w -> (flags.getIntValue() & 1) != 0);
         control(channel, 239, FOOTER_Y, 68, () -> tr("apply"), () -> submitChannels(false), true)
                 .setEnabledIf(w -> (flags.getIntValue() & 1) != 0);
+
+        heading(groups, "materialRoles", this::name);
+        list(groups, roles, EDGE, 44, LIST_WIDTH, 150);
+        heading(choice, "alternatives", this::name);
+        label(choice, () -> StatCollector.translateToLocalFormatted("structurebuildernh.choiceTotal", String.format(Locale.ROOT, "%,d", choiceSize)),
+                EDGE + 2, 43, ROW_WIDTH, 14, ACCENT);
+        list(choice, alternatives, EDGE, 59, LIST_WIDTH, 130);
+        label(choice, () -> remainder() < 0 ? tr("choiceOverflow") : tr("choiceRemainder"),
+                EDGE + 2, 190, ROW_WIDTH, 14, MUTED);
+        control(choice, 239, FOOTER_Y, 68, () -> tr("apply"), () -> sendChoice(true, choiceIndex, choiceRevision), true)
+                .setEnabledIf(w -> !amounts.isEmpty() && remainder() >= 0);
 
         heading(order, "shortage", this::name);
         label(
@@ -817,8 +839,138 @@ final class BuilderGui {
         return StatCollector.translateToLocalFormatted("structurebuildernh.site", location);
     }
 
+    private void sendChoice(boolean apply, int index, int revision) {
+        sync.callSyncedAction("materialChoice", b -> {
+            writeStringSafe(b, selectedId.getStringValue());
+            b.writeInt(revision);
+            b.writeVarIntToBuffer(index);
+            b.writeBoolean(apply);
+            if (apply) {
+                b.writeVarIntToBuffer(amounts.size());
+                for (int i = 1; i < amounts.size(); i++) b.writeVarIntToBuffer(amounts.get(i).getIntValue());
+            }
+        });
+    }
+
+    private void openMaterial(PacketBuffer b) {
+        String id = readStringSafe(b);
+        int revision = b.readInt(), groupIndex = b.readVarIntFromBuffer(), option = b.readVarIntFromBuffer();
+        update();
+        if (page != Page.MAIN || task == null || !task.id.equals(id) || !task.editable() || task.revision != revision
+                || task.plan == null || !task.plan.ready || groupIndex < 0 || groupIndex >= task.plan.choices.size()) return;
+        MaterialChoice clicked = task.plan.choices.get(groupIndex);
+        if (option < 0 || option >= clicked.items.size()) return;
+        matchingGroups.clear();
+        ItemStack item = clicked.items.get(option);
+        for (int i = 0; i < task.plan.choices.size(); i++) {
+            MaterialChoice group = task.plan.choices.get(i);
+            for (ItemStack candidate : group.items) {
+                if (Materials.equal(candidate, item)) {
+                    matchingGroups.add(i);
+                    break;
+                }
+            }
+        }
+        if (matchingGroups.isEmpty()) return;
+        choiceIndex = matchingGroups.get(0);
+        show(matchingGroups.size() == 1 ? Page.CHOICES : Page.GROUPS);
+    }
+
+    private void editChoice(PacketBuffer b) {
+        String id = readStringSafe(b);
+        int revision = b.readInt(), index = b.readVarIntFromBuffer();
+        boolean apply = b.readBoolean();
+        update();
+        if (task == null || !task.id.equals(id) || !task.editable() || task.revision != revision
+                || task.plan == null || !task.plan.ready || index < 0 || index >= task.plan.choices.size()) return;
+        if (!apply) {
+            if (page == Page.GROUPS && matchingGroups.contains(index)) {
+                choiceIndex = index;
+                show(Page.CHOICES);
+            }
+            return;
+        }
+        if (page != Page.CHOICES || index != choiceIndex) return;
+        MaterialChoice group = task.plan.choices.get(index);
+        if (b.readVarIntFromBuffer() != group.optionCount()) return;
+        int[] counts = new int[group.optionCount()];
+        int left = group.count;
+        for (int i = 1; i < counts.length; i++) {
+            counts[i] = b.readVarIntFromBuffer();
+            if (counts[i] < 0 || counts[i] > left) return;
+            left -= counts[i];
+        }
+        counts[0] = left;
+        task.setMaterialQuantities(group, counts);
+        show(Page.MAIN);
+    }
+
+    private static final class ChoiceEntry {
+        final ItemStack item;
+        final int group, option;
+        int allocated;
+
+        ChoiceEntry(ItemStack item, int group, int option) {
+            this.item = item;
+            this.group = group;
+            this.option = option;
+        }
+    }
+
     private void sendRows() {
         if (tool() == null || tool().getItem() != BuilderItem.ITEM) return;
+        if (page == Page.GROUPS) {
+            if (task == null || !task.editable() || task.plan == null || !task.plan.ready) {
+                show(Page.MAIN);
+                return;
+            }
+            String key = "roles/" + task.id + "/" + task.revision;
+            if (previous.equals(key)) return;
+            previous = key;
+            sync.callSyncedAction("rows", b -> b.writeByte(9));
+            for (int i : matchingGroups) {
+                if (i >= task.plan.choices.size()) continue;
+                MaterialChoice group = task.plan.choices.get(i);
+                sync.callSyncedAction("rows", b -> {
+                    b.writeByte(10);
+                    b.writeInt(task.revision);
+                    b.writeVarIntToBuffer(i);
+                    b.writeVarIntToBuffer(group.count);
+                    b.writeInt(group.x);
+                    b.writeInt(group.y);
+                    b.writeInt(group.z);
+                });
+            }
+            return;
+        }
+        if (page == Page.CHOICES) {
+            if (task == null || !task.editable() || task.plan == null || !task.plan.ready
+                    || choiceIndex < 0 || choiceIndex >= task.plan.choices.size()) {
+                show(Page.MAIN);
+                return;
+            }
+            MaterialChoice group = task.plan.choices.get(choiceIndex);
+            String key = "choice/" + task.id + "/" + choiceIndex + "/" + task.revision;
+            if (previous.equals(key)) return;
+            previous = key;
+            sync.callSyncedAction("rows", b -> {
+                b.writeByte(7);
+                b.writeInt(task.revision);
+                b.writeVarIntToBuffer(choiceIndex);
+                b.writeVarIntToBuffer(group.count);
+            });
+            int[] counts = task.effectiveAllocation(group);
+            for (int i = 0; i < counts.length; i++) {
+                final int option = i;
+                sync.callSyncedAction("rows", b -> {
+                    b.writeByte(8);
+                    b.writeBoolean(group.isAir(option));
+                    if (!group.isAir(option)) ByteBufAdapters.ITEM_STACK.serializeSafe(b, group.optionItem(option));
+                    b.writeVarIntToBuffer(counts[option]);
+                });
+            }
+            return;
+        }
         if (page == Page.CHANNELS) {
             if (task == null) return;
             String key = "channels/" + task.id + "/" + task.revision + "/" + channels.size();
@@ -924,15 +1076,51 @@ final class BuilderGui {
                 list.add(entry.item, entry.count);
         }
         if (list == null) return;
+        boolean catalog = !missing && task.plan != null && list == task.plan.bill;
+        Map<ItemId, ChoiceEntry> alternatives = new LinkedHashMap<>();
+        if (catalog) {
+            Materials combined = new Materials();
+            for (int index = 0; index < task.plan.choices.size(); index++) {
+                MaterialChoice group = task.plan.choices.get(index);
+                int[] quantities = task.effectiveAllocation(group);
+                for (int i = 0; i < quantities.length; i++) {
+                    if (group.isAir(i)) continue;
+                    ItemStack item = group.optionItem(i);
+                    ItemId id = ItemId.create(item);
+                    ChoiceEntry entry = alternatives.get(id);
+                    if (entry == null) {
+                        entry = new ChoiceEntry(item, index, i);
+                        alternatives.put(id, entry);
+                    }
+                    entry.allocated += quantities[i];
+                }
+            }
+            for (ChoiceEntry entry : alternatives.values())
+                combined.add(entry.item, list.count(entry.item) + entry.allocated);
+            for (Map.Entry<ItemId, Materials.Entry> row : list.rows.entrySet())
+                if (!alternatives.containsKey(row.getKey())) combined.add(row.getValue().item, row.getValue().count);
+            list = combined;
+        }
         for (Materials.Entry e : list.rows.values()) {
             int amount = e.count;
-            if (!missing
-                    && task.plan != null
-                    && list == task.plan.bill
+            if (catalog
                     && task.existing
                     && Materials.equal(e.item, task.target)) amount--;
             if (amount <= 0) continue;
             final int n = amount;
+            ChoiceEntry entry = alternatives.get(ItemId.create(e.item));
+            if (entry != null && task.editable()) {
+                sync.callSyncedAction("rows", b -> {
+                    b.writeByte(6);
+                    b.writeInt(task.revision);
+                    b.writeVarIntToBuffer(entry.group);
+                    b.writeVarIntToBuffer(entry.option);
+                    b.writeVarIntToBuffer(entry.allocated);
+                    ByteBufAdapters.ITEM_STACK.serializeSafe(b, e.item);
+                    b.writeVarIntToBuffer(n);
+                });
+                continue;
+            }
             sync.callSyncedAction(
                     "rows",
                     b -> {
@@ -956,6 +1144,32 @@ final class BuilderGui {
             jobs.removeAll();
             materials.removeAll();
             deficits.removeAll();
+            return;
+        }
+        if (type == 9) {
+            roles.removeAll();
+            return;
+        }
+        if (type == 10) {
+            int revision = b.readInt(), index = b.readVarIntFromBuffer(), count = b.readVarIntFromBuffer();
+            String position = b.readInt() + ", " + b.readInt() + ", " + b.readInt();
+            String title = StatCollector.translateToLocalFormatted("structurebuildernh.rolePosition", position, count);
+            ParentWidget<?> row = new ParentWidget<>().size(ROW_WIDTH, 20);
+            control(row, 0, 1, ROW_WIDTH, () -> title, () -> sendChoice(false, index, revision), false);
+            roles.child(row);
+            return;
+        }
+        if (type == 7) {
+            choiceRevision = b.readInt();
+            choiceIndex = b.readVarIntFromBuffer();
+            choiceSize = b.readVarIntFromBuffer();
+            amounts.clear();
+            alternatives.removeAll();
+            return;
+        }
+        if (type == 8) {
+            ItemStack stack = b.readBoolean() ? null : ByteBufAdapters.ITEM_STACK.deserializeSafe(b);
+            optionRow(stack, b.readVarIntFromBuffer());
             return;
         }
         if (type == 4) {
@@ -1012,9 +1226,14 @@ final class BuilderGui {
             }
             return;
         }
+        boolean selectable = type == 6;
+        int revision = selectable ? b.readInt() : 0;
+        int group = selectable ? b.readVarIntFromBuffer() : 0;
+        int option = selectable ? b.readVarIntFromBuffer() : 0;
+        int flexible = selectable ? b.readVarIntFromBuffer() : 0;
         ItemStack s = ByteBufAdapters.ITEM_STACK.deserializeSafe(b);
         int n = b.readVarIntFromBuffer();
-        boolean quoted = b.readBoolean();
+        boolean quoted = !selectable && b.readBoolean();
         int required = quoted ? b.readVarIntFromBuffer() : 0,
                 reserved = quoted ? b.readVarIntFromBuffer() : 0;
         if (s == null) return;
@@ -1056,7 +1275,51 @@ final class BuilderGui {
                                                                 n)));
                                 });
         singleLine(row, () -> itemName, 19, 0, nameWidth, 16, 0xffefffff);
+        if (selectable) {
+            ButtonWidget<?> hit = new ButtonWidget<>().size(rowWidth, 16)
+                    .background(fill(0x00000000)).hoverBackground(fill(0x2273bfaa))
+                    .onMousePressed(button -> {
+                        if (button != 0) return false;
+                        sync.callSyncedAction("openMaterial", packet -> {
+                            writeStringSafe(packet, selectedId.getStringValue());
+                            packet.writeInt(revision);
+                            packet.writeVarIntToBuffer(group);
+                            packet.writeVarIntToBuffer(option);
+                        });
+                        return true;
+                    }).tooltip(t -> {
+                        t.addFromItem(s);
+                        t.addLine(IKey.str(StatCollector.translateToLocalFormatted(
+                                "structurebuildernh.choiceHint", String.format(Locale.ROOT, "%,d", n - flexible),
+                                String.format(Locale.ROOT, "%,d", flexible))));
+                    });
+            row.child(hit);
+        }
         rows.child(row);
+    }
+
+    private long remainder() {
+        long left = choiceSize;
+        for (int i = 1; i < amounts.size(); i++) left -= amounts.get(i).getIntValue();
+        return left;
+    }
+
+    private void optionRow(ItemStack item, int count) {
+        int index = amounts.size();
+        IntValue value = new IntValue(count);
+        amounts.add(value);
+        ParentWidget<?> row = new ParentWidget<>().size(ROW_WIDTH, 22).marginBottom(2).background(fill(STRIPE));
+        if (item != null) row.child(new ItemDrawable(item).asWidget().pos(3, 3));
+        Supplier<String> name = () -> item == null ? tr("previewAir") : item.getDisplayName();
+        singleLine(row, name, 25, 1, ROW_WIDTH - 136, 20, INK);
+        if (index == 0) label(row, () -> String.format(Locale.ROOT, "%,d", Math.max(0, remainder())),
+                ROW_WIDTH - 105, 2, 57, 18, ACCENT, Alignment.CenterRight);
+        else row.child(new TextFieldWidget().value(value).numbersInt(0, choiceSize)
+                .pos(ROW_WIDTH - 104, 3).size(56, 16));
+        control(row, ROW_WIDTH - 43, 2, 41, () -> tr("choiceAll"), () -> {
+            for (int i = 1; i < amounts.size(); i++) amounts.get(i).setIntValue(i == index ? choiceSize : 0);
+        }, false).tooltip(t -> t.addLine(IKey.str(tr("choiceAll") + " - " + name.get())));
+        alternatives.child(row);
     }
 
     private void channelRow(String key, int current, int min, int max) {
