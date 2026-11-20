@@ -29,7 +29,7 @@ public abstract class ShapeBuilderMixin {
             IStructureDefinition<?> definition = cir.getReturnValue();
             String symbols = definition instanceof StructureDefinition
                     ? ((StructureDefinition<?>) definition).getShapes().get(entry.getKey()) : null;
-            ShapeRegistry.put(definition.getStructureFor(entry.getKey()), entry.getValue(), entry.getKey(), symbols);
+            ShapeRegistry.put(definition.getStructureFor(entry.getKey()), entry.getValue(), entry.getKey(), symbols, definition);
         }
     }
 }

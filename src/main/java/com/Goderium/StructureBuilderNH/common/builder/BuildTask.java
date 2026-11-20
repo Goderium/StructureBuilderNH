@@ -2,6 +2,7 @@ package com.Goderium.StructureBuilderNH.common.builder;
 
 import appeng.api.config.*;
 
+import com.Goderium.StructureBuilderNH.config.RebuildConfig;
 import com.gtnewhorizon.structurelib.StructureLibAPI;
 import com.gtnewhorizon.structurelib.alignment.IAlignment;
 import com.gtnewhorizon.structurelib.alignment.constructable.*;
@@ -62,6 +63,7 @@ final class BuildTask {
 
     ItemStack target;
     int tier = 1, cursor, total, placed, revision;
+    boolean useSurvivalConstruct = RebuildConfig.useSurvivalConstruct;
     int siteRevision = -1, siteInstalled, siteTotal, siteUnknown;
     int previewLayers;
     boolean texturedPreview;
@@ -597,6 +599,7 @@ final class BuildTask {
         if (!selected.isEmpty() && (!existing || plan == null || !plan.ready
                 || !plan.upgradeChannels().containsAll(selected))) return false;
         upgradeChannels.clear(); upgradeChannels.addAll(selected);
+        useSurvivalConstruct = RebuildConfig.useSurvivalConstruct;
         upgradeReview.clear(); releaseUpgradePhaseData();
         upgradeCount = 0; upgradeApproved = false; upgradeNetwork = "";
         needed.rows.clear(); shortage.rows.clear(); errors.rows.clear(); funding.clear();
@@ -710,6 +713,7 @@ final class BuildTask {
     }
 
     void resetDraft() {
+        useSurvivalConstruct = RebuildConfig.useSurvivalConstruct;
         state = previewLayers == 0 ? State.DRAFT : State.PREVIEW;
         resetPlan();
     }
@@ -764,7 +768,8 @@ final class BuildTask {
                 }
                 if (!channels.hasKey("chisel"))
                     ChannelDataAccessor.setChannelData(trigger, "chisel", 1);
-                plan = new Blueprint(target, trigger, facing, x, y, z, actor, this::initiallyConfirmed);
+                plan = Blueprint.read(target, trigger, facing, x, y, z, actor, this::initiallyConfirmed,
+                        useSurvivalConstruct);
             }
             if (!plan.ready) plan.advance(deadline);
             if (plan.ready) ensureSelections();
@@ -1685,6 +1690,7 @@ final class BuildTask {
         n.setBoolean("auto", auto);
         n.setBoolean("received", received);
         n.setInteger("tier", tier);
+        n.setBoolean("useSurvivalConstruct", useSurvivalConstruct);
         n.setByte("previewLayers", (byte) previewLayers);
         if (texturedPreview) n.setBoolean("texturedPreview", true);
         if (!pendingDefaults.hasNoTags()) n.setTag("pendingDefaults", pendingDefaults);
@@ -1812,6 +1818,21 @@ final class BuildTask {
             }
         }
         t.target = ItemStack.loadItemStackFromNBT(n.getCompoundTag("target"));
+        // Queued builds and reservations address cells by ordinal. Resume with the source
+        // that produced those ordinals, including construct-only saves from earlier versions.
+        boolean savedSource = n.getBoolean("useSurvivalConstruct");
+        if (t.state == State.DRAFT || t.state == State.PREVIEW) {
+            if (t.useSurvivalConstruct != savedSource) {
+                t.confirmed = new BitSet();
+                t.pending.clear();
+                t.cursor = t.placed = t.total = 0;
+                t.revision++;
+                t.reason = "";
+                t.issue = null;
+            }
+        } else {
+            t.useSurvivalConstruct = savedSource;
+        }
         t.needed.read(n.getTagList("needed", 10));
         t.held.read(n.getTagList("held", 10));
         t.salvage.read(n.getTagList("salvage", 10));

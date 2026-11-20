@@ -12,6 +12,7 @@ public final class RebuildConfig {
     public static boolean enabled = true, protectTileEntities = false;
     private static final int DEFAULT_REBUILD_VOLUME = 4000000;
     public static int maxRebuildVolume = DEFAULT_REBUILD_VOLUME;
+    public static boolean useSurvivalConstruct = true;
     public static boolean writeDebugLogs = true, logBlockDecisions = true;
     public static File logDirectory;
     public static Set<String> protectedMods = new HashSet<String>();
@@ -27,6 +28,8 @@ public final class RebuildConfig {
         }
         Configuration cfg = new Configuration(file);
         cfg.load();
+        useSurvivalConstruct = cfg.getBoolean("useSurvivalConstruct", "terminal", true,
+            "Select the wireless terminal's native structure source. True uses survivalConstruct, as in the GT NEI preview. False uses construct with the marked controller's saved state. The machine defines how each source interprets the main channel");
         enabled = cfg.getBoolean("enabled", "general", true,
             "Allow creative sneaking blueprint rebuild ONLY with an explicit rebuild=1 subchannel. Without that channel, native placement is unchanged. False disables rebuilding for every blueprint");
         protectTileEntities = cfg.getBoolean("protectAllTileEntities", "protection", false,

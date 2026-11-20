@@ -10,6 +10,7 @@ import com.gtnewhorizon.gtnhmixins.LateMixin;
 public class LateLoader implements ILateMixinLoader {
     public String getMixinConfig() { return "mixins.structurebuildernh.late.json"; }
     public List<String> getMixins(Set<String> mods) {
-        return Arrays.asList("BlueprintMixin", "ChannelReadMixin", "ShapeBuilderMixin", "StructureIterationMixin", "MachineCheckMixin");
+        return Arrays.asList("BlueprintMixin", "ChannelReadMixin", "ShapeBuilderMixin", "SurvivalBuildWalkerAccessor",
+                "StructureIterationMixin", "MachineCheckMixin");
     }
 }

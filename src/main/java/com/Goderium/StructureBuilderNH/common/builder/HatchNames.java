@@ -39,6 +39,11 @@ final class HatchNames {
     private static final String[] EMPTY = new String[0];
     private final Map<IStructureElement<?>, String[]> elements = new IdentityHashMap<>();
     private final Map<List<String>, String[]> combinations = new LinkedHashMap<>();
+    private final boolean typesOnly;
+
+    HatchNames() { this(false); }
+
+    HatchNames(boolean typesOnly) { this.typesOnly = typesOnly; }
 
     /** Returned arrays are shared, immutable descriptions expressed as client translation keys. */
     String[] resolve(IStructureElement<?> element, Object context) {
@@ -81,6 +86,14 @@ final class HatchNames {
 
     private void collectBuilder(HatchElementBuilder<?> builder, Set<String> names) {
         Supplier<List<String>> description = builder.getDescriptionNames();
+        if (typesOnly) {
+            // GT's atLeast/anyOf and hatchClass helpers retain their typed declarations in
+            // the hint supplier even when description() supplies a whole machine tooltip.
+            Map<Object, Boolean> captures = new IdentityHashMap<>();
+            collectValue(builder.getHatchItemType(), names, captures, 0);
+            collectValue(description, names, captures, 0);
+            return;
+        }
         if (description == null) return;
         List<String> descriptions;
         try {
@@ -104,7 +117,7 @@ final class HatchNames {
         }
     }
 
-    private static HatchElementBuilder<?> builder(IStructureElement<?> element) {
+    static HatchElementBuilder<?> builder(IStructureElement<?> element) {
         if (element.getClass().getEnclosingClass() != HatchElementBuilder.class) return null;
         for (Field field : element.getClass().getDeclaredFields()) {
             if (HatchElementBuilder.class.isAssignableFrom(field.getType())) {

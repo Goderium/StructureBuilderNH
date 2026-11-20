@@ -120,12 +120,12 @@ final class MaterialChoice {
 
     // Native construction/hint defaults need not belong to the element's accepted block set.
     static NativeMaterial nativeDefault(Blueprint plan, IStructureElement<?> e, ItemStack candidate,
-            Block block, int meta, int x, int y, int z) {
+            Block block, int meta, int x, int y, int z, Object context, ItemStack trigger) {
         if (!nativeElement(e, false)) return null;
         @SuppressWarnings("unchecked")
         IStructureElement<Object> element = (IStructureElement<Object>) e;
         IStructureElement.BlocksToPlace choices = element.getBlocksToPlace(
-                plan.controller, plan, x, y, z, plan.trigger, plan.env);
+                context, plan, x, y, z, trigger, plan.env);
         if (choices == null || choices.getStacks() == null) return null;
         ItemStack first = null;
         for (ItemStack s : choices.getStacks()) {
@@ -138,14 +138,14 @@ final class MaterialChoice {
                 first.getItem().getMetadata(first.getMetadata()));
     }
 
-    static MaterialChoice discover(Blueprint plan, Blueprint.Cell cell, int x, int y, int z) {
+    static MaterialChoice discover(Blueprint plan, Blueprint.Cell cell, int x, int y, int z, Object context, ItemStack trigger) {
         boolean air = Blueprint.allowsAir(cell.element);
         // Any-meta elements have exact world predicates, but cannot enumerate all of their item variants.
         if (cell.hatch || cell.inscribedRitual
                 || !nativeElement(cell.element, false) && !(air && cell.element instanceof IStructureElementChain))
             return null;
         IStructureElement.BlocksToPlace choices = cell.element.getBlocksToPlace(
-                plan.controller, plan, x, y, z, plan.trigger, plan.env);
+                context, plan, x, y, z, trigger, plan.env);
         if (choices == null || choices.getStacks() == null) return null;
         List<ItemStack> items = new ArrayList<>();
         for (ItemStack s : choices.getStacks()) {

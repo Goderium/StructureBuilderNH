@@ -17,6 +17,7 @@ public final class ChannelProbe {
     }
 
     public static void record(String name) {
+        BrowserChannels.record(name);
         Set<String> channels = ACTIVE.get();
         if (channels != null && name != null && !name.isEmpty()) channels.add(name);
     }

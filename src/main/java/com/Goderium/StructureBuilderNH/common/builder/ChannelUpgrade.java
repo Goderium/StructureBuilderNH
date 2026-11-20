@@ -167,9 +167,11 @@ final class ChannelUpgrade {
 
     private Profile sample(Blueprint.Cell cell, Proof proof, int x, int y, int z) {
         try {
+            ItemStack pieceTrigger = cell.pieceTrigger();
+            if (pieceTrigger == null) return null;
             int value = Math.max(1, Math.min(proof.maximum,
-                    ChannelDataAccessor.getChannelData(plan.trigger, proof.channel)));
-            Material target = plan.sampleUpgrade(cell, plan.trigger.copy(), x, y, z);
+                    ChannelDataAccessor.getChannelData(pieceTrigger, proof.channel)));
+            Material target = plan.sampleUpgrade(cell, pieceTrigger.copy(), x, y, z);
             if (target == null || !target.same(cell.block, cell.meta) || !Materials.equal(target.item, cell.item))
                 return null;
             if ("glass".equals(proof.channel)) {
@@ -181,7 +183,7 @@ final class ChannelUpgrade {
             target.value = value;
             Profile profile = new Profile(proof.channel, value, target);
             for (int rank = 1; rank <= proof.maximum; rank++) {
-                ItemStack trigger = plan.trigger.copy();
+                ItemStack trigger = pieceTrigger.copy();
                 ChannelDataAccessor.setChannelData(trigger, proof.channel, rank);
                 Material material;
                 try {

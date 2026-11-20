@@ -4,24 +4,30 @@ import com.Goderium.StructureBuilderNH.StructureBuilderNH;
 import com.Goderium.StructureBuilderNH.config.RebuildConfig;
 import com.Goderium.StructureBuilderNH.util.Bounds;
 
+import java.lang.ref.WeakReference;
 import java.util.Collections;
 import java.util.Map;
 import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 import com.gtnewhorizon.structurelib.alignment.enumerable.ExtendedFacing;
+import com.gtnewhorizon.structurelib.structure.IStructureDefinition;
 import com.gtnewhorizon.structurelib.structure.IStructureElement;
 
 public final class ShapeRegistry {
     public static final class Shape {
         public final String piece, symbols;
         private final int[] size;
+        private final WeakReference<IStructureDefinition<?>> definition;
         private final Map<Character, String> roles = new ConcurrentHashMap<>();
 
-        Shape(String piece, String symbols, int[] size) {
+        Shape(String piece, String symbols, int[] size, IStructureDefinition<?> definition) {
             this.piece = piece;
             this.symbols = symbols;
             this.size = size.clone();
+            this.definition = new WeakReference<>(definition);
         }
+
+        public IStructureDefinition<?> definition() { return definition.get(); }
 
         public char symbol(int cursor) {
             return symbols != null && cursor >= 0 && cursor < symbols.length() ? symbols.charAt(cursor) : '\0';
@@ -38,7 +44,12 @@ public final class ShapeRegistry {
         put(elements, size, "", null);
     }
     public static void put(IStructureElement<?>[] elements, int[] size, String piece, String symbols) {
-        SHAPES.put(elements, new Shape(piece, symbols != null && symbols.length() == elements.length ? symbols : null, size));
+        put(elements, size, piece, symbols, null);
+    }
+    public static void put(IStructureElement<?>[] elements, int[] size, String piece, String symbols,
+            IStructureDefinition<?> definition) {
+        SHAPES.put(elements, new Shape(piece, symbols != null && symbols.length() == elements.length ? symbols : null,
+                size, definition));
     }
     public static Shape get(IStructureElement<?>[] elements) { return SHAPES.get(elements); }
     public static Bounds bounds(IStructureElement<?>[] elements, ExtendedFacing facing,

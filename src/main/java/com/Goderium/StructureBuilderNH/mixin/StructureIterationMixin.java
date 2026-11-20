@@ -3,6 +3,7 @@ package com.Goderium.StructureBuilderNH.mixin;
 import com.Goderium.StructureBuilderNH.common.FormationTracker;
 import com.Goderium.StructureBuilderNH.common.RebuildEngine;
 import com.Goderium.StructureBuilderNH.common.ShapeRegistry;
+import com.Goderium.StructureBuilderNH.common.builder.Blueprint;
 import net.minecraft.world.World;
 import com.gtnewhorizon.structurelib.alignment.enumerable.ExtendedFacing;
 import com.gtnewhorizon.structurelib.structure.IStructureElement;
@@ -17,9 +18,20 @@ public abstract class StructureIterationMixin {
     @WrapMethod(method = "iterateV2", remap = false)
     private static <T> boolean rebuild$iterate(IStructureElement<T>[] elements, World world, ExtendedFacing facing,
         int x, int y, int z, int a, int b, int c, IStructureWalker<T> walker, String type, Operation<Boolean> original) {
-        if (world instanceof com.Goderium.StructureBuilderNH.common.builder.Blueprint && "placeBlock".equals(type)) {
-            ((com.Goderium.StructureBuilderNH.common.builder.Blueprint) world).capture(elements, facing, x, y, z, a, b, c, walker);
-            return true;
+        if (world instanceof Blueprint) {
+            Blueprint plan = (Blueprint) world;
+            if ("placeBlock".equals(type)) {
+                plan.capture(elements, facing, x, y, z, a, b, c, walker);
+                return true;
+            }
+            if ("survivalBuild".equals(type) && walker instanceof SurvivalBuildWalkerAccessor) {
+                @SuppressWarnings("unchecked")
+                SurvivalBuildWalkerAccessor<T> survival = (SurvivalBuildWalkerAccessor<T>) walker;
+                plan.captureSurvival(elements, facing, x, y, z, a, b, c,
+                        survival.structurebuildernh$getContext(), survival.structurebuildernh$getTrigger());
+                // StructureLib's untouched walker reports -1 (piece complete) to the machine.
+                return true;
+            }
         }
         RebuildEngine.Session session = RebuildEngine.ACTIVE.get();
         if (session != null && session.planning() && "placeBlock".equals(type)) {
