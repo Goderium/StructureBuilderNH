@@ -19,6 +19,7 @@ import gregtech.common.render.GTCopiedBlockTextureRender;
 
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockBreakable;
+import net.minecraft.block.BlockFence;
 import net.minecraft.block.material.Material;
 import net.minecraft.client.renderer.RenderBlocks;
 import net.minecraft.client.renderer.Tessellator;
@@ -32,7 +33,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-/** Passive cube icons only: no tile construction, TESR, item renderer or arbitrary ITexture rendering. */
+/** Passive block models and atlas icons for cached preview geometry. */
 final class BlockPreviewTextures {
     static final Appearance FALLBACK = new Appearance(null, -1, true, null);
     private static final int[] SIDES = { 4, 5, 0, 1, 2, 3 };
@@ -57,11 +58,18 @@ final class BlockPreviewTextures {
         final Block source;
         final int meta;
         final boolean worldIcon;
+        final boolean fullBright;
 
         Layer(IIcon icon, int color) { this(icon, color, null, 0, false); }
+        Layer(IIcon icon, int color, boolean fullBright) { this(icon, color, null, 0, false, fullBright); }
 
         Layer(IIcon icon, int color, Block source, int meta, boolean worldIcon) {
+            this(icon, color, source, meta, worldIcon, false);
+        }
+
+        Layer(IIcon icon, int color, Block source, int meta, boolean worldIcon, boolean fullBright) {
             this.icon = icon; this.color = color; this.source = source; this.meta = meta; this.worldIcon = worldIcon;
+            this.fullBright = fullBright;
         }
     }
 
@@ -69,7 +77,7 @@ final class BlockPreviewTextures {
         final Block block;
         final int meta;
         final boolean opaque;
-        final boolean glass, frame, translucent, worldIcon;
+        final boolean glass, frame, fence, translucent, worldIcon;
         final Layer[][] faces;
 
         Appearance(Block block, int meta, boolean opaque, Layer[][] faces) {
@@ -84,6 +92,7 @@ final class BlockPreviewTextures {
             this.faces = faces;
             this.glass = glass;
             this.frame = frame;
+            this.fence = isFence(block);
             this.translucent = translucent;
             this.worldIcon = worldIcon;
         }
@@ -114,6 +123,10 @@ final class BlockPreviewTextures {
 
     static void clear() { CACHE.clear(); LAYER_ACCESS.clear(); }
 
+    private static boolean isFence(Block block) {
+        return block instanceof BlockFence && block.getRenderType() == 11 && block.getRenderBlockPass() == 0;
+    }
+
     private static Appearance resolve(Block block, int meta) {
         if (block == null || block == Blocks.air) return FALLBACK;
         try {
@@ -127,26 +140,32 @@ final class BlockPreviewTextures {
             boolean opaque = block.isOpaqueCube();
             boolean glass = block instanceof BWBlocksGlass || GlassTier.getGlassBlockTier(block, meta) != null
                     || !opaque && block.getMaterial() == Material.glass;
-            if (!casing && !frame && !glass && !(block instanceof BlockBreakable)
-                    && !block.renderAsNormalBlock()) return FALLBACK;
+            boolean fence = isFence(block);
+            if (!casing && !frame && !glass && !fence && !(block instanceof BlockBreakable)
+                    && !block.renderAsNormalBlock() && !PreviewCubeProfiles.cube(block, meta)) return FALLBACK;
             Layer[][] faces = new Layer[6][];
             ITexture[][] nativeLayers = (casing || frame) && block instanceof IBlockWithTextures
                     ? ((IBlockWithTextures) block).getTextures(meta) : null;
             int tint = block.getRenderColor(meta);
+            Layer[][] separate = nativeLayers == null ? PreviewCubeProfiles.layers(block, meta, tint) : null;
+            boolean fullBright = PreviewCubeProfiles.fullBright(block);
             for (int side = 0; side < 6; side++) {
                 if (nativeLayers != null) {
                     if (nativeLayers.length != 6 || nativeLayers[side] == null || nativeLayers[side].length > 8)
                         return FALLBACK;
                     faces[side] = layers(nativeLayers[side], side);
                     if (faces[side] == null) return FALLBACK;
+                } else if (separate != null) {
+                    faces[side] = separate[side];
+                    for (Layer layer : faces[side]) if (!valid(layer.icon)) return FALLBACK;
                 } else {
                     IIcon icon = block.getIcon(side, meta);
                     if (icon == null || !valid(icon)) return FALLBACK;
-                    faces[side] = new Layer[] { new Layer(icon, tint) };
+                    faces[side] = new Layer[] { new Layer(icon, tint, fullBright) };
                 }
             }
             return new Appearance(block, meta, opaque, faces, glass, frame,
-                    glass || !frame && block.getRenderBlockPass() == 1, nativeLayers == null);
+                    glass || !frame && block.getRenderBlockPass() == 1, nativeLayers == null && separate == null);
         } catch (RuntimeException | LinkageError unsupported) {
             return FALLBACK;
         }
@@ -221,7 +240,7 @@ final class BlockPreviewTextures {
     }
 
     static boolean occludes(Appearance neighbor, Appearance current) {
-        if (neighbor.frame) return false;
+        if (neighbor.frame || neighbor.fence) return false;
         return neighbor.opaque || current.textured() && neighbor.block == current.block && neighbor.meta == current.meta;
     }
 
@@ -236,13 +255,7 @@ final class BlockPreviewTextures {
         int nativeSide = SIDES[side];
         int x = slot & 15, y = slot >> 8, z = slot >> 4 & 15;
         for (Layer layer : appearance.faces[nativeSide]) {
-            int color = layer.color;
-            int light = SHADE[side];
-            color = ((color >> 16 & 255) * light / 100 << 16)
-                    | ((color >> 8 & 255) * light / 100 << 8) | (color & 255) * light / 100;
-            tessellator.setColorRGBA_I(color, alpha);
-            tessellator.setNormal(side < 2 ? (side & 1) * 2 - 1 : 0,
-                    side >= 2 && side < 4 ? (side & 1) * 2 - 1 : 0, side >= 4 ? (side & 1) * 2 - 1 : 0);
+            shade(tessellator, layer, side, alpha);
             IIcon icon = layer.icon;
             if (access != null) {
                 Block source = layer.source == null ? appearance.block : layer.source;
@@ -260,25 +273,34 @@ final class BlockPreviewTextures {
                 } finally { RENDERER.renderFromInside = false; LAYER_ACCESS.clear(); }
                 continue;
             }
-            plainFace(appearance.block, nativeSide, x, y, z, icon);
+            plainFace(RENDERER, appearance.block, nativeSide, x, y, z, icon);
             if (appearance.frame) {
                 RENDERER.renderFromInside = true;
-                try { plainFace(appearance.block, nativeSide, x, y, z, icon); }
+                try { plainFace(RENDERER, appearance.block, nativeSide, x, y, z, icon); }
                 finally { RENDERER.renderFromInside = false; }
             }
         }
     }
 
-    private static void plainFace(Block block, int side, int x, int y, int z, IIcon icon) {
-            switch (side) {
-                case 0: RENDERER.renderFaceYNeg(block, x, y, z, icon); break;
-                case 1: RENDERER.renderFaceYPos(block, x, y, z, icon); break;
-                case 2: RENDERER.renderFaceZNeg(block, x, y, z, icon); break;
-                case 3: RENDERER.renderFaceZPos(block, x, y, z, icon); break;
-                case 4: RENDERER.renderFaceXNeg(block, x, y, z, icon); break;
-                case 5: RENDERER.renderFaceXPos(block, x, y, z, icon); break;
-                default: break;
-            }
+    static void shade(Tessellator tessellator, Layer layer, int side, int alpha) {
+        int color = layer.color, light = layer.fullBright ? 100 : SHADE[side];
+        color = ((color >> 16 & 255) * light / 100 << 16)
+                | ((color >> 8 & 255) * light / 100 << 8) | (color & 255) * light / 100;
+        tessellator.setColorRGBA_I(color, alpha);
+        tessellator.setNormal(side < 2 ? (side & 1) * 2 - 1 : 0,
+                side >= 2 && side < 4 ? (side & 1) * 2 - 1 : 0, side >= 4 ? (side & 1) * 2 - 1 : 0);
+    }
+
+    static void plainFace(RenderBlocks renderer, Block block, int side, int x, int y, int z, IIcon icon) {
+        switch (side) {
+            case 0: renderer.renderFaceYNeg(block, x, y, z, icon); break;
+            case 1: renderer.renderFaceYPos(block, x, y, z, icon); break;
+            case 2: renderer.renderFaceZNeg(block, x, y, z, icon); break;
+            case 3: renderer.renderFaceZPos(block, x, y, z, icon); break;
+            case 4: renderer.renderFaceXNeg(block, x, y, z, icon); break;
+            case 5: renderer.renderFaceXPos(block, x, y, z, icon); break;
+            default: break;
+        }
     }
 
     private BlockPreviewTextures() {}
