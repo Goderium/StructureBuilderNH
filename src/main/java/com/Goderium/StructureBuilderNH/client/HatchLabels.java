@@ -129,6 +129,16 @@ final class HatchLabels {
         return hint.dedicated || exact.isEmpty() ? hint.text : exact;
     }
 
+    static List<String> browserNames(String[] keys) {
+        Set<String> names = new LinkedHashSet<>();
+        if (keys != null) for (String key : keys) {
+            String name = translated("structurebuildernh.browser.hatchType." + key);
+            if (name.isEmpty()) name = translated(key);
+            if (usable(name, locale())) names.add(name);
+        }
+        return new ArrayList<>(names);
+    }
+
     static HatchRole role(String dotHint, String[] keys, boolean ambiguous) {
         HatchRole exact = null;
         boolean declared = false;

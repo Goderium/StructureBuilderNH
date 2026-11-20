@@ -138,7 +138,7 @@ public final class BuilderItem extends Item
         ItemStack held = player.getHeldItem();
         if (held == null || held.getItem() != this) return;
         if (event.world.isRemote) {
-            if (event.action == PlayerInteractEvent.Action.RIGHT_CLICK_AIR && StructureBuilderNH.proxy.editPreview(player))
+            if (StructureBuilderNH.proxy.editPreview(player))
                 event.setCanceled(true);
         } else if (StructureBuilderNH.proxy.consumePreviewUse(player)) event.setCanceled(true);
     }

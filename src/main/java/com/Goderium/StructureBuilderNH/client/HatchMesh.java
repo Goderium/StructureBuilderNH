@@ -2,8 +2,37 @@ package com.Goderium.StructureBuilderNH.client;
 
 import java.util.Arrays;
 
-/** Section-local hatch faces. Confirmed hatches occlude neighbours but emit no faces themselves. */
+/** Merged exterior faces of the visible hatch markers in a section. */
 final class HatchMesh {
+    /** Looks up a visible hatch's role in the packet's rank-packed array while compiling outlines. */
+    static final class Roles {
+        final long[] occupied, hidden;
+        private final byte[] packed;
+        private final short[] first;
+
+        Roles(long[] occupied, long[] hidden, byte[] packed) {
+            this.occupied = occupied;
+            this.hidden = hidden;
+            this.packed = packed;
+            first = packed.length > 1 ? new short[occupied.length] : null;
+            if (first != null) {
+                int rank = 0;
+                for (int word = 0; word < first.length; word++) {
+                    first[word] = (short) rank;
+                    rank += Long.bitCount(occupied[word]);
+                }
+            }
+        }
+
+        int type(int slot) {
+            int word = slot >>> 6;
+            long bit = 1L << (slot & 63);
+            if ((occupied[word] & ~hidden[word] & bit) == 0) return 0;
+            int rank = first == null ? 0 : first[word] + Long.bitCount(occupied[word] & (bit - 1));
+            return 1 + (packed[rank] & 255);
+        }
+    }
+
     interface Boundary {
         boolean occupied(int side, int wrappedSlot);
     }
@@ -12,10 +41,50 @@ final class HatchMesh {
         void quad(int side, int plane, int u, int v, int w, int h, int dot);
     }
 
-    static void emit(long[] hatches, long[] confirmed, byte[] dots, Boundary neighbors, Face sink) {
+    /** Merged exterior faces of the one section under the cursor, kept for moves within that section. */
+    static final class Selection implements Face {
+        private byte[] faces = new byte[7 * 8];
+        private int size;
+
+        @Override
+        public void quad(int side, int plane, int u, int v, int width, int height, int role) {
+            if (size == faces.length) faces = Arrays.copyOf(faces, size * 2);
+            faces[size++] = (byte) side;
+            faces[size++] = (byte) plane;
+            faces[size++] = (byte) u;
+            faces[size++] = (byte) v;
+            faces[size++] = (byte) width;
+            faces[size++] = (byte) height;
+            faces[size++] = (byte) role;
+        }
+
+        void draw(int slot, Face base, Face selected) {
+            int x = slot & 15, y = slot >>> 8, z = slot >>> 4 & 15;
+            for (int i = 0; i < size; i += 7) {
+                int side = faces[i], plane = faces[i + 1], u = faces[i + 2], v = faces[i + 3];
+                int w = faces[i + 4], h = faces[i + 5], role = faces[i + 6] & 255;
+                int axis = side / 2;
+                int p = axis == 0 ? x : axis == 1 ? y : z;
+                int col = axis == 0 ? y : axis == 1 ? z : x;
+                int row = axis == 0 ? z : axis == 1 ? x : y;
+                if (plane != p + (side & 1) || col < u || col >= u + w || row < v || row >= v + h) {
+                    base.quad(side, plane, u, v, w, h, role);
+                    continue;
+                }
+                // Partition the original rectangle; no internal face or coplanar overlay is introduced.
+                if (row > v) base.quad(side, plane, u, v, w, row - v, role);
+                if (row + 1 < v + h) base.quad(side, plane, u, row + 1, w, v + h - row - 1, role);
+                if (col > u) base.quad(side, plane, u, row, col - u, 1, role);
+                if (col + 1 < u + w) base.quad(side, plane, col + 1, row, u + w - col - 1, 1, role);
+                selected.quad(side, plane, col, row, 1, 1, role);
+            }
+        }
+    }
+
+    static void emit(long[] hatches, long[] hidden, byte[] dots, Boundary neighbors, Face sink) {
         int visible = 0;
         for (int word = 0; word < hatches.length; word++)
-            visible += Long.bitCount(hatches[word] & ~confirmed[word]);
+            visible += Long.bitCount(hatches[word] & ~hidden[word]);
         if (visible == 0) return;
 
         // Sparse sections never allocate a section-sized face mask. One hatch needs no scratch array.
@@ -23,14 +92,14 @@ final class HatchMesh {
         int count = 0, rankBase = 0;
         for (int word = 0; word < hatches.length; word++) {
             long occupied = hatches[word];
-            for (long bits = occupied & ~confirmed[word]; bits != 0; bits &= bits - 1) {
+            for (long bits = occupied & ~hidden[word]; bits != 0; bits &= bits - 1) {
                 long bit = Long.lowestOneBit(bits);
                 int slot = (word << 6) + Long.numberOfTrailingZeros(bit);
                 // Dots are packed over every hatch, including the confirmed ones.
                 int dot = dots[rankBase + Long.bitCount(occupied & (bit - 1))] & 255;
                 int x = slot & 15, y = slot >>> 8, z = slot >>> 4 & 15;
                 for (int side = 0; side < 6; side++) {
-                    if (occluded(hatches, neighbors, side, slot, x, y, z)) continue;
+                    if (occluded(hatches, hidden, neighbors, side, slot, x, y, z)) continue;
                     int axis = side >>> 1;
                     int plane = axis == 0 ? x : axis == 1 ? y : z;
                     int u = axis == 0 ? y : axis == 1 ? z : x;
@@ -82,7 +151,7 @@ final class HatchMesh {
         }
     }
 
-    private static boolean occluded(long[] hatches, Boundary neighbors, int side, int slot, int x, int y, int z) {
+    private static boolean occluded(long[] hatches, long[] hidden, Boundary neighbors, int side, int slot, int x, int y, int z) {
         int axis = side >>> 1;
         int plane = axis == 0 ? x : axis == 1 ? y : z;
         int step = axis == 0 ? 1 : axis == 1 ? 256 : 16;
@@ -92,6 +161,7 @@ final class HatchMesh {
             return neighbors != null && neighbors.occupied(side, wrapped);
         }
         int adjacent = slot + (positive ? step : -step);
-        return (hatches[adjacent >>> 6] & (1L << (adjacent & 63))) != 0;
+        int word = adjacent >>> 6;
+        return (hatches[word] & ~hidden[word] & (1L << (adjacent & 63))) != 0;
     }
 }

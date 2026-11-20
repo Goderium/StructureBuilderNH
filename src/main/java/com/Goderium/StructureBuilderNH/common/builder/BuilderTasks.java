@@ -42,6 +42,15 @@ public final class BuilderTasks extends WorldSavedData {
         if (parts.isEmpty()) watched.remove(dim);
     }
 
+    List<PlacementLedger> placementOwners(World world, int x, int y, int z) {
+        Map<Long, Set<PlacementLedger>> parts = watched.get(world.provider.dimensionId);
+        Set<PlacementLedger> candidates = parts == null ? null : parts.get(PlacementLedger.key(x, y, z));
+        if (candidates == null) return Collections.emptyList();
+        List<PlacementLedger> owners = new ArrayList<>();
+        for (PlacementLedger ledger : candidates) if (ledger.matches(world, x, y, z)) owners.add(ledger);
+        return owners;
+    }
+
     private void blockChanged(World world, int x, int y, int z) {
         PreviewStream.worldChanged(world.provider.dimensionId, x, y, z);
         Map<Long, Set<PlacementLedger>> parts = watched.get(world.provider.dimensionId);
@@ -127,7 +136,46 @@ public final class BuilderTasks extends WorldSavedData {
     }
 
     void select(ItemStack stack, BuildTask t) {
-        tag(stack).setString("selected", t == null ? "" : t.id);
+        NBTTagCompound n = tag(stack);
+        if (t != null && jobs.containsKey(t.id)) n.setString("lastTask", t.id);
+        else if (jobs.containsKey(n.getString("selected"))) n.setString("lastTask", n.getString("selected"));
+        n.setString("selected", t == null ? "" : t.id);
+    }
+
+    public static String shortcutTarget(ItemStack stack) {
+        if (stack == null || stack.getItem() != BuilderItem.ITEM || !stack.hasTagCompound()) return "";
+        NBTTagCompound n = stack.getTagCompound();
+        return n.hasKey("lastTask") ? n.getString("lastTask") : n.getString("selected");
+    }
+
+    boolean shortcutDelete(EntityPlayerMP player, ItemStack stack, String id) {
+        if (id.isEmpty() || !id.equals(shortcutTarget(stack))) return false;
+        BuildTask t = jobs.get(id), selected = selected(player, stack);
+        if (!owns(t, player, stack) || t.target == null || (selected != null && selected.target != null && selected != t)
+                || t.deleteRequested) return false;
+        if (!t.shortcutDeletable()) {
+            player.addChatMessage(new net.minecraft.util.ChatComponentTranslation("structurebuildernh.chat.shortcutState"));
+            return false;
+        }
+        delete(t, player, stack, DimensionManager.getWorld(t.dim));
+        player.inventory.markDirty();
+        player.inventoryContainer.detectAndSendChanges();
+        player.addChatMessage(new net.minecraft.util.ChatComponentTranslation(jobs.containsKey(id)
+                ? "structurebuildernh.chat.taskDeleteRefund" : "structurebuildernh.chat.taskDeleted",
+                t.target.getDisplayName(), t.x, t.y, t.z));
+        return true;
+    }
+
+    void delete(BuildTask t, EntityPlayerMP player, ItemStack stack, WorldServer world) {
+        boolean current = selected(player, stack) == t;
+        t.deleteRequested = true;
+        t.dismantleRequested = false;
+        if (t.state != BuildTask.State.REFUND) t.cancel(player, world);
+        else if (world != null && player.worldObj == world) t.retryRefund(player, world);
+        if (t.savedLink == null && !t.hasReserved()) remove(t, player);
+        if (current) select(stack, null);
+        if (t.id.equals(tag(stack).getString("lastTask"))) tag(stack).removeTag("lastTask");
+        t.changed();
     }
 
     void create(
@@ -216,7 +264,7 @@ public final class BuilderTasks extends WorldSavedData {
         NBTTagList l = n.getTagList("jobs", 10);
         for (int i = 0; i < l.tagCount(); i++) {
             BuildTask t = BuildTask.load(this, l.getCompoundTagAt(i));
-            if (t.target != null || t.hasReserved() || t.savedLink != null) jobs.put(t.id, t);
+            if (t.target != null || t.ledger.count > 0 || t.hasReserved() || t.savedLink != null) jobs.put(t.id, t);
         }
     }
 
@@ -298,9 +346,13 @@ public final class BuilderTasks extends WorldSavedData {
                 running.computeIfAbsent(t.owner + t.tool, k -> new ArrayList<>()).add(t);
                 continue;
             }
+            t.releaseMissingTemporaryHost(world);
             if (t.state == BuildTask.State.DISMANTLED || t.state == BuildTask.State.TEARDOWN_PAUSED) continue;
-            if (t.state == BuildTask.State.REFUND) {
-                if (t.key.isEmpty()) t.key = tag(item).getString("network");
+            if (t.state == BuildTask.State.REFUND || t.state == BuildTask.State.DONE) {
+                // Salvage from an unbound world edit can be bound for the first time.
+                // Held ME stock and crafting links stay with the original network.
+                if (t.key.isEmpty() && t.held.rows.isEmpty() && t.savedLink == null && !t.keepsUpgradeBinding()
+                        && !t.salvage.rows.isEmpty()) t.key = tag(item).getString("network");
                 if (Math.floorMod(turn - t.id.hashCode(), 100) == 0
                         && (t.hasReserved() || t.savedLink != null)) t.retryRefund(player, world);
                 if (t.state != BuildTask.State.REFUND) continue;
@@ -311,7 +363,12 @@ public final class BuilderTasks extends WorldSavedData {
             if (!t.ordering()
                     && t.state != BuildTask.State.DONE
                     && t.state != BuildTask.State.REFUND
-                    && t.held.rows.isEmpty() && !t.keepsUpgradeBinding()) t.key = tag(item).getString("network");
+                    && t.held.rows.isEmpty() && (t.salvage.rows.isEmpty() || t.key.isEmpty())
+                    && !t.keepsUpgradeBinding()) t.key = tag(item).getString("network");
+            if (!t.upgrading() && !t.salvage.rows.isEmpty() && Math.floorMod(turn - t.id.hashCode(), 100) == 0) {
+                if (t.key.isEmpty()) t.key = tag(item).getString("network");
+                t.depositManualDrops(player, world);
+            }
             boolean viewed =
                     turn - viewers.getOrDefault(t.id, turn - 2000) < 30
                             || t.previewLayers != 0;

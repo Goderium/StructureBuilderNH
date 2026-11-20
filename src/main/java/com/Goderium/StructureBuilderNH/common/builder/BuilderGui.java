@@ -23,15 +23,17 @@ import com.cleanroommc.modularui.widget.scroll.VerticalScrollData;
 import com.cleanroommc.modularui.widgets.*;
 import com.cleanroommc.modularui.widgets.slot.*;
 import com.cleanroommc.modularui.widgets.textfield.TextFieldWidget;
-import com.gtnewhorizon.structurelib.ChannelDescription;
 import com.gtnewhorizon.structurelib.structure.IChannelDefinition;
 
 import gregtech.api.util.GTUtility.ItemId;
+import gregtech.api.interfaces.tileentity.IGregTechTileEntity;
+import gregtech.api.metatileentity.implementations.MTEMultiBlockBase;
 
 import net.minecraft.entity.player.EntityPlayerMP;
 import net.minecraft.item.ItemStack;
 import net.minecraft.nbt.NBTTagCompound;
 import net.minecraft.network.PacketBuffer;
+import net.minecraft.tileentity.TileEntity;
 import net.minecraft.util.StatCollector;
 import net.minecraft.world.WorldServer;
 import net.minecraftforge.common.DimensionManager;
@@ -43,9 +45,8 @@ import java.util.function.Supplier;
 final class BuilderGui {
     private enum Page {
         MAIN,
-        CHANNELS,
         ORDER,
-        TASKS, CHOICES, GROUPS
+        TASKS, CHOICES, GROUPS, BROWSER, CELL
     }
 
     private static final int W = 316,
@@ -64,28 +65,65 @@ final class BuilderGui {
     private static final int MATERIAL_WIDTH = OPTIONS_X - 23, ACTION_WIDTH = 49;
     private static final int TASK_BODY = ROW_WIDTH - ACTION_WIDTH - 4;
     private static final int EDGE = 9, FOOTER_Y = 206, BUTTON_H = 17;
-    private static final int LEVEL_X = ROW_WIDTH - 49, LEVEL_WIDTH = 43;
-    private static final int UPGRADE = 512, CAN_CONFIGURE = 1024, HAS_REPLACEMENTS = 2048;
+    private static final int UPGRADE = 512, HAS_REPLACEMENTS = 2048;
     private static final int SITE_COUNTS = 4096, PARTIAL_BUILD = 8192, CHECKING_SITE = 16384;
     private static final int TEXTURED_PREVIEW = 1 << 15;
+    private static final int REPAIR_CELL = 1 << 16;
+    private static final int LOCKED_MARKER = 128;
+    private static final int CELL_SLOT_X = 13, CELL_SLOT_Y = 78, BAG_X = EDGE, BAG_Y = 152;
     final PlayerInventoryGuiData data;
     final PanelSyncManager sync;
-    final ModularPanel panel = ModularPanel.defaultPanel("wireless_builder", W, H);
+    final ModularPanel panel = new ModularPanel("wireless_builder") {
+        @Override
+        public boolean onKeyPressed(char c, int key) {
+            if (onCellPage() && !getContext().isFocused()) {
+                if (key == org.lwjgl.input.Keyboard.KEY_ESCAPE) { sendAction("back"); return true; }
+                if (cellSlotHovered() && pickHotbar(key)) return true;
+                if (key == org.lwjgl.input.Keyboard.KEY_RETURN || key == org.lwjgl.input.Keyboard.KEY_NUMPADENTER) {
+                    if (!org.lwjgl.input.Keyboard.isRepeatEvent()) confirmCell(false);
+                    return true;
+                }
+            }
+            if (!getContext().isFocused()
+                    && com.Goderium.StructureBuilderNH.StructureBuilderNH.proxy.deleteShortcutKey(key)) {
+                String id = BuilderTasks.shortcutTarget(tool());
+                if (!id.isEmpty()) sync.callSyncedAction("shortcutDelete", b -> writeStringSafe(b, id));
+                return true;
+            }
+            return super.onKeyPressed(c, key);
+        }
+        @Override
+        public boolean onMousePressed(int button) {
+            if (onCellPage() && cellSlotHovered() && pickHotbar(button - 100)) return true;
+            if (onCellPage() && (button == 0 || button == 1)) {
+                int slot = bagSlot(getContext().getAbsMouseX() - getArea().x, getContext().getAbsMouseY() - getArea().y);
+                if (slot >= 0 && data.getPlayer().inventory.getItemStack() == null) {
+                    selectCellSlot(slot);
+                    return true;
+                }
+            }
+            if (button == 1 && view != null && view.getIntValue() != Page.MAIN.ordinal()
+                    && view.getIntValue() != Page.BROWSER.ordinal()) {
+                int x = getContext().getAbsMouseX() - getArea().x;
+                int y = getContext().getAbsMouseY() - getArea().y;
+                if (onCellPage() && (cellSlotHovered() || bagSlot(x, y) >= 0)) return super.onMousePressed(button);
+                if (x >= 0 && x < W && y >= 0 && y < H) {
+                    getContext().removeFocus();
+                    sendAction("back");
+                    return true;
+                }
+            }
+            return super.onMousePressed(button);
+        }
+    }.size(W, H);
     final ListWidget<IWidget, ?> materials = new ListWidget<>(),
             deficits = new ListWidget<>(),
-            jobs = new ListWidget<>(),
-            settings = new ListWidget<>();
+            jobs = new ListWidget<>();
     private final Map<String, String> sentProgress = new HashMap<>();
     private final Map<String, QueueLine> lines = new HashMap<>();
-    private final Map<String, IntValue> channelValues = new LinkedHashMap<>();
-    private final Set<String> editedChannels = new LinkedHashSet<>(), upgradeable = new HashSet<>();
-    private final Map<String, String> siteLevels = new HashMap<>();
-    private ChannelSurvey survey;
-    private boolean surveySent;
     private OrdinaryBuildSurvey checkingSite, site, sentSite;
     private int nextSiteCheck;
     private final Map<ItemId, SiteRow> siteRows = new HashMap<>();
-    private int channelRevision;
     private final ListWidget<IWidget, ?> alternatives = new ListWidget<>();
     private final List<IntValue> amounts = new ArrayList<>();
     private final ListWidget<IWidget, ?> roles = new ListWidget<>();
@@ -101,6 +139,40 @@ final class BuilderGui {
     StringSyncValue selectedId;
     IntSyncValue view, flags;
     GenericSyncValue<ItemStack, ?> target;
+    private TerminalBrowser browser;
+    private SingleCellPlacement cell;
+    private int markerNoticeUntil;
+    private IntSyncValue cellTicket;
+
+    private boolean onCellPage() { return view != null && view.getIntValue() == Page.CELL.ordinal(); }
+
+    private boolean cellSlotHovered() {
+        int x = panel.getContext().getAbsMouseX() - panel.getArea().x - CELL_SLOT_X;
+        int y = panel.getContext().getAbsMouseY() - panel.getArea().y - CELL_SLOT_Y;
+        return x >= 0 && y >= 0 && x < 18 && y < 18;
+    }
+
+    static int bagSlot(int x, int y) {
+        int dx = x - BAG_X, dy = y - BAG_Y;
+        if (dx < 0 || dx >= 162 || dy < 0) return -1;
+        if (dy < 54) return 9 + (dy / 18) * 9 + dx / 18;
+        return dy >= 58 && dy < 76 ? dx / 18 : -1;
+    }
+
+    private boolean pickHotbar(int key) {
+        int index = com.Goderium.StructureBuilderNH.StructureBuilderNH.proxy.hotbarSlot(key);
+        if (index < 0) return false;
+        selectCellSlot(index);
+        return true;
+    }
+
+    private void selectCellSlot(int index) {
+        sync.callSyncedAction("cellSelect", b -> b.writeByte(index));
+    }
+
+    private void confirmCell(boolean remove) {
+        sync.callSyncedAction("cellConfirm", b -> { b.writeInt(cellTicket.getIntValue()); b.writeBoolean(remove); });
+    }
 
     private static final class QueueLine {
         static final int HEIGHT = 37, CONTENT = TASK_BODY - 10, PROGRESS_Y = 24;
@@ -169,6 +241,15 @@ final class BuilderGui {
         sync = s;
         if (server() && tool() != null && BuilderTasks.tag(tool()).getBoolean("openQueue"))
             page = Page.TASKS;
+        net.minecraft.util.ChunkCoordinates p = PreviewEdit.openedMarker.get();
+        if (server() && p != null) openCell(current(), p);
+    }
+
+    private void openCell(BuildTask t, net.minecraft.util.ChunkCoordinates p) {
+        if (t == null || !t.canChangeCell(p) || t.dim != player().dimension || !player().worldObj.blockExists(p.posX,p.posY,p.posZ)) return;
+        if (p.posX == t.x && p.posY == t.y && p.posZ == t.z && !player().worldObj.isAirBlock(t.x, t.y, t.z)) return;
+        cell = new SingleCellPlacement(t, p, player());
+        page = Page.CELL;
     }
 
     static String tr(String k) {
@@ -195,6 +276,12 @@ final class BuilderGui {
     private void update() {
         BuildTask now = current();
         if (now != task) {
+            markerNoticeUntil = 0;
+            if (cell != null && cell.task != now) { cell = null; if (page == Page.CELL) page = Page.MAIN; }
+            if (page == Page.BROWSER) {
+                browser.leave();
+                page = Page.MAIN;
+            }
             if (now == null && task != null && task.target != null && server()
                     && tool() != null && tool().getItem() == BuilderItem.ITEM
                     && (task.deleteRequested || !task.store.jobs.containsKey(task.id))) {
@@ -210,11 +297,14 @@ final class BuilderGui {
             channelReads = -1;
             channels = Collections.emptyList();
             observed = null;
-            survey = null;
             checkingSite = site = sentSite = null;
             previous = "";
         }
         if (task == null) return;
+        if (page == Page.CELL && (cell == null || !task.canChangeCell(cell.at))) {
+            cell = null;
+            page = Page.MAIN;
+        }
         task.store.touch(task);
         if (!Materials.equal(channelTarget, task.target)
                 || task.plan != null
@@ -252,8 +342,11 @@ final class BuilderGui {
                         || t.existing
                         || Materials.equal(t.target, stack)
                         || stack != null && Blueprint.prototype(stack) == null) return;
-                t.configureTarget(stack);
-                if (stack != null) t.store.register(t);
+                if (!t.configureTarget(stack)) {
+                    markerNoticeUntil = player().ticksExisted + 100;
+                    return;
+                }
+                if (stack != null) { t.store.register(t); t.store.select(tool(), t); }
                 else if (t.placed == 0 && t.ledger.count == 0 && !t.hasReserved()) t.store.unbind(t);
             }
         };
@@ -279,6 +372,12 @@ final class BuilderGui {
         selectedId = str("selectedId", () -> task == null ? "" : task.id);
         view = new IntSyncValue(() -> page.ordinal());
         sync.syncValue("view", view);
+        sync.registerSyncedAction("shortcutDelete", false, true, b -> {
+            String id = readStringSafe(b);
+            if (tool() != null && BuilderTasks.get().shortcutDelete(player(), tool(), id)) {
+                show(Page.TASKS);
+            }
+        });
         IntSyncValue autoRemove = new IntSyncValue(() -> server() && BuilderTasks.get().autoRemove(player()) ? 1 : 0);
         sync.syncValue("autoRemove", autoRemove);
         sync.registerSyncedAction(
@@ -326,14 +425,18 @@ final class BuilderGui {
                 });
         sync.registerSyncedAction("openMaterial", false, true, this::openMaterial);
         sync.registerSyncedAction("materialChoice", false, true, this::editChoice);
-        sync.registerSyncedAction("apply", false, true, this::applyChannels);
         sync.registerSyncedAction("rows", true, false, this::receive);
+        browser = new TerminalBrowser(sync, this::current, this::commitChannels, () -> sendAction("back"));
+        sync.addCloseListener(p -> browser.close());
         sync.onServerTick(
                 () -> {
                     update();
+                    if (page == Page.BROWSER) {
+                        if (!browser.tick(task, channels, player())) show(Page.MAIN);
+                        return;
+                    }
                     surveyBuildSite();
-                    if (page == Page.CHANNELS || data.getPlayer().ticksExisted % 5 == 0) sendRows();
-                    if (page == Page.CHANNELS) surveyChannels();
+                    if (data.getPlayer().ticksExisted % 5 == 0) sendRows();
                 });
         target =
                 GenericSyncValue.builder(ItemStack.class)
@@ -347,7 +450,9 @@ final class BuilderGui {
         StringSyncValue facing = str("facing", () -> task == null ? "" : task.facing.getDirection().name());
         StringSyncValue phase =
                 str("phase", () -> task == null ? "pick" : "state." + task.state.name());
-        StringSyncValue reason = str("reason", () -> task == null ? "" : task.reason);
+        StringSyncValue formation = str("formation", this::controllerFormation);
+        StringSyncValue reason = str("reason", () -> task == null ? ""
+                : page == Page.MAIN && markerNoticeUntil > player().ticksExisted ? "markerLocked" : task.reason);
         StringSyncValue detail = str("detail", () -> task == null ? "" : task.detail);
         StringSyncValue progress = str("progress", this::mainProgress);
         IntSyncValue unknownAtSite = new IntSyncValue(() -> site == null ? 0 : site.unknownCells);
@@ -356,10 +461,14 @@ final class BuilderGui {
         sync.syncValue("blockedAtSite", blockedAtSite);
         Supplier<String> status = () -> {
             String state = phase.getStringValue();
-            if (target.getValue() == null && state.equals("state.DRAFT")) return tr("markController");
+            if ("markerLocked".equals(reason.getStringValue())) return tr("markerLocked");
+            if (target.getValue() == null && state.equals("state.DRAFT"))
+                return tr((flags.getIntValue() & LOCKED_MARKER) != 0 ? "markerLocked" : "markController");
             String message = tr(state.equals("state.REFUND") && (flags.getIntValue() & 264) == 0 ? "refundDone"
                     : (flags.getIntValue() & UPGRADE) != 0 && state.equals("state.DONE") ? "upgradeDone"
                     : (flags.getIntValue() & UPGRADE) != 0 && state.equals("state.BUILDING") ? "upgrading" : state);
+            if (state.equals("state.DONE") && !formation.getStringValue().isEmpty())
+                message += " | " + tr(formation.getStringValue());
             if (!reason.getStringValue().isEmpty()) {
                 String why = tr(reason.getStringValue());
                 if (!why.equals(message)) message += ": " + why;
@@ -385,17 +494,16 @@ final class BuilderGui {
                                                                         == BuildTask.State.REFUND
                                                         ? 256
                                                         : 0)
-                                                | (task.key.isEmpty() && task.salvage.rows.isEmpty() ? 128 : 0)
+                                                | (task.ledger.count > 0 ? LOCKED_MARKER : 0)
                                                 | (task.hasReserved() ? 8 : 0)
                                                 | (task.upgrading() ? UPGRADE : 0)
-                                                | (task.canConfigureChannels() && (!task.existing || task.plan != null && task.plan.ready)
-                                                        ? CAN_CONFIGURE : 0)
                                                 | (task.upgradeCount > 0 ? HAS_REPLACEMENTS : 0)
                                                 | (site != null ? SITE_COUNTS : 0)
                                                 | (site == null && checkingSite != null ? CHECKING_SITE : 0)
                                                 | (site != null && site.installedCells > 0 && site.installedCells < site.totalCells
                                                         ? PARTIAL_BUILD : 0)
                                                 | (task.texturedPreview ? TEXTURED_PREVIEW : 0)
+                                                | (task.repairableIssue() ? REPAIR_CELL : 0)
                                                 | (task.previewLayers << 4));
         sync.syncValue("flags", flags);
         IntSyncValue rate =
@@ -411,16 +519,18 @@ final class BuilderGui {
 
         panel.child(new Widget<>().pos(2, 2).size(W - 4, H - 4).background(fill(SURFACE)));
         ParentWidget<?> main = page(Page.MAIN),
-                channel = page(Page.CHANNELS),
                 order = page(Page.ORDER),
                 tasks = page(Page.TASKS),
                 choice = page(Page.CHOICES),
                 groups = page(Page.GROUPS);
+        ParentWidget<?> browserPage = page(Page.BROWSER);
+        installCellPage(page(Page.CELL));
+        if (!server()) browser.install(browserPage, this::name);
         main.child(
                 new PhantomItemSlot()
                         .slot(markerSlot())
                         .pos(EDGE, 9)
-                        .tooltip(t -> t.addLine(IKey.str(tr("marker")))));
+                        .tooltip(t -> t.addLine(IKey.str(tr((flags.getIntValue() & LOCKED_MARKER) != 0 ? "markerLocked" : "marker")))));
         singleLine(main, this::name, 33, 4, 205, 17, INK);
         label(main, () -> position.getStringValue().isEmpty() ? ""
                 : site(position.getStringValue()) + " | " + tr("facing." + facing.getStringValue()),
@@ -431,7 +541,8 @@ final class BuilderGui {
                 () -> in(phase, "DONE", "REFUND", "DISMANTLING", "DISMANTLED", "TEARDOWN_PAUSED");
         label(
                 main,
-                () -> tr(in(phase, "DISMANTLING") ? "salvage" : in(phase, "REFUND") ? "leftovers"
+                () -> tr(in(phase, "DISMANTLING") ? "salvage"
+                        : in(phase, "REFUND") || in(phase, "DONE") && (flags.getIntValue() & 8) != 0 ? "leftovers"
                         : (flags.getIntValue() & UPGRADE) != 0 ? "replacementList"
                         : (flags.getIntValue() & SITE_COUNTS) != 0 ? "installedTotal" : "materials"),
                 10,
@@ -444,18 +555,20 @@ final class BuilderGui {
                 : progress.getStringValue(), 104, 38, EDGE + MATERIAL_WIDTH - 104, 13, MUTED, Alignment.CenterRight)
                 .setEnabledIf(w -> !in(phase, "REFUND"));
         list(main, materials, EDGE, 52, MATERIAL_WIDTH + 7, 80);
-        button(main, OPTIONS_X, 39, OPTIONS_WIDTH, () -> tr("channels"), "channels", false)
-                .height(15).padding(OPTION_TEXT, 2, 0, 0)
-                .overlay(IKey.str(tr("channels")).color(INK).shadow(false).alignment(Alignment.CenterLeft))
-                .setEnabledIf(w -> target.getValue() != null && !settled.getAsBoolean());
-        ParentWidget<?> preview = new ParentWidget<>().pos(OPTIONS_X, 55).size(OPTIONS_WIDTH, 76)
+        ParentWidget<?> preview = new ParentWidget<>().pos(OPTIONS_X, 65).size(OPTIONS_WIDTH, 66)
                 .setEnabledIf(w -> target.getValue() != null && !settled.getAsBoolean());
         main.child(preview);
-        label(preview, () -> tr("preview"), 3, 0, OPTIONS_WIDTH - 3, 12, ACCENT);
-        checkbox(preview, 0, 13, OPTIONS_WIDTH, "hatches", () -> layerVisible(PreviewStream.HATCH)).height(15);
-        checkbox(preview, 0, 29, OPTIONS_WIDTH, "box", () -> layerVisible(PreviewStream.BOX)).height(15);
-        checkbox(preview, 0, 45, OPTIONS_WIDTH, "shell", () -> layerVisible(PreviewStream.SHELL)).height(20);
-        ParentWidget<?> shellStyles = new ParentWidget<>().pos(0, 65).size(OPTIONS_WIDTH, STYLE_ROW_HEIGHT)
+        IDrawable browseLabel = IKey.str(tr("browser.open")).color(INK).shadow(false).alignment(Alignment.CenterLeft);
+        IDrawable arrow = IKey.str("›").color(ACCENT).shadow(false).alignment(Alignment.CenterRight);
+        button(main, OPTIONS_X, 40, OPTIONS_WIDTH, () -> tr("browser.open"), "browser", true)
+                .height(22).overlay((ctx, x, y, w, h, theme) -> {
+                    browseLabel.draw(ctx, x + 7, y, w - 22, h, theme);
+                    arrow.draw(ctx, x + w - 15, y, 8, h, theme);
+                }).setEnabledIf(w -> target.getValue() != null);
+        checkbox(preview, 0, 0, OPTIONS_WIDTH, "hatches", () -> layerVisible(PreviewStream.HATCH)).height(15);
+        checkbox(preview, 0, 17, OPTIONS_WIDTH, "box", () -> layerVisible(PreviewStream.BOX)).height(15);
+        checkbox(preview, 0, 34, OPTIONS_WIDTH, "shell", () -> layerVisible(PreviewStream.SHELL)).height(20);
+        ParentWidget<?> shellStyles = new ParentWidget<>().pos(0, 54).size(OPTIONS_WIDTH, STYLE_ROW_HEIGHT)
                 .setEnabledIf(w -> layerVisible(PreviewStream.SHELL));
         preview.child(shellStyles);
         int solidWidth = 31;
@@ -463,7 +576,10 @@ final class BuilderGui {
         previewStyle(shellStyles, solidWidth + 1, OPTIONS_WIDTH - solidWidth - 1, true);
         singleLine(main, status, 10, 133, LIST_WIDTH - 2, 13, MUTED);
         rule(main, EDGE, 147, LIST_WIDTH);
-        main.child(SlotGroupWidget.playerInventory(false).left(EDGE).top(152));
+        panel.child(SlotGroupWidget.playerInventory(false).left(BAG_X).top(BAG_Y)
+                .setEnabledIf(w -> view.getIntValue() == Page.MAIN.ordinal() || onCellPage()));
+        button(main, 178, 187, 129, () -> tr("cell.title"), "repairCell", false)
+                .setEnabledIf(w -> (flags.getIntValue() & REPAIR_CELL) != 0);
         label(main, () -> tr("rate"), 178, 152, 129, 14, MUTED)
                 .setEnabledIf(w -> !settled.getAsBoolean());
         main.child(
@@ -497,41 +613,20 @@ final class BuilderGui {
                                         && in(
                                                 phase, "DRAFT", "PREVIEW", "BLOCKED", "READY",
                                                 "MISSING", "UPGRADE_REVIEW"));
-        button(
-                        main,
-                        178,
-                        FOOTER_Y,
-                        129,
-                        () ->
-                                tr(
-                                        (flags.getIntValue() & 264) == 0
-                                                ? "remove"
-                                                : (flags.getIntValue() & 128) == 0
-                                                        ? "retryRefund"
-                                                        : "recover"),
-                        "cancel",
-                        false)
-                .setEnabledIf(w -> settled.getAsBoolean() && !in(phase, "DISMANTLING"));
+        button(main, 178, FOOTER_Y, 129, () -> tr("retryRefund"), "retryRefund", false)
+                .setEnabledIf(w -> in(phase, "DONE", "REFUND") && (flags.getIntValue() & 264) != 0);
+        button(main, 178, FOOTER_Y, 129, () -> tr("remove"), "deleteTask", false)
+                .setEnabledIf(w -> settled.getAsBoolean() && !in(phase, "DISMANTLING")
+                        && (!in(phase, "DONE", "REFUND") || (flags.getIntValue() & 264) == 0));
         button(
                         main,
                         178,
                         FOOTER_Y,
                         60,
                         () -> tr(in(phase, "PREVIEW") ? "remove" : "discard"),
-                        "cancel",
+                        "deleteTask",
                         false)
                 .setEnabledIf(w -> in(phase, "DRAFT", "PREVIEW") && target.getValue() != null);
-
-        heading(channel, "channels", this::name);
-        label(channel, () -> tr("channelName"), EDGE + 25, 44, LEVEL_X - 29, 12, ACCENT);
-        label(channel, () -> tr("level"), EDGE + LEVEL_X, 44, LEVEL_WIDTH, 12, ACCENT, Alignment.CENTER);
-        list(channel, settings, EDGE, 59, LIST_WIDTH, 128);
-        label(channel, () -> tr(upgradeable.isEmpty() ? "inherit" : "upgradeChannelHelp"), 10, 190, LIST_WIDTH - 2, 14, MUTED);
-        control(channel, 121, FOOTER_Y, 112, () -> tr("shareDefaults"), () -> submitChannels(true), false)
-                .tooltip(t -> t.addLine(IKey.str(tr("shareHelp"))))
-                .setEnabledIf(w -> (flags.getIntValue() & CAN_CONFIGURE) != 0);
-        control(channel, 239, FOOTER_Y, 68, () -> tr(Collections.disjoint(editedChannels, upgradeable) ? "apply" : "checkUpgrade"),
-                () -> submitChannels(false), true).setEnabledIf(w -> (flags.getIntValue() & CAN_CONFIGURE) != 0);
 
         heading(groups, "materialRoles", this::name);
         list(groups, roles, EDGE, 44, LIST_WIDTH, 150);
@@ -580,6 +675,18 @@ final class BuilderGui {
         }
     }
 
+    private String controllerFormation() {
+        if (task == null || task.state != BuildTask.State.DONE || task.target == null) return "";
+        WorldServer world = DimensionManager.getWorld(task.dim);
+        if (world == null || !world.blockExists(task.x, task.y, task.z)) return "";
+        TileEntity tile = world.getTileEntity(task.x, task.y, task.z);
+        if (!(tile instanceof IGregTechTileEntity)) return "";
+        IGregTechTileEntity gt = (IGregTechTileEntity) tile;
+        if (gt.getMetaTileID() != task.target.getMetadata() || !(gt.getMetaTileEntity() instanceof MTEMultiBlockBase)) return "";
+        return ((MTEMultiBlockBase) gt.getMetaTileEntity()).mMachine
+                ? "machineFormed" : "machineUnformed";
+    }
+
     private static boolean in(StringSyncValue phase, String... states) {
         for (String state : states)
             if (("state." + state).equals(phase.getStringValue())) return true;
@@ -610,6 +717,74 @@ final class BuilderGui {
         rule(group, 9, 38, LIST_WIDTH);
     }
 
+    private void installCellPage(ParentWidget<?> group) {
+        GenericSyncValue<ItemStack, ?> selected = GenericSyncValue.builder(ItemStack.class)
+                .getter(() -> cell == null ? null : cell.selected).adapter(ByteBufAdapters.ITEM_STACK)
+                .copy(ItemStack::copy).nullable().build();
+        IntSyncValue mode = new IntSyncValue(() -> cell == null ? 0 : (cell.host ? 1 : 0) | (cell.occupied() ? 2 : 0));
+        cellTicket = new IntSyncValue(() -> cell == null ? 0 : cell.ticket);
+        sync.syncValue("cellSlot", selected);
+        sync.syncValue("cellMode", mode);
+        sync.syncValue("cellTicket", cellTicket);
+        StringSyncValue pos = str("cellPos", () -> cell == null ? "" : cell.x + ", " + cell.y + ", " + cell.z);
+        StringSyncValue result = str("cellResult", () -> cell == null ? "" : cell.message);
+        GenericSyncValue<ItemStack, ?> old = GenericSyncValue.builder(ItemStack.class)
+                .getter(() -> cell == null ? null : cell.oldDisplay).adapter(ByteBufAdapters.ITEM_STACK)
+                .copy(ItemStack::copy).nullable().build();
+        sync.syncValue("cellOld", old);
+        sync.registerSyncedAction("cellSelect", false, true, b -> {
+            int index = b.readByte();
+            if (cellActive()) cell.select(player(), index);
+        });
+        sync.registerSyncedAction("cellConfirm", false, true, b -> {
+            int ticket = b.readInt();
+            boolean remove = b.readBoolean();
+            if (cellActive()) {
+                cell.apply(player(), ticket, remove);
+                if (cell.host && cell.occupied()) show(Page.MAIN);
+            }
+        });
+        heading(group, "cell.title", () -> tr((mode.getIntValue() & 1) != 0 ? "markerHost" : "markerHatch")
+                + "   " + pos.getStringValue());
+        label(group, () -> tr("cell.current"), 13, 42, 85, 13, MUTED);
+        singleLine(group, () -> old.getValue() == null ? tr((mode.getIntValue() & 2) == 0 ? "cell.empty" : "cell.occupied")
+                : old.getValue().getDisplayName(), 13, 56, W - 26, 15, INK);
+        ItemStackHandler mark = new ItemStackHandler(1) {
+            @Override public int getSlotLimit(int index) { return 1; }
+            @Override public ItemStack getStackInSlot(int index) {
+                return ItemStack.copyItemStack(server() ? cell == null ? null : cell.selected : selected.getValue());
+            }
+            @Override public void setStackInSlot(int index, ItemStack stack) {
+                if (server() && cellActive()) cell.mark(stack, -1);
+            }
+        };
+        ModularSlot phantom = new ModularSlot(mark, 0) {
+            @Override public boolean isItemValid(ItemStack s) {
+                if (s == null || !(s.getItem() instanceof net.minecraft.item.ItemBlock)) return false;
+                if (server()) return cellActive() && (!cell.host || cell.task.target.isItemEqual(s));
+                return onCellPage() && ((mode.getIntValue() & 1) == 0 || target.getValue() != null && target.getValue().isItemEqual(s));
+            }
+            @Override public int getItemStackLimit(ItemStack s) { return 1; }
+        }.singletonSlotGroup();
+        group.child(new PhantomItemSlot().slot(phantom).pos(CELL_SLOT_X, CELL_SLOT_Y)
+                .tooltip(t -> t.addLine(IKey.str(tr("cell.slotHint")))));
+        singleLine(group, () -> selected.getValue() == null ? tr("cell.select") : selected.getValue().getDisplayName(),
+                40, 80, W - 53, 16, INK);
+        rule(group, EDGE, 110, LIST_WIDTH);
+        label(group, () -> StatCollector.translateToLocal("container.inventory"), BAG_X, 136, 130, 14, MUTED);
+        singleLine(group, () -> result.getStringValue().isEmpty() ? "" : tr(result.getStringValue()),
+                EDGE, 115, LIST_WIDTH, 16, ACCENT);
+        control(group, 178, FOOTER_Y, 59, () -> tr("cell.remove"), () -> confirmCell(true), false)
+                .setEnabledIf(w -> mode.getIntValue() == 2);
+        control(group, 241, FOOTER_Y, 66, () -> tr((mode.getIntValue() & 2) == 0 ? "cell.place" : "cell.replace"),
+                () -> confirmCell(false), true);
+    }
+
+    private boolean cellActive() {
+        return page == Page.CELL && cell != null && current() == cell.task && cell.task.canChangeCell(cell.at)
+                && player().getHeldItem() == tool() && player().dimension == cell.task.dim;
+    }
+
     private static Rectangle fill(int color) {
         return new Rectangle().color(color);
     }
@@ -631,6 +806,8 @@ final class BuilderGui {
         ItemStack s = tool();
         if (s == null || s.getItem() != BuilderItem.ITEM) return;
         if ("back".equals(action)) {
+            if (page == Page.MAIN) return;
+            if (page == Page.CHOICES && matchingGroups.size() > 1) { show(Page.GROUPS); return; }
             if (task == null) BuilderItem.selectAtFeet(player(), s);
             show(Page.MAIN);
             return;
@@ -646,13 +823,20 @@ final class BuilderGui {
         if (task == null) return;
         WorldServer world = DimensionManager.getWorld(task.dim);
         switch (action) {
+            case "repairCell":
+                if (page == Page.MAIN && task.repairableIssue() && task.dim == player().dimension)
+                    openCell(task, task.issue);
+                return;
+            case "browser":
+                if (page == Page.MAIN && task.target != null) {
+                    browser.open(player(), task, channels);
+                    show(Page.BROWSER);
+                }
+                return;
             case "buildList":
                 if (page == Page.MAIN && task.state == BuildTask.State.UPGRADE_REVIEW
                         && world != null && player().worldObj == world) task.continueOrdinaryBuild(player(), world);
                 break;
-            case "channels":
-                if (task.target != null) show(Page.CHANNELS);
-                return;
             case "auto":
                 if (page == Page.ORDER && task.state == BuildTask.State.MISSING) {
                     task.auto = !task.auto;
@@ -687,17 +871,31 @@ final class BuilderGui {
                 if (page != Page.ORDER
                         || task.state != BuildTask.State.MISSING
                         || player().worldObj != world) return;
-                if (action.equals("recheck") || player().capabilities.isCreativeMode) task.start();
+                if (action.equals("recheck")) task.recheckMaterials();
+                else if (player().capabilities.isCreativeMode) task.start();
                 else task.submit(player(), world);
                 break;
+            case "retryRefund":
+                if (page == Page.MAIN && world != null && player().worldObj == world
+                        && (task.state == BuildTask.State.REFUND || task.state == BuildTask.State.DONE)) {
+                    task.retryRefund(player(), world);
+                    task.beginDismantle();
+                }
+                break;
+            case "deleteTask":
+                if (page == Page.MAIN && (task.state == BuildTask.State.DRAFT || task.state == BuildTask.State.PREVIEW
+                        || task.state == BuildTask.State.REFUND || task.state == BuildTask.State.DONE
+                        || task.state == BuildTask.State.DISMANTLED || task.state == BuildTask.State.TEARDOWN_PAUSED)) {
+                    delete(task, world);
+                    show(Page.TASKS);
+                }
+                break;
             case "cancel":
-                if (page == Page.MAIN && world != null && player().worldObj == world) {
-                    if (task.state == BuildTask.State.REFUND) {
-                        task.cancel(player(),world);
-                        if (task.savedLink == null && !task.hasReserved()) delete(task, world);
-                    } else if (task.ledger.count > 0 && task.state != BuildTask.State.DONE)
-                        task.cancel(player(), world);
-                    else delete(task, world);
+                if (page == Page.MAIN && world != null && player().worldObj == world && task.state != BuildTask.State.DONE
+                        && task.state != BuildTask.State.REFUND && task.state != BuildTask.State.DISMANTLED
+                        && task.state != BuildTask.State.DISMANTLING && task.state != BuildTask.State.TEARDOWN_PAUSED
+                        && task.state != BuildTask.State.DRAFT && task.state != BuildTask.State.PREVIEW) {
+                    task.cancel(player(), world);
                     show(Page.TASKS);
                 }
                 break;
@@ -710,16 +908,7 @@ final class BuilderGui {
     }
 
     private void delete(BuildTask t, WorldServer world) {
-        boolean selected = current() == t;
-        t.deleteRequested = true;
-        t.dismantleRequested = false;
-        if (t.state != BuildTask.State.REFUND) t.cancel(player(), world);
-        else if (world != null && player().worldObj == world) t.retryRefund(player(), world);
-        if (t.savedLink == null && !t.hasReserved()) {
-            t.store.remove(t, player());
-        }
-        if (selected) t.store.select(tool(), null);
-        t.changed();
+        t.store.delete(t, player(), tool(), world);
     }
 
     private void queueAction(String id, boolean dismantle) {
@@ -732,62 +921,18 @@ final class BuilderGui {
     }
 
     private void show(Page next) {
-        if (next == Page.CHANNELS || page == Page.CHANNELS) survey = null;
+        if (page == Page.CELL && next != Page.CELL) cell = null;
+        if (page == Page.BROWSER && next != Page.BROWSER) browser.leave();
         page = next;
         previous = "";
         update();
         sendRows();
     }
 
-    private void submitChannels(boolean share) {
-        panel.getContext().removeFocus();
-        sync.callSyncedAction(
-                "apply",
-                b -> {
-                    writeStringSafe(b, selectedId.getStringValue());
-                    b.writeInt(channelRevision);
-                    b.writeVarIntToBuffer(channelValues.size());
-                    for (Map.Entry<String, IntValue> e : channelValues.entrySet()) {
-                        writeStringSafe(b, e.getKey());
-                        b.writeVarIntToBuffer(e.getValue().getIntValue());
-                        b.writeBoolean(editedChannels.contains(e.getKey()));
-                    }
-                    b.writeBoolean(share);
-                });
-    }
-
-    private void applyChannels(PacketBuffer b) {
-        String id = readStringSafe(b);
-        int revision = b.readInt();
-        int count = b.readVarIntFromBuffer();
-        update();
-        if (page != Page.CHANNELS
-                || task == null
-                || task.target == null
-                || !task.id.equals(id)
-                || !task.canConfigureChannels()
-                || task.existing && (task.plan == null || !task.plan.ready)
-                || task.revision != revision
-                || count != channels.size() + 1) return;
-        Map<String, Integer> values = new HashMap<>();
-        Set<String> specified = new LinkedHashSet<>();
-        for (int i = 0; i < count; i++) {
-            String name = readStringSafe(b);
-            if (values.put(name, b.readVarIntFromBuffer()) != null) return;
-            if (b.readBoolean()) specified.add(name);
-        }
-        boolean share = b.isReadable() && b.readBoolean();
-        if (!values.containsKey("")) return;
-        int tier = Math.max(1, Math.min(4096, values.get("")));
-        NBTTagCompound next = new NBTTagCompound();
-        for (IChannelDefinition d : channels) {
-            Integer v = values.get(d.getChannel());
-            if (v == null) return;
-            if (v > 0) next.setInteger(d.getChannel(), d.normalizeValue(v));
-            if (task.channels.getInteger(d.getChannel()) != next.getInteger(d.getChannel()))
-                specified.add(d.getChannel());
-        }
-        boolean changed = task.tier != tier || !task.channels.equals(next);
+    private void commitChannels(int tier, NBTTagCompound next, Set<String> specified, boolean share) {
+        if (page != Page.BROWSER || task == null || !task.canConfigureChannels()
+                || task.existing && (task.plan == null || !task.plan.ready)) return;
+        boolean changed = !task.usesConfiguredSource() || task.tier != tier || !task.channels.equals(next);
         if (!share && task.existing && task.plan != null && task.plan.ready) {
             specified.retainAll(task.plan.upgradeChannels());
         } else specified.clear();
@@ -795,14 +940,13 @@ final class BuilderGui {
             if (!task.setUpgradeChannels(specified)) return;
             task.tier = tier;
             task.channels = next;
-        } else if (changed) {
+        } else if (changed || !share && task.upgrading()) {
             if (task.upgrading() && !task.setUpgradeChannels(Collections.emptySet())) return;
             task.tier = tier;
             task.channels = next;
             task.resetDraft();
         }
         task.store.channelMemory.remember(task, channels, share);
-        show(Page.MAIN);
     }
 
     private String dimensions() {
@@ -893,7 +1037,11 @@ final class BuilderGui {
                         .textAlign(align)
                         .color(color)
                         .shadow(false)
-                        .tooltip(t -> t.addLine(IKey.dynamic(text)));
+                        .tooltipDynamic(t -> {
+                            String line = text.get();
+                            if (!line.isEmpty()) t.addLine(IKey.str(line));
+                        })
+                        .tooltipAutoUpdate(true);
         group.child(widget);
         return widget;
     }
@@ -962,6 +1110,7 @@ final class BuilderGui {
                         .overlay(IKey.dynamic(title).color(INK).shadow(false))
                         .onMousePressed(
                                 b -> {
+                                    if (b != 0) return false;
                                     click.run();
                                     return true;
                                 });
@@ -1060,6 +1209,7 @@ final class BuilderGui {
     }
 
     private void sendRows() {
+        if (page == Page.BROWSER) return;
         if (tool() == null || tool().getItem() != BuilderItem.ITEM) return;
         if (page == Page.GROUPS) {
             if (task == null || !task.editable() || task.plan == null || !task.plan.ready) {
@@ -1111,30 +1261,6 @@ final class BuilderGui {
                     b.writeVarIntToBuffer(counts[option]);
                 });
             }
-            return;
-        }
-        if (page == Page.CHANNELS) {
-            if (task == null) return;
-            boolean ready = task.existing && task.plan != null && task.plan.ready;
-            String key = "channels/" + task.id + "/" + task.revision + "/" + channels.size() + "/" + ready;
-            if (key.equals(previous)) return;
-            previous = key;
-            survey = null;
-            sync.callSyncedAction(
-                    "rows",
-                    b -> {
-                        b.writeByte(4);
-                        b.writeInt(task.revision);
-                        b.writeVarIntToBuffer(task.tier);
-                        b.writeVarIntToBuffer(channels.size());
-                        for (IChannelDefinition d : channels) {
-                            writeStringSafe(b, d.getChannel());
-                            b.writeVarIntToBuffer(task.channels.getInteger(d.getChannel()));
-                            b.writeVarIntToBuffer(d.getMinimumValue());
-                            b.writeVarIntToBuffer(d.getMaximumValue());
-                            b.writeBoolean(ready && task.plan.upgradeChannels().contains(d.getChannel()));
-                        }
-                    });
             return;
         }
         if (page == Page.TASKS) {
@@ -1258,14 +1384,11 @@ final class BuilderGui {
                         : task.state == BuildTask.State.DISMANTLING
                                 ? task.salvage
                                 : task.plan != null && task.plan.ready ? task.plan.bill : null;
-        if (task.state == BuildTask.State.REFUND
-                || task.state == BuildTask.State.DONE && task.hasReserved()) {
-            list = new Materials();
-            list.read(task.held.save());
-            for (Materials.Entry entry : task.backpack.rows.values())
-                list.add(entry.item, entry.count);
-            for (Materials.Entry entry : task.salvage.rows.values())
-                list.add(entry.item, entry.count);
+        if (task.state == BuildTask.State.REFUND || task.state == BuildTask.State.DONE && task.hasReserved()) {
+            sendRefundRows(task.backpack, 15);
+            sendRefundRows(task.held, 16);
+            sendRefundRows(task.salvage, 16);
+            return;
         }
         if (list == null) return;
         boolean catalog = !missing && task.plan != null && list == task.plan.bill;
@@ -1351,6 +1474,14 @@ final class BuilderGui {
         }
     }
 
+    private void sendRefundRows(Materials source, int type) {
+        for (Materials.Entry e : source.rows.values()) sync.callSyncedAction("rows", b -> {
+            b.writeByte(type);
+            ByteBufAdapters.ITEM_STACK.serializeSafe(b, e.item);
+            b.writeVarIntToBuffer(e.count);
+        });
+    }
+
     private static void writeSiteCounts(PacketBuffer b, OrdinaryBuildSurvey site, ItemStack item) {
         b.writeVarIntToBuffer(site.installed.count(item));
         b.writeVarIntToBuffer(site.missing.count(item));
@@ -1384,26 +1515,6 @@ final class BuilderGui {
         }
     }
 
-    private void surveyChannels() {
-        if (task == null || !task.existing || task.plan == null || !task.plan.ready
-                || player().dimension != task.dim || task.plan.upgradeChannels().isEmpty()) return;
-        if (survey == null || survey.plan != task.plan) {
-            survey = new ChannelSurvey(task.plan);
-            surveySent = false;
-        }
-        if (surveySent || !survey.advance(player().worldObj)) return;
-        surveySent = true;
-        for (String channel : survey.plan.upgradeChannels()) sync.callSyncedAction("rows", buf -> {
-            buf.writeByte(12);
-            buf.writeInt(task.revision);
-            writeStringSafe(buf, channel);
-            Set<Integer> levels = survey.levels.getOrDefault(channel, Collections.emptySet());
-            buf.writeVarIntToBuffer(levels.size());
-            for (int level : levels) buf.writeVarIntToBuffer(level);
-            buf.writeBoolean(survey.incomplete.contains(channel));
-        });
-    }
-
     private void receive(PacketBuffer b) {
         int type = b.readUnsignedByte();
         if (type == 14) {
@@ -1417,17 +1528,6 @@ final class BuilderGui {
             ItemStack next = ByteBufAdapters.ITEM_STACK.deserializeSafe(b);
             int count = b.readVarIntFromBuffer();
             if (old != null && next != null) replacementRow(old, next, count);
-            return;
-        }
-        if (type == 12) {
-            if (b.readInt() != channelRevision) return;
-            String channel = readStringSafe(b);
-            int count = b.readVarIntFromBuffer();
-            StringJoiner levels = new StringJoiner(" / ");
-            for (int i = 0; i < count; i++) levels.add(String.valueOf(b.readVarIntFromBuffer()));
-            boolean partial = b.readBoolean();
-            siteLevels.put(channel, count == 0 ? tr(partial ? "siteUnknown" : "siteEmpty")
-                    : StatCollector.translateToLocalFormatted("structurebuildernh." + (partial ? "siteLevelsPartial" : "siteLevels"), levels));
             return;
         }
         if (type == 0) {
@@ -1464,23 +1564,6 @@ final class BuilderGui {
             optionRow(stack, b.readVarIntFromBuffer());
             return;
         }
-        if (type == 4) {
-            channelRevision = b.readInt();
-            settings.removeAll();
-            channelValues.clear();
-            editedChannels.clear();
-            upgradeable.clear();
-            siteLevels.clear();
-            channelRow("", b.readVarIntFromBuffer(), 1, 4096);
-            int count = b.readVarIntFromBuffer();
-            for (int i = 0; i < count; i++) {
-                String channel = readStringSafe(b);
-                int value = b.readVarIntFromBuffer(), min = b.readVarIntFromBuffer(), max = b.readVarIntFromBuffer();
-                if (b.readBoolean()) upgradeable.add(channel);
-                channelRow(channel, value, min, max);
-            }
-            return;
-        }
         if (type == 2 || type == 3) {
             String id = readStringSafe(b);
             QueueLine row;
@@ -1514,6 +1597,7 @@ final class BuilderGui {
                         .overlay(row::draw)
                         .tooltip(t -> t.addLine(IKey.dynamic(row::description)))
                         .onMousePressed(i -> {
+                            if (i != 0) return false;
                             sync.callSyncedAction("select", buf -> writeStringSafe(buf, id));
                             return true;
                         }));
@@ -1538,11 +1622,13 @@ final class BuilderGui {
         int fixed = surveyed && selectable ? b.readVarIntFromBuffer() : 0;
         ItemStack s = ByteBufAdapters.ITEM_STACK.deserializeSafe(b);
         int n = b.readVarIntFromBuffer();
-        boolean quoted = !surveyed && !selectable && b.readBoolean();
+        boolean refundRow = type == 15 || type == 16;
+        boolean quoted = !surveyed && !selectable && !refundRow && b.readBoolean();
         int required = quoted ? b.readVarIntFromBuffer() : 0,
                 reserved = quoted ? b.readVarIntFromBuffer() : 0;
         if (s == null) return;
-        String count = String.format(Locale.ROOT, "%,d", n);
+        String count = refundRow ? quantity(type == 15 ? "refundBagCount" : "refundMECount", n)
+                : String.format(Locale.ROOT, "%,d", n);
         SiteRow progress = surveyed ? new SiteRow(n) : null;
         if (surveyed) {
             progress.read(b);
@@ -1645,86 +1731,5 @@ final class BuilderGui {
             for (int i = 1; i < amounts.size(); i++) amounts.get(i).setIntValue(i == index ? choiceSize : 0);
         }, false).tooltip(t -> t.addLine(IKey.str(tr("choiceAll") + " - " + name.get())));
         alternatives.child(row);
-    }
-
-    private void channelRow(String key, int current, int min, int max) {
-        boolean main = key.isEmpty();
-        IntValue value = new IntValue(current);
-        channelValues.put(key, value);
-        Map<Integer, ItemStack> samples = new HashMap<>();
-        if (!main && ChannelDescription.has(key)) {
-            for (Map.Entry<ItemStack, Integer> e :
-                    ChannelDescription.get(key).getItems().entrySet())
-                samples.putIfAbsent(e.getValue(), e.getKey());
-        }
-        Supplier<ItemStack> sample =
-                () ->
-                        samples.get(
-                                Math.max(
-                                        min,
-                                        Math.min(
-                                                max,
-                                                value.getIntValue() == 0
-                                                        ? channelValues.get("").getIntValue()
-                                                        : value.getIntValue())));
-        String label = main ? tr("tier") : key;
-        String alias = "structurebuildernh.channel." + key;
-        if (!main && StatCollector.canTranslate(alias))
-            label = StatCollector.translateToLocal(alias);
-        final String title = label;
-        String fallback = main ? tr("defaultTier") : max == Integer.MAX_VALUE
-                ? StatCollector.translateToLocalFormatted("structurebuildernh.minLevel", min)
-                : StatCollector.translateToLocalFormatted("structurebuildernh.levelRange", min, max);
-        int textWidth = LEVEL_X - 25 - 6;
-        int rowHeight = 32;
-        ParentWidget<?> row = new ParentWidget<>().size(ROW_WIDTH, rowHeight)
-                .background(fill(settings.getChildren().size() % 2 == 0 ? STRIPE : SURFACE));
-        ItemDrawable icon = new ItemDrawable();
-        Supplier<ItemStack> selectedBlock = main ? target::getValue : sample;
-        row.child(
-                new Widget<>()
-                        .left(4).verticalCenter()
-                        .size(16)
-                        .background(
-                                (ctx, x, y, w, h, theme) -> {
-                                    ItemStack stack = selectedBlock.get();
-                                    if (stack != null)
-                                        icon.setItem(stack).draw(ctx, x, y, w, h, theme);
-                                })
-                        .tooltip(t -> t.addLine(IKey.dynamic(() -> {
-                            ItemStack stack = selectedBlock.get();
-                            return stack == null ? fallback : stack.getDisplayName();
-                        }))));
-        singleLine(row, () -> title, 25, 3, textWidth, 12, INK);
-        singleLine(
-                row,
-                () -> {
-                    ItemStack block = sample.get();
-                    if (siteLevels.containsKey(key)) return siteLevels.get(key);
-                    if (block != null) return block.getDisplayName();
-                    return fallback;
-                },
-                25,
-                17,
-                textWidth,
-                12,
-                MUTED);
-        row.child(
-                new TextFieldWidget() {
-                    @Override
-                    public void onFocus(ModularGuiContext context) {
-                        super.onFocus(context);
-                        // Selecting a target is intentional even if it matches the terminal's remembered value.
-                        if (upgradeable.contains(key)) editedChannels.add(key);
-                    }
-                }
-                        .value(value)
-                        .numbersInt(main ? 1 : 0, max)
-                        .left(LEVEL_X).verticalCenter()
-                        .size(LEVEL_WIDTH, 16)
-                        .setEnabledIf(w -> (flags.getIntValue() & CAN_CONFIGURE) != 0));
-        label(row, value::getStringValue, LEVEL_X, (rowHeight - 16) / 2, LEVEL_WIDTH, 16, INK, Alignment.CENTER)
-                .setEnabledIf(w -> (flags.getIntValue() & CAN_CONFIGURE) == 0);
-        settings.child(row);
     }
 }

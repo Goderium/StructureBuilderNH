@@ -5,24 +5,27 @@ import com.Goderium.StructureBuilderNH.common.builder.PreviewStream;
 import com.Goderium.StructureBuilderNH.common.builder.HatchTypes;
 import com.Goderium.StructureBuilderNH.common.builder.PreviewAim;
 import com.Goderium.StructureBuilderNH.common.builder.PreviewEdit;
+import com.Goderium.StructureBuilderNH.common.builder.PreviewDragMessage;
+import com.Goderium.StructureBuilderNH.common.builder.PreviewPose;
+import com.gtnewhorizon.structurelib.alignment.enumerable.ExtendedFacing;
 import com.Goderium.StructureBuilderNH.common.builder.BuilderItem;
+import com.Goderium.StructureBuilderNH.common.builder.BuilderTasks;
 import com.Goderium.StructureBuilderNH.util.Bounds;
 
 import cpw.mods.fml.common.FMLCommonHandler;
 import cpw.mods.fml.common.eventhandler.EventPriority;
 import cpw.mods.fml.common.eventhandler.SubscribeEvent;
 import cpw.mods.fml.common.gameevent.TickEvent;
+import cpw.mods.fml.common.gameevent.InputEvent;
+import cpw.mods.fml.client.registry.ClientRegistry;
 
-import gregtech.api.GregTechAPI;
 import net.minecraft.block.Block;
 import net.minecraft.init.Blocks;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiScreen;
 import net.minecraft.client.renderer.Tessellator;
 import net.minecraft.client.renderer.culling.Frustrum;
-import net.minecraft.client.renderer.texture.AbstractTexture;
-import net.minecraft.client.renderer.texture.TextureManager;
 import net.minecraft.client.renderer.texture.TextureMap;
-import net.minecraft.client.renderer.texture.TextureUtil;
 import net.minecraft.client.resources.IResourceManager;
 import net.minecraft.client.resources.IReloadableResourceManager;
 import net.minecraft.client.settings.KeyBinding;
@@ -31,7 +34,7 @@ import net.minecraft.entity.player.EntityPlayer;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.util.ChunkCoordinates;
-import net.minecraft.util.ResourceLocation;
+import net.minecraft.util.MathHelper;
 import net.minecraft.util.StatCollector;
 import net.minecraft.util.AxisAlignedBB;
 import net.minecraft.world.ChunkPosition;
@@ -56,8 +59,10 @@ import io.netty.buffer.Unpooled;
 
 public final class BuilderRenderer extends BuilderProxy {
     private static BuilderRenderer instance;
+    private static final long[] EMPTY_MASK = new long[64];
     private final Queue<PreviewStream.Packet> packets = new ConcurrentLinkedQueue<>();
     private final Map<UUID, View> views = new LinkedHashMap<>();
+    private final KeyBinding deleteTask = new KeyBinding("structurebuildernh.key.deleteTask", Keyboard.KEY_Z, "StructureBuilderNH");
     private final PreviewEditQueue editQueue = new PreviewEditQueue(new PreviewEditQueue.Transport() {
         @Override
         public boolean aimed(PreviewEditQueue.Target target) { return editTargetAimed(target); }
@@ -68,17 +73,30 @@ public final class BuilderRenderer extends BuilderProxy {
         }
     });
     private final List<Section> visibleHatches = new ArrayList<>();
+    private final List<Section> visibleSections = new ArrayList<>();
     private final List<Section> transparentSections = new ArrayList<>();
-    private final List<Section> texturedOutlines = new ArrayList<>();
     private double cameraX, cameraY, cameraZ;
-    private final List<net.minecraft.util.ChunkCoordinates> visibleControllers = new ArrayList<>();
+    private World observedWorld;
+    private ProjectionOccupancy occupancy;
+    private final long[] sampledOccupancy = new long[64];
+    private long samplingBudget;
+    private final List<View> visibleControllers = new ArrayList<>();
     private long compilations;
     private String aimedMarker;
     private int aimedColor;
     private Pick aimed;
+    private ChunkCoordinates highlighted;
+    private int highlightColor;
+    private View highlightedController;
+    private Section highlightedHatch, cachedHatchSection;
+    private int highlightedHatchSlot, cachedHatchSlot, cachedMarksRevision, hoverMarks;
+    private HatchMesh.Selection cachedHatchFaces;
+    private final int[] highlightOffset = new int[3], highlightLocal = new int[3];
     private String aimedHint;
     private boolean aimedHatch;
     private final PreviewTooltip tooltip = new PreviewTooltip();
+    private volatile PreviewGrip grip;
+    private long nextGrip;
     private volatile boolean textureReload;
 
     public static final class Pick {
@@ -100,7 +118,7 @@ public final class BuilderRenderer extends BuilderProxy {
     }
 
     public static Pick aimedPick() {
-        return instance == null ? null : instance.pick(Minecraft.getMinecraft().thePlayer);
+        return instance == null ? null : choice(instance.worldHit(Minecraft.getMinecraft().thePlayer), true);
     }
 
     public static boolean previewModifierDown() {
@@ -120,12 +138,89 @@ public final class BuilderRenderer extends BuilderProxy {
     @Override
     public boolean editPreview(EntityPlayer player) {
         if (!editContext(player)) return false;
-        Pick hit = pick(player);
-        PreviewEditQueue.Target target = hit == null ? editQueue.pendingAt(this::editTargetAimed) : editTarget(hit, player);
-        if (target == null) return false;
-        if (previewModifierDown() && target.groupSelectable) editQueue.applyGroup(target, System.nanoTime());
-        // Ordinary right-click consumes the editable projection without opening a new task.
+        if (grip != null) return true;
+        WorldHit hit = worldHit(player);
+        if (hit == null) return false;
+        if (!hit.owned || hit.view.fixedPose != null) return true;
+        boolean sneak = previewModifierDown();
+        if (sneak && !GuiScreen.isCtrlKeyDown()) {
+            PreviewEdit.TaskAction.openTask(hit.view.id, hit.at);
+            return true;
+        }
+        Pick pick = choice(hit, true);
+        if (sneak && pick != null && pick.wholeGroup) {
+            editQueue.applyGroup(editTarget(pick, player), System.nanoTime());
+            return true;
+        }
+        if (sneak && pick == null) {
+            PreviewEditQueue.Target pending = editQueue.pendingAt(this::editTargetAimed);
+            if (pending != null && pending.groupSelectable) {
+                editQueue.applyGroup(pending, System.nanoTime());
+                return true;
+            }
+        }
+        if (hit.marker()) {
+            if (!beginGrip(hit, player)) PreviewEdit.TaskAction.open(hit.view.id, hit.view.revision, hit.at);
+            return true;
+        }
+        return hit.projected;
+    }
+
+    private static boolean canGrip(WorldHit hit, EntityPlayer player) {
+        return hit != null && hit.owned && hit.host && hit.view.fixedPose == null
+                && hit.view.pose >= 0 && hit.view.allowed != null && player.worldObj.isAirBlock(hit.at.posX, hit.at.posY, hit.at.posZ);
+    }
+
+    private boolean beginGrip(WorldHit hit, EntityPlayer player) {
+        if (!canGrip(hit, player)) return false;
+        PreviewGrip g = new PreviewGrip(hit.view.id, ++nextGrip, hit.view.revision, hit.view.tool, hit.at,
+                ExtendedFacing.byIndex(hit.view.pose), hit.view.allowed, player, System.nanoTime());
+        grip = g;
+        PreviewDragMessage.send(PreviewDragMessage.PRESS, g.id, g.sequence, g.revision, null, null);
         return true;
+    }
+
+    private static boolean useDown() {
+        KeyBinding use = Minecraft.getMinecraft().gameSettings.keyBindUseItem;
+        if (use.getIsKeyPressed()) return true;
+        int code=use.getKeyCode();
+        if (code<0) return code+100>=0 && code+100<Mouse.getButtonCount() && Mouse.isButtonDown(code+100);
+        return code>0 && code<Keyboard.KEYBOARD_SIZE && Keyboard.isKeyDown(code);
+    }
+
+    @Override public void rejectDrag(UUID id,long sequence) {
+        PreviewGrip g=grip;
+        if (g!=null && g.id.equals(id) && g.sequence==sequence) g.rejected=true;
+    }
+
+    @Override
+    public boolean deleteShortcutKey(int key) {
+        return key != 0 && key == deleteTask.getKeyCode() && !Keyboard.isRepeatEvent();
+    }
+
+    @Override
+    public int hotbarSlot(int key) {
+        KeyBinding[] keys = Minecraft.getMinecraft().gameSettings.keyBindsHotbar;
+        if (key != 0) for (int i = 0; i < keys.length; i++) if (keys[i].getKeyCode() == key) return i;
+        return -1;
+    }
+
+    @SubscribeEvent
+    public void worldKey(InputEvent.KeyInputEvent e) {
+        if (Keyboard.getEventKeyState() && deleteShortcutKey(Keyboard.getEventKey())) deleteInWorld();
+    }
+
+    @SubscribeEvent
+    public void worldMouseButton(InputEvent.MouseInputEvent e) {
+        int button = Mouse.getEventButton();
+        if (button >= 0 && Mouse.getEventButtonState() && deleteTask.getKeyCode() == button - 100) deleteInWorld();
+    }
+
+    private void deleteInWorld() {
+        Minecraft mc = Minecraft.getMinecraft();
+        if (mc.currentScreen != null || mc.thePlayer == null) return;
+        String id = BuilderTasks.shortcutTarget(mc.thePlayer.getHeldItem());
+        if (!id.isEmpty()) PreviewEdit.TaskAction.delete(id);
     }
 
     @Override
@@ -133,26 +228,63 @@ public final class BuilderRenderer extends BuilderProxy {
 
     @SubscribeEvent(priority = EventPriority.HIGH)
     public void scrollPreview(MouseEvent event) {
-        if (event.dwheel == 0 || !previewModifierDown()) return;
+        if (event.dwheel == 0) return;
         EntityPlayer player = Minecraft.getMinecraft().thePlayer;
         if (!editContext(player)) return;
-        Pick hit = pick(player);
+        int notches = (int) Math.min(PreviewEdit.MAX_STEPS, Math.max(1, Math.abs((long) event.dwheel) / 120));
+        if (useDown()) {
+            if (grip==null) beginGrip(worldHit(player), player);
+            PreviewGrip g=grip;
+            if (g!=null && !g.released) {
+                if (!g.rejected) g.scroll(previewModifierDown(),event.dwheel>0 ? notches : -notches);
+                event.setCanceled(true);
+                return;
+            }
+        }
+        if (!previewModifierDown()) return;
+        Pick hit = choice(worldHit(player), true);
         PreviewEditQueue.Target target = hit == null ? editQueue.pendingAt(this::editTargetAimed) : editTarget(hit, player);
         if (target == null) return;
-        int notches = (int) Math.min(PreviewEdit.MAX_STEPS, Math.max(1, Math.abs((long) event.dwheel) / 120));
         editQueue.cycle(target, event.dwheel < 0 ? notches : -notches, System.nanoTime());
         event.setCanceled(true);
     }
 
     @SubscribeEvent
     public void previewInputTick(TickEvent.ClientTickEvent event) {
-        if (event.phase == TickEvent.Phase.END && editContext(Minecraft.getMinecraft().thePlayer))
-            editQueue.tick(System.nanoTime());
+        if (event.phase != TickEvent.Phase.END) return;
+        Minecraft mc=Minecraft.getMinecraft();
+        EntityPlayer player=mc.thePlayer;
+        boolean context=editContext(player);
+        long now=System.nanoTime();
+        PreviewGrip g=grip;
+        if (g==null) { if (context) editQueue.tick(now); return; }
+        View view=views.get(g.id);
+        if (g.released) {
+            if (g.rejected || view == null || view.revision != g.revision || player == null
+                    || player.dimension != g.dimension || now - g.releasedAt > 15_000_000_000L) grip = null;
+            return;
+        }
+        if (!context || !player.worldObj.isAirBlock(g.origin.posX, g.origin.posY, g.origin.posZ)
+                || player.dimension!=g.dimension || player.inventory.currentItem!=g.slot ||
+                !g.tool.equals(player.getHeldItem().getTagCompound().getString("tool"))) {
+            if (!g.released && player!=null && mc.getNetHandler()!=null)
+                PreviewDragMessage.send(PreviewDragMessage.CANCEL,g.id,g.sequence,g.revision,null,null);
+            grip=null; return;
+        }
+        if (view==null || view.revision!=g.revision || view.pose<0) g.rejected=true;
+        if (!g.rejected && now-g.pressedAt>=300_000_000L) g.moving=true;
+        if (g.moving && !g.rejected) g.track(player);
+        if (!useDown()) {
+            int op=g.rejected ? PreviewDragMessage.CANCEL : g.moving ? PreviewDragMessage.DROP : PreviewDragMessage.TAP;
+            PreviewDragMessage.send(op,g.id,g.sequence,g.revision,g.at,g.facing);
+            g.released=true; g.releasedAt=now;
+            if (op!=PreviewDragMessage.DROP || !g.changed() && player.worldObj.isAirBlock(g.at.posX,g.at.posY,g.at.posZ)) grip=null;
+        }
     }
 
     @SubscribeEvent
     public void previewInputUnload(WorldEvent.Unload event) {
-        if (event.world.isRemote) editQueue.clear();
+        if (event.world.isRemote) { grip=null; editQueue.clear(); }
     }
 
     private boolean editContext(EntityPlayer player) {
@@ -180,54 +312,18 @@ public final class BuilderRenderer extends BuilderProxy {
         if (player == null || minecraft.currentScreen != null || player.dimension != target.dimension
                 || held == null || held.getItem() != BuilderItem.ITEM || !held.hasTagCompound()
                 || !target.tool.equals(held.getTagCompound().getString("tool"))) return false;
-        Pick current = pick(player);
-        if (current != null) return current.taskId.equals(target.task) && current.x == target.x
-                && current.y == target.y && current.z == target.z;
-        View view = views.get(target.task);
-        if (view == null || !view.editable || !target.tool.equals(view.tool) || player.dimension != view.dim
-                || (view.layers & PreviewStream.SHELL) == 0 || !view.bounds.contains(target.x, target.y, target.z)) return false;
-        Section section = view.sections.get(new ChunkPosition(target.x >> 4, target.y >> 4, target.z >> 4));
-        if (section != null && section.epoch == view.epoch && section.revision == view.revision) return false;
-        // Acknowledged edits can temporarily leave an old section while its replacement arrives.
-        ChunkCoordinates hit = PreviewAim.first(player, (x, y, z) -> x == target.x && y == target.y && z == target.z);
-        return hit != null;
+        WorldHit hit = worldHit(player);
+        return hit != null && hit.owned && hit.view.fixedPose == null && hit.view.id.equals(target.task)
+                && hit.at.posX == target.x && hit.at.posY == target.y && hit.at.posZ == target.z
+                && choice(hit, false) != null;
     }
 
-    private Pick pick(EntityPlayer player) {
-        return pick(player, true);
-    }
-
-    private Pick pick(EntityPlayer player, boolean requireCurrentSection) {
-        if (player == null || Minecraft.getMinecraft().currentScreen != null) return null;
-        ItemStack held = player.getHeldItem();
-        if (held == null || held.getItem() != BuilderItem.ITEM || !held.hasTagCompound()) return null;
-        String tool = held.getTagCompound().getString("tool");
-        String selected = held.getTagCompound().getString("selected");
-        if (views.isEmpty() || tool.isEmpty()) return null;
-        ChunkCoordinates pos = PreviewAim.first(player, (x, y, z) ->
-                editableAt(player.dimension, tool, selected, x, y, z, requireCurrentSection) != null);
-        if (pos == null) return null;
-        View view = editableAt(player.dimension, tool, selected, pos.posX, pos.posY, pos.posZ, requireCurrentSection);
-        Section s = view.sections.get(new ChunkPosition(pos.posX >> 4, pos.posY >> 4, pos.posZ >> 4));
-        return new Pick(view.id, s.revision, pos.posX, pos.posY, pos.posZ,
-                s.style((pos.posX & 15) | ((pos.posZ & 15) << 4) | ((pos.posY & 15) << 8)));
-    }
-
-    private View editableAt(int dim, String tool, String selected, int x, int y, int z, boolean requireCurrentSection) {
-        View best = null;
-        ChunkPosition pos = null;
-        int slot = (x & 15) | ((z & 15) << 4) | ((y & 15) << 8);
-        for (View view : views.values()) {
-            if (!view.editable || dim != view.dim || !tool.equals(view.tool)
-                    || (view.layers & PreviewStream.SHELL) == 0 || !view.bounds.contains(x, y, z)) continue;
-            if (pos == null) pos = new ChunkPosition(x >> 4, y >> 4, z >> 4);
-            Section s = view.sections.get(pos);
-            if (s == null || s.choice(slot) == 0) continue;
-            if (requireCurrentSection && (s.epoch != view.epoch || s.revision != view.revision)) continue;
-            if (view.idText.equals(selected)) return view;
-            if (best == null || view.idText.compareTo(best.idText) < 0) best = view;
-        }
-        return best;
+    private static Pick choice(WorldHit hit, boolean current) {
+        if (hit == null || !hit.owned || !hit.projected || hit.view.fixedPose != null || !hit.view.editable
+                || (hit.view.layers & PreviewStream.SHELL) == 0 || hit.section == null || !hit.section.hasChoice(hit.slot)) return null;
+        Section s = hit.section;
+        if (current && (s.epoch != hit.view.epoch || s.revision != hit.view.revision)) return null;
+        return new Pick(hit.view.id, s.revision, hit.at.posX, hit.at.posY, hit.at.posZ, s.style(hit.slot));
     }
 
     private static final class HatchInfo {
@@ -248,29 +344,23 @@ public final class BuilderRenderer extends BuilderProxy {
         Bounds bounds;
         net.minecraft.util.ChunkCoordinates controller, issue;
         AxisAlignedBB box;
-        int dim, layers;
+        int dim, layers, pose=-1;
+        PreviewPose.Allowed allowed;
+        boolean repairable;
         int controllerMeta, tier, ambiguousDots;
         String[] dotHints;
         final Map<List<String>, HatchInfo[]> labels = new HashMap<>();
         int epoch, revision;
-        boolean editable, textured;
-        long controllerCheckTick = Long.MIN_VALUE;
-        boolean showController;
+        boolean editable, textured, locateHatches;
         final Map<Integer, Assembly> fragments = new HashMap<>();
-        final Map<Integer, Map<Long, Integer>> choiceTypes = new HashMap<>();
-        int nextChoiceType;
         long lastCompilation;
+        View previous;
+        PreviewGrip fixedPose;
+        boolean moveStreamReady, waitingForSite;
 
         View(UUID id) {
             this.id = id;
             idText = id.toString();
-        }
-
-        int choiceType(PreviewStream.Style style) {
-            if (style.group < 0) return 0;
-            long material = ((long) style.item << 32) | (style.damage & 0xffffffffL);
-            return choiceTypes.computeIfAbsent(style.group, k -> new HashMap<>())
-                    .computeIfAbsent(material, k -> ++nextChoiceType);
         }
 
         void invalidateLabels() {
@@ -279,16 +369,27 @@ public final class BuilderRenderer extends BuilderProxy {
             for (Section s : sections.values()) {
                 s.labels = null;
                 s.markerRoles = null;
-                if (s.hasHatches) s.marksDirty = true;
+                if (s.hasHatches) s.marksDirty = s.outlineDirty = true;
             }
         }
 
         void clear() {
+            releasePrevious();
+            clearSections();
+        }
+
+        void releasePrevious() {
+            if (previous != null) {
+                previous.clear();
+                previous = null;
+            }
+            moveStreamReady = false;
+        }
+
+        void clearSections() {
             for (Section section : sections.values()) section.clear();
             sections.clear();
             fragments.clear();
-            choiceTypes.clear();
-            nextChoiceType = 0;
         }
     }
 
@@ -304,7 +405,7 @@ public final class BuilderRenderer extends BuilderProxy {
 
     private boolean unload;
     private static final int HOST_COLOR = 0xba72fa;
-    private static final ResourceLocation MARKER_GRID = new ResourceLocation("structurebuildernh", "preview/marker_grid");
+    private static final int SOLID_MARKER = -2;
     private static final HatchRole[] HATCH_ROLES = HatchRole.values();
     private static final int SHELL_ALPHA = 100;
     private static final int[] COLORS = {
@@ -315,32 +416,40 @@ public final class BuilderRenderer extends BuilderProxy {
     };
 
     static final class Section {
+        final View owner;
         final int x, y, z;
         final long[] solid, hatch;
         final byte[] dots;
         final HatchTypes hatchTypes;
         HatchInfo[][] labels;
         byte[] markerRoles;
-        final long[] optional, choices;
+        final long[] optional;
         final short[] styleSlots;
         final List<PreviewStream.Style> styles;
         final int[] colors;
-        final int[] choiceTypes;
         final int epoch, revision;
         boolean textured;
         short[] renderSlots;
         List<PreviewStream.RenderMaterial> renders;
         BlockPreviewTextures.Appearance[] appearances;
-        long[] confirmed;
+        long[] confirmed, occupied = EMPTY_MASK;
+        final ProjectionSite site = new ProjectionSite();
         final Section[] near = new Section[6];
         final AxisAlignedBB box;
-        int faces, glassFaces, marks, outline;
+        int faces, glassFaces, marks, outline, marksRevision;
         double sortDistance;
         boolean facesTextured;
-        boolean dirty = true, marksDirty = true, outlineDirty = true, hasHatches, hasShell, hasChoices;
+        boolean dirty = true, marksDirty = true, outlineDirty = true, hasHatches, hasShell;
+        boolean replaceFaces, replaceMarks, replaceOutline;
         long lastCompilation;
 
+        boolean needsMesh(int layers) {
+            return (layers & PreviewStream.SHELL) != 0 && hasShell && dirty
+                    || (layers & PreviewStream.HATCH) != 0 && hasHatches && (marksDirty || outlineDirty);
+        }
+
         Section(View view, PreviewStream.Packet p) {
+            owner=view;
             x = p.x * 16;
             y = p.y * 16;
             z = p.z * 16;
@@ -349,8 +458,7 @@ public final class BuilderRenderer extends BuilderProxy {
             dots = p.dots;
             hatchTypes = p.hatchTypes;
             optional = p.optional;
-            choices = p.styles.isEmpty() ? null : p.painted;
-            styleSlots = p.styleSlots;
+            styleSlots = p.styles.isEmpty() ? null : p.styleSlots;
             styles = p.styles;
             epoch = p.epoch;
             revision = p.revision;
@@ -358,12 +466,9 @@ public final class BuilderRenderer extends BuilderProxy {
             renderSlots = textured ? p.renderSlots : null;
             renders = !textured || p.renders == null ? Collections.emptyList() : p.renders;
             colors = new int[styles.size()];
-            choiceTypes = new int[styles.size()];
-            for (int i = 0; i < colors.length; i++) {
-                colors[i] = materialColor(styles.get(i));
-                choiceTypes[i] = view.choiceType(styles.get(i));
-            }
-            updateProgress(p.confirmed);
+            for (int i = 0; i < colors.length; i++) colors[i] = materialColor(styles.get(i));
+            confirmed = p.confirmed;
+            updateVisibility(EMPTY_MASK);
             box = AxisAlignedBB.getBoundingBox(x, y, z, x + 16, y + 16, z + 16);
         }
 
@@ -406,18 +511,13 @@ public final class BuilderRenderer extends BuilderProxy {
             return index == 0 ? 0 : colors[index - 1];
         }
 
-        long choice(int slot) {
-            if (choices == null || (confirmed[slot >> 6] & (1L << (slot & 63))) != 0) return 0;
-            int index = styleSlots[slot] & 65535;
-            return index == 0 ? 0 : choiceTypes[index - 1];
+        boolean hasChoice(int slot) {
+            return (confirmed[slot >> 6] & (1L << (slot & 63))) == 0 && choiceMaterial(slot);
         }
 
-        boolean sameChoices(Section other) {
-            if (!Arrays.equals(choiceTypes, other.choiceTypes) || !Arrays.equals(styleSlots, other.styleSlots)) return false;
-            if (choices == null) return other.choices == null;
-            for (int word = 0; word < choices.length; word++)
-                if (((confirmed[word] ^ other.confirmed[word]) & choices[word]) != 0) return false;
-            return true;
+        boolean choiceMaterial(int slot) {
+            PreviewStream.Style style = style(slot);
+            return style != null && style.group >= 0;
         }
 
         HatchInfo hatchInfo(View view, int rank) {
@@ -445,55 +545,58 @@ public final class BuilderRenderer extends BuilderProxy {
             return markerRoles;
         }
 
-        boolean updateProgress(long[] mask) {
-            dirty = true;
+        int updateVisibility(long[] mask) {
             hasHatches = false;
-            hasChoices = false;
-            boolean choicesChanged = false;
-            for (int i = 0; i < hatch.length; i++) {
-                if ((hatch[i] & ~mask[i]) != 0) hasHatches = true;
-                if (confirmed != null && ((confirmed[i] ^ mask[i]) & hatch[i]) != 0) marksDirty = true;
-                if (choices != null) {
-                    if ((choices[i] & ~mask[i]) != 0) hasChoices = true;
-                    if (confirmed != null && ((confirmed[i] ^ mask[i]) & choices[i]) != 0) choicesChanged = true;
-                }
-            }
-            if (choicesChanged) outlineDirty = true;
-            confirmed = mask;
-            if (marksDirty && marks != 0) {
-                GL11.glDeleteLists(marks, 1);
-                marks = 0;
-            }
             hasShell = false;
-            for (int i = 0; i < solid.length; i++) {
-                if (((solid[i] | optional[i]) & ~confirmed[i]) != 0) {
-                    hasShell = true;
-                    break;
+            boolean addedShell = false, addedHatch = false, shellChanged = false, hatchChanged = false;
+            int borders = 0;
+            for (int i = 0; i < hatch.length; i++) {
+                long shell = solid[i] | optional[i];
+                long changed = occupied[i] ^ mask[i];
+                hasShell |= (shell & ~mask[i]) != 0;
+                hasHatches |= (hatch[i] & ~mask[i]) != 0;
+                shellChanged |= (changed & shell) != 0;
+                addedShell |= (changed & shell & mask[i]) != 0;
+                if ((changed & hatch[i]) != 0) {
+                    hatchChanged = true;
+                    addedHatch |= (changed & hatch[i] & mask[i]) != 0;
+                    borders |= borderSides(i, changed & hatch[i]);
                 }
             }
-            if (!hasShell) clearFaces();
-            if (!hasChoices && outline != 0) {
-                GL11.glDeleteLists(outline, 1);
-                outline = 0;
-            }
-            return choicesChanged;
+            // Never replay old geometry over a newly occupied cell while a replacement list is pending.
+            if (addedShell || !hasShell) clearFaces();
+            if (addedHatch || !hasHatches) clearHatches();
+            if (shellChanged) dirty = true;
+            if (hatchChanged) marksDirty = outlineDirty = true;
+            return borders;
         }
 
         void clear() {
+            site.close();
             clearFaces();
+            clearHatches();
+        }
+
+        void clearHatches() {
             if (marks != 0) GL11.glDeleteLists(marks, 1);
             if (outline != 0) GL11.glDeleteLists(outline, 1);
+            marks = outline = 0;
+            marksDirty = outlineDirty = true;
         }
     }
 
     @Override
     public void register() {
         instance = this;
+        ClientRegistry.registerKeyBinding(deleteTask);
         IResourceManager resources = Minecraft.getMinecraft().getResourceManager();
         if (resources instanceof IReloadableResourceManager)
             ((IReloadableResourceManager) resources).registerReloadListener(reloaded -> {
                 HatchLabels.clear();
-                for (View view : views.values()) view.invalidateLabels();
+                for (View view : views.values()) {
+                    view.invalidateLabels();
+                    if (view.previous != null) view.previous.invalidateLabels();
+                }
                 tooltip.clear();
                 textureReload = true;
             });
@@ -509,7 +612,14 @@ public final class BuilderRenderer extends BuilderProxy {
         textureReload = false;
         BlockPreviewTextures.clear();
         PreviewConnectedTextures.clear();
-        for (View view : views.values()) for (Section section : view.sections.values()) {
+        for (View view : views.values()) {
+            invalidateTextures(view);
+            if (view.previous != null) invalidateTextures(view.previous);
+        }
+    }
+
+    private static void invalidateTextures(View view) {
+        for (Section section : view.sections.values()) {
             section.appearances = null;
             if (section.facesTextured && (section.faces != 0 || section.glassFaces != 0)) {
                 // Old atlas UVs cannot be retained across a resource-pack rebuild.
@@ -535,19 +645,44 @@ public final class BuilderRenderer extends BuilderProxy {
     private void remove(UUID id) {
         View view = views.remove(id);
         if (view != null) view.clear();
+        if (cachedHatchSection != null && cachedHatchSection.owner.id.equals(id)) clearHatchSelection();
+        if (views.isEmpty()) observe(null);
+        visibleHatches.clear();
         transparentSections.clear();
-        texturedOutlines.clear();
+    }
+
+    private void acceptMove(PreviewStream.Packet p) {
+        PreviewGrip released = grip;
+        View old = views.get(p.id);
+        if (released == null || old == null || !released.released || released.rejected
+                || !p.id.equals(released.id) || p.sequence != released.sequence || p.dim != released.dimension
+                || old.revision != released.revision || p.revision != old.revision + 1) return;
+        View replacement = new View(p.id);
+        replacement.dim = p.dim;
+        replacement.epoch = p.epoch;
+        replacement.revision = p.revision;
+        replacement.tool = old.tool;
+        replacement.layers = old.layers;
+        replacement.controller = new ChunkCoordinates(released.at);
+        if (p.pose >= 0 && p.pose < ExtendedFacing.VALUES.length) released.orient(ExtendedFacing.VALUES[p.pose]);
+        old.fixedPose = released;
+        replacement.previous = old;
+        views.put(p.id, replacement);
+        grip = null;
     }
 
     @SubscribeEvent
     public void tick(TickEvent.ClientTickEvent e) {
         if (e.phase != TickEvent.Phase.END) return;
+        BrowserRenderer.cleanupClosed();
         reloadPreviewTextures();
         if (unload) {
+            observe(null);
+            clearHatchSelection();
             BlockPreviewTextures.clear();
             PreviewConnectedTextures.clear();
+            visibleHatches.clear();
             transparentSections.clear();
-            texturedOutlines.clear();
             for (View view : views.values()) view.clear();
             views.clear();
             unload = false;
@@ -561,6 +696,10 @@ public final class BuilderRenderer extends BuilderProxy {
             }
             if (Minecraft.getMinecraft().theWorld == null
                     || Minecraft.getMinecraft().theWorld.provider.dimensionId != p.dim) continue;
+            if (p.type == PreviewStream.MOVE_ACCEPTED) {
+                acceptMove(p);
+                continue;
+            }
             if (p.type == 4) {
                 View v = views.computeIfAbsent(p.id, View::new);
                 v.dim = p.dim;
@@ -570,20 +709,26 @@ public final class BuilderRenderer extends BuilderProxy {
                     if (at != null) at.dirty = true;
                 }
                 v.controller = controllerOn ? new ChunkCoordinates(p.x, p.y, p.z) : null;
-                v.controllerCheckTick = Long.MIN_VALUE;
                 v.issue = p.issue;
+                v.pose=p.pose;
+                v.allowed=p.allowed;
+                v.repairable = (p.layers & 4) != 0;
                 continue;
             }
             if (p.type == 1) {
                 View view = views.computeIfAbsent(p.id, View::new);
                 if (p.epoch < view.epoch) continue;
-                if (p.reset) view.clear();
+                if (view.previous != null && (p.epoch != view.epoch || p.revision != view.revision || p.layers != view.previous.layers
+                        || p.textured != view.previous.textured)) view.releasePrevious();
+                if (p.reset) view.clearSections();
                 if (view.epoch != p.epoch) view.fragments.clear();
                 view.epoch = p.epoch;
                 view.revision = p.revision;
                 view.editable = p.editable;
+                view.locateHatches = p.locateHatches;
                 if (view.textured != p.textured)
                     for (Section s : view.sections.values()) {
+                        s.site.dirty = true;
                         if (s.hasShell) s.dirty = true;
                         if (!p.textured) s.dropTextures((p.layers & PreviewStream.SHELL) != 0);
                     }
@@ -605,6 +750,11 @@ public final class BuilderRenderer extends BuilderProxy {
             }
             View view = views.get(p.id);
             if (view == null || view.dim != p.dim || view.epoch != p.epoch) continue;
+            if (p.type == PreviewStream.MOVE_READY) {
+                if (view.previous != null && view.previous.fixedPose.sequence == p.sequence
+                        && view.revision == p.revision) view.moveStreamReady = true;
+                continue;
+            }
             if (p.type == 6) {
                 if (!view.fragments.containsKey(p.transfer) && view.fragments.size() >= 2) continue;
                 Assembly assembly = view.fragments.get(p.transfer);
@@ -632,9 +782,7 @@ public final class BuilderRenderer extends BuilderProxy {
             if (p.type == 3) {
                 Section section = view.sections.get(pos);
                 if (section != null) {
-                    if (section.updateProgress(p.confirmed)) invalidateOutlineNeighbors(view, p.x, p.y, p.z);
-                    for (Section near : section.near) if (near != null) near.dirty = true;
-                    invalidateTextureNeighbors(view, p.x, p.y, p.z);
+                    section.confirmed = p.confirmed;
                 }
                 continue;
             }
@@ -642,31 +790,29 @@ public final class BuilderRenderer extends BuilderProxy {
             Section s = new Section(view, p);
             Section old = view.sections.put(pos, s);
             invalidateTextureNeighbors(view, p.x, p.y, p.z);
-            int changedBorders = changedHatchBorders(old, s);
-            boolean sameChoices = s.hasChoices && old != null && s.sameChoices(old);
-            if (!sameChoices && (s.hasChoices || old != null && old.hasChoices)) {
-                invalidateOutlineNeighbors(view, p.x, p.y, p.z);
+            if (old != null) {
+                s.updateVisibility(old.occupied);
+                s.occupied = old.occupied;
             }
+            boolean sameRoles = old != null && Arrays.equals(old.hatch, s.hatch)
+                    && Arrays.equals(old.dots, s.dots) && s.hatchTypes.sameAs(old.hatchTypes);
+            invalidateHatchNeighbors(view, s, changedHatchBorders(old, s, sameRoles), false);
             if (old != null) {
                 // A replacement projection must not punch a hole while waiting for its paced mesh rebuild.
-                if (s.hasChoices) {
-                    s.outline = old.outline;
-                    s.outlineDirty = !sameChoices || old.outlineDirty;
-                    old.outline = 0;
-                }
                 if (s.hasShell) {
                     s.faces = old.faces;
                     s.glassFaces = old.glassFaces;
                     s.facesTextured = old.facesTextured;
                     old.faces = old.glassFaces = 0;
                 }
-                if (Arrays.equals(old.hatch, s.hatch) && Arrays.equals(old.dots, s.dots) && s.hatchTypes.sameAs(old.hatchTypes)
-                        && Arrays.equals(old.confirmed, s.confirmed)) {
+                if (sameRoles) {
                     s.marks = old.marks;
                     s.marksDirty = old.marksDirty;
+                    s.outline = old.outline;
+                    s.outlineDirty = old.outlineDirty;
                     s.labels = old.labels;
                     s.markerRoles = old.markerRoles;
-                    old.marks = 0;
+                    old.marks = old.outline = 0;
                 }
                 old.clear();
             }
@@ -682,21 +828,33 @@ public final class BuilderRenderer extends BuilderProxy {
                     s.near[side] = near;
                     near.near[side ^ 1] = s;
                     near.dirty = true;
-                    if ((changedBorders & (1 << side)) != 0) near.marksDirty = true;
                 }
             }
         }
         // Keep highlighting the visible material between the revision header and its section payload.
-        aimed = pick(Minecraft.getMinecraft().thePlayer, false);
-        updateAimedMarker();
+        EntityPlayer player = Minecraft.getMinecraft().thePlayer;
+        WorldHit hit = grip == null || grip.rejected ? worldHit(player) : null;
+        aimed = choice(hit, false);
+        updateAimedMarker(hit);
+        applyHighlight(player, hit);
     }
 
-    private static void invalidateOutlineNeighbors(View view, int x, int y, int z) {
-        // A grid edge can belong to any of its four touching cells, including across a section diagonal.
+    private static void invalidateHatchNeighbors(View view, Section section, int borders, boolean presenting) {
+        if (borders == 0) return;
+        // Four cells share a grid edge. Two sections meeting at that edge can affect one another.
         for (int dz = -1; dz <= 1; dz++) for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
-            if (Math.abs(dx) + Math.abs(dy) + Math.abs(dz) > 2 || (dx | dy | dz) == 0) continue;
-            Section near = view.sections.get(new ChunkPosition(x + dx, y + dy, z + dz));
-            if (near != null && near.hasChoices) near.outlineDirty = true;
+            int distance = Math.abs(dx) + Math.abs(dy) + Math.abs(dz);
+            if (distance == 0 || distance == 3) continue;
+            int sides = (dx < 0 ? 1 : dx > 0 ? 2 : 0) | (dy < 0 ? 4 : dy > 0 ? 8 : 0) | (dz < 0 ? 16 : dz > 0 ? 32 : 0);
+            if ((borders & sides) != sides) continue;
+            Section near = view.sections.get(new ChunkPosition((section.x >> 4) + dx, (section.y >> 4) + dy, (section.z >> 4) + dz));
+            if (near == null || !near.hasHatches) continue;
+            near.outlineDirty = true;
+            near.replaceOutline |= presenting && near.outline != 0;
+            if (distance == 1) {
+                near.marksDirty = true;
+                near.replaceMarks |= presenting && near.marks != 0;
+            }
         }
     }
 
@@ -709,31 +867,171 @@ public final class BuilderRenderer extends BuilderProxy {
         }
     }
 
-    private static int changedHatchBorders(Section old, Section current) {
+    private static int changedHatchBorders(Section old, Section current, boolean sameRoles) {
         int sides = 0;
         for (int word = 0; word < current.hatch.length && sides != 63; word++) {
-            long changed = current.hatch[word] ^ (old == null ? 0L : old.hatch[word]);
-            while (changed != 0) {
-                int i = word * 64 + Long.numberOfTrailingZeros(changed);
-                int x = i & 15, y = i >> 8, z = i >> 4 & 15;
-                if (x == 0) sides |= 1;
-                if (x == 15) sides |= 2;
-                if (y == 0) sides |= 4;
-                if (y == 15) sides |= 8;
-                if (z == 0) sides |= 16;
-                if (z == 15) sides |= 32;
-                changed &= changed - 1;
-            }
+            long before = old == null ? 0 : old.hatch[word];
+            long after = current.hatch[word];
+            long changed = before | after;
+            if (sameRoles) changed = (before ^ after) | ((old.occupied[word] ^ current.occupied[word]) & changed);
+            if (changed != 0) sides |= borderSides(word, changed);
         }
         return sides;
     }
 
-    private void updateAimedMarker() {
+    // Each word covers four rows of sixteen X coordinates, all at the same Y.
+    private static int borderSides(int word, long cells) {
+        int sides = 0;
+        if ((cells & 0x0001000100010001L) != 0) sides |= 1;
+        if ((cells & 0x8000800080008000L) != 0) sides |= 2;
+        if (word < 4) sides |= 4;
+        if (word >= 60) sides |= 8;
+        if ((word & 3) == 0 && (cells & 0xffffL) != 0) sides |= 16;
+        if ((word & 3) == 3 && (cells >>> 48) != 0) sides |= 32;
+        return sides;
+    }
+
+    private static int changedBorders(long[] before, long[] after) {
+        int sides = 0;
+        for (int word = 0; word < before.length && sides != 63; word++) {
+            long changed = before[word] ^ after[word];
+            if (changed != 0) sides |= borderSides(word, changed);
+        }
+        return sides;
+    }
+
+    private static final class WorldHit {
+        final View view;
+        final Section section;
+        final ChunkCoordinates at;
+        final int slot;
+        final boolean owned, projected, host, hatch, issue;
+        WorldHit(View view, Section section, int slot, int x, int y, int z, boolean owned,
+                boolean projected, boolean host, boolean hatch, boolean issue) {
+            this.view = view; this.section = section; this.slot = slot;
+            this.at = new ChunkCoordinates(x, y, z); this.owned = owned;
+            this.projected = projected; this.host = host; this.hatch = hatch; this.issue = issue;
+        }
+        boolean marker() { return host || hatch || issue; }
+    }
+
+    private WorldHit worldHit(EntityPlayer player) {
+        if (player == null || player.worldObj == null || Minecraft.getMinecraft().currentScreen != null || views.isEmpty()) return null;
+        ItemStack held = player.getHeldItem();
+        boolean terminal = held != null && held.getItem() == BuilderItem.ITEM && held.hasTagCompound();
+        String tool = terminal ? held.getTagCompound().getString("tool") : "";
+        String selected = terminal ? held.getTagCompound().getString("selected") : "";
+        WorldHit[] result = {null};
+        PreviewAim.first(player, (x, y, z) -> {
+            for (View incoming : views.values()) {
+                if (incoming.dim != player.dimension) continue;
+                View v = incoming.previous != null ? incoming.previous : incoming;
+                boolean owned = !tool.isEmpty() && tool.equals(v.tool);
+                WorldHit best = result[0];
+                if (best != null && !PreviewAim.prefer(owned, v.idText, best.owned, best.view.idText, selected)) continue;
+                WorldHit hit = hitAt(v, player.worldObj, x, y, z, owned);
+                if (hit != null) result[0] = hit;
+            }
+            return result[0] != null;
+        });
+        return result[0];
+    }
+
+    private WorldHit hitAt(View view, World world, int worldX, int worldY, int worldZ, boolean owned) {
+        int x = worldX, y = worldY, z = worldZ;
+        PreviewGrip pose = view.fixedPose;
+        if (pose != null) {
+            highlightOffset[0] = x - pose.at.posX; highlightOffset[1] = y - pose.at.posY; highlightOffset[2] = z - pose.at.posZ;
+            pose.facing.getOffsetABC(highlightOffset, highlightLocal);
+            pose.original.getWorldOffset(highlightLocal, highlightOffset);
+            x = pose.origin.posX + highlightOffset[0]; y = pose.origin.posY + highlightOffset[1]; z = pose.origin.posZ + highlightOffset[2];
+        }
+        boolean roles = (view.layers & PreviewStream.HATCH) != 0, shells = (view.layers & PreviewStream.SHELL) != 0;
+        boolean issue = view.repairable && view.issue != null && view.issue.posX == x && view.issue.posY == y && view.issue.posZ == z;
+        boolean controller = view.controller != null && view.controller.posX == x && view.controller.posY == y && view.controller.posZ == z;
+        if (!issue && !(roles && controller) && (view.bounds == null || !view.bounds.contains(x,y,z))) return null;
+        Section s = view.sections.get(new ChunkPosition(x >> 4, y >> 4, z >> 4));
+        int slot = (y & 15) << 8 | (z & 15) << 4 | (x & 15), word = slot >> 6;
+        long bit = 1L << (slot & 63);
+        boolean hatch = s != null && (s.hatch[word] & bit) != 0;
+        boolean structure = s != null && ((s.solid[word] | s.optional[word]) & bit) != 0;
+        boolean drawn = roles && controller || s != null && (s.occupied[word] & bit) == 0
+                && (roles && hatch ? s.marks != 0 || s.outline != 0 : shells && structure && s.faces != 0);
+        boolean air = world.isAirBlock(worldX, worldY, worldZ);
+        if (!issue && !(air ? drawn : owned && (controller || structure || hatch))) return null;
+        return new WorldHit(view, s, slot, worldX, worldY, worldZ, owned, air && drawn,
+                controller && (roles || shells && structure), hatch && (roles || shells && structure), issue);
+    }
+
+    private void updateHighlight(EntityPlayer player) {
+        applyHighlight(player, grip == null || grip.rejected ? worldHit(player) : null);
+    }
+
+    private void applyHighlight(EntityPlayer player, WorldHit hit) {
+        highlighted = null; highlightedController = null; highlightedHatch = null;
+        if (hit == null || !hit.owned || !hit.projected || player.getHeldItem() == null) return;
+        highlighted = hit.at;
+        boolean roles = (hit.view.layers & PreviewStream.HATCH) != 0;
+        if (roles && hit.host) highlightedController = hit.view;
+        else if (roles && hit.hatch) { highlightedHatch = hit.section; highlightedHatchSlot = hit.slot; }
+        highlightColor = roles && (hit.host || hit.hatch) ? SOLID_MARKER : hit.section.color(hit.slot);
+    }
+
+    private boolean shouldDrawPick(EntityPlayer player) {
+        if (highlighted == null) return false;
+        int x = highlighted.posX, y = highlighted.posY, z = highlighted.posZ;
+        if (x == MathHelper.floor_double(player.posX) && z == MathHelper.floor_double(player.posZ)
+                && y < player.boundingBox.maxY && y + 1.0 > player.boundingBox.minY) return false;
+        return player.worldObj.isAirBlock(x, y, z);
+    }
+
+    private static int hatchRank(Section section, int slot) {
+        int word = slot >> 6;
+        int rank = Long.bitCount(section.hatch[word] & ((1L << (slot & 63)) - 1));
+        for (int i = 0; i < word; i++) rank += Long.bitCount(section.hatch[i]);
+        return rank;
+    }
+
+    private void updateAimedMarker(WorldHit marker) {
         aimedMarker = null;
         aimedHint = null;
         aimedHatch = false;
         Minecraft mc = Minecraft.getMinecraft();
         if (mc.thePlayer == null || mc.currentScreen != null || views.isEmpty()) return;
+        PreviewGrip g=grip;
+        if (g!=null && !g.rejected) {
+            aimed=null;
+            aimedColor=HOST_COLOR;
+            aimedMarker=StatCollector.translateToLocal("structurebuildernh.markerHost")+"   "+g.at.posX+", "+g.at.posY+", "+g.at.posZ;
+            aimedHint=!g.moving ? StatCollector.translateToLocal("structurebuildernh.drag.hold")
+                    : g.limited ? StatCollector.translateToLocal("structurebuildernh.drag.limited")
+                    : StatCollector.translateToLocalFormatted("structurebuildernh.drag.controls",PreviewTooltip.modifierName(mc));
+            return;
+        }
+        ItemStack held = mc.thePlayer.getHeldItem();
+        if (marker != null && marker.marker() && (marker.owned || held == null || held.getItem() != BuilderItem.ITEM)) {
+            aimed = null;
+            View v = marker.view;
+            ChunkCoordinates p = marker.at;
+            if (marker.host) {
+                aimedMarker = StatCollector.translateToLocal("structurebuildernh.markerHost");
+                aimedColor = HOST_COLOR;
+                if (canGrip(marker, mc.thePlayer)) aimedHint=StatCollector.translateToLocal("structurebuildernh.drag.hold");
+            } else if (marker.issue) {
+                aimedMarker = StatCollector.translateToLocal("structurebuildernh.markerHatch");
+                aimedColor = HOST_COLOR;
+                aimedHatch = true;
+            } else {
+                Section s = marker.section;
+                int i = marker.slot;
+                HatchInfo label = s.hatchInfo(v, hatchRank(s, i));
+                aimedMarker = StatCollector.translateToLocal("structurebuildernh.markerHatch");
+                aimedHatch = true;
+                aimedColor = label.role.color;
+                aimedHint = label.text;
+            }
+            return;
+        }
         if (aimed != null) {
             PreviewStream.Style style = aimed.style;
             String material = style.air ? StatCollector.translateToLocal("structurebuildernh.previewAir")
@@ -743,54 +1041,12 @@ public final class BuilderRenderer extends BuilderProxy {
             aimedColor = materialColor(style);
             if (mc.gameSettings.keyBindSneak.getKeyCode() != 0) {
                 aimedHint = previewModifierDown()
-                        ? StatCollector.translateToLocal("structurebuildernh."
-                                + (style.groupSelectable ? "previewPickHint" : "previewPickSingleHint"))
+                        ? StatCollector.translateToLocalFormatted("structurebuildernh."
+                                + (style.groupSelectable ? "previewPickHint" : "previewPickSingleHint"), PreviewTooltip.modifierName(mc))
                         : StatCollector.translateToLocalFormatted("structurebuildernh.previewChooseHint",
                                 PreviewTooltip.modifierName(mc));
             }
             return;
-        }
-        boolean enabled = false;
-        for (View v : views.values())
-            if (v.controller != null) {
-                enabled = true;
-                break;
-            }
-        if (!enabled) return;
-        net.minecraft.util.Vec3 eye = mc.thePlayer.getPosition(1f), dir = mc.thePlayer.getLook(1f);
-        int previousX = Integer.MIN_VALUE, previousY = 0, previousZ = 0;
-        for (double distance = 0; distance <= 12; distance += .2) {
-            int x = (int) Math.floor(eye.xCoord + dir.xCoord * distance);
-            int y = (int) Math.floor(eye.yCoord + dir.yCoord * distance);
-            int z = (int) Math.floor(eye.zCoord + dir.zCoord * distance);
-            if (x == previousX && y == previousY && z == previousZ) continue;
-            previousX = x;
-            previousY = y;
-            previousZ = z;
-            ChunkPosition key = new ChunkPosition(x >> 4, y >> 4, z >> 4);
-            for (View v : views.values()) {
-                if (v.dim != mc.thePlayer.dimension || v.controller == null) continue;
-                if (v.controller.posX == x && v.controller.posY == y && v.controller.posZ == z) {
-                    aimedMarker =
-                            net.minecraft.util.StatCollector.translateToLocal(
-                                    "structurebuildernh.markerHost");
-                    aimedColor = HOST_COLOR;
-                    return;
-                }
-                Section s = v.sections.get(key);
-                if (s == null || !s.hasHatches) continue;
-                int i = (y & 15) << 8 | (z & 15) << 4 | (x & 15);
-                long bit = 1L << (i & 63);
-                if ((s.hatch[i >> 6] & bit) == 0 || (s.confirmed[i >> 6] & bit) != 0) continue;
-                int rank = Long.bitCount(s.hatch[i >> 6] & (bit - 1));
-                for (int word = 0; word < (i >> 6); word++) rank += Long.bitCount(s.hatch[word]);
-                HatchInfo label = s.hatchInfo(v, rank);
-                aimedMarker = StatCollector.translateToLocal("structurebuildernh.markerHatch");
-                aimedHatch = true;
-                aimedColor = label.role.color;
-                aimedHint = label.text;
-                return;
-            }
         }
     }
 
@@ -808,8 +1064,12 @@ public final class BuilderRenderer extends BuilderProxy {
         reloadPreviewTextures();
         if (views.isEmpty()) return;
         Minecraft mc = Minecraft.getMinecraft();
+        if (TerminalBrowserWidget.coversWorld(mc.currentScreen)) return;
         Entity eye = mc.renderViewEntity;
         if (eye == null) return;
+        observe(eye.worldObj);
+        occupancy.drain();
+        samplingBudget = 2_000_000L;
         double x = eye.lastTickPosX + (eye.posX - eye.lastTickPosX) * e.partialTicks;
         double y = eye.lastTickPosY + (eye.posY - eye.lastTickPosY) * e.partialTicks;
         double z = eye.lastTickPosZ + (eye.posZ - eye.lastTickPosZ) * e.partialTicks;
@@ -833,54 +1093,64 @@ public final class BuilderRenderer extends BuilderProxy {
             GL11.glDepthMask(false);
             visibleHatches.clear();
             transparentSections.clear();
-            texturedOutlines.clear();
             visibleControllers.clear();
             View nextView = null;
             Section nextSection = null;
             ItemStack held = mc.thePlayer == null ? null : mc.thePlayer.getHeldItem();
             boolean terminal = held != null && held.getItem() == BuilderItem.ITEM;
-            String tool = terminal && held.hasTagCompound() ? held.getTagCompound().getString("tool") : "";
-            for (View view : views.values()) {
-                if (eye.dimension != view.dim) continue;
+            for (View incoming : views.values()) {
+                if (eye.dimension != incoming.dim) continue;
+                Section warming = null;
+                View view = incoming;
+                if (incoming.previous != null) {
+                    warming = pendingMoveMesh(incoming, camera);
+                    if (warming == null && !incoming.waitingForSite && incoming.moveStreamReady) {
+                        incoming.releasePrevious();
+                    } else {
+                        view = incoming.previous;
+                        if (warming != null && (nextView == null || incoming.lastCompilation < nextView.lastCompilation)) {
+                            nextView = incoming;
+                            nextSection = warming;
+                        }
+                    }
+                }
 
-                if (view.box != null && !camera.isBoundingBoxInFrustum(view.box)) continue;
-                if (view.controller != null && (view.layers & PreviewStream.HATCH) != 0
-                        && showController(view, eye.worldObj)) visibleControllers.add(view.controller);
+                PreviewGrip moving=renderGrip(view);
+                if (view.box != null && !(moving==null ? camera.isBoundingBoxInFrustum(view.box) : moving.visible(camera,view.box))) continue;
+                if (view.controller != null && (view.layers & PreviewStream.HATCH) != 0) {
+                    ChunkCoordinates at = moving == null ? view.controller : moving.at;
+                    if (moving != null && !moving.released || !occupancy.occupied(at.posX, at.posY, at.posZ))
+                        visibleControllers.add(view);
+                }
                 if (view.box == null) continue;
-                if ((view.layers & PreviewStream.BOX) != 0) drawBounds(view.bounds);
+                if ((view.layers & PreviewStream.BOX) != 0) {
+                    GL11.glPushMatrix();
+                    if (moving!=null) moving.transform();
+                    drawBounds(view.bounds);
+                    GL11.glPopMatrix();
+                }
                 if ((view.layers & (PreviewStream.SHELL | PreviewStream.HATCH)) == 0) continue;
-                Section candidate = drawSections(view, camera, view.editable && tool.equals(view.tool));
+                Section candidate = drawSections(view, camera);
                 if (candidate != null && (nextView == null || view.lastCompilation < nextView.lastCompilation)) {
                     nextView = view;
                     nextSection = candidate;
                 }
             }
             drawTransparentSections();
-            drawTexturedOutlines();
-            drawMarkers(terminal);
-            if (terminal && aimed != null) drawPick(aimed);
+            boolean drawSelection = terminal && shouldDrawPick(mc.thePlayer);
+            drawMarkers(terminal, drawSelection && highlightColor == SOLID_MARKER);
+            if (drawSelection && highlightColor != SOLID_MARKER) drawPick(highlighted, highlightColor);
+            drawHatchOutlines(terminal);
             for (View view : views.values())
                 if (eye.dimension == view.dim && view.issue != null) drawIssue(view.issue);
             if (nextView != null) {
                 nextView.lastCompilation = ++compilations;
                 nextSection.lastCompilation = compilations;
-                if ((nextView.layers & PreviewStream.HATCH) != 0 && nextSection.hasHatches && nextSection.marksDirty) {
-                    nextSection.marks = compileHatches(nextView, nextSection);
-                    nextSection.marksDirty = nextSection.marks == 0;
-                } else if (nextSection.dirty && nextSection.hasShell && (nextView.layers & PreviewStream.SHELL) != 0) {
-                    boolean textured = nextView.textured && nextSection.textured;
-                    nextSection.faces = textured ? compileTexturedShell(nextView, nextSection, nextSection.faces)
-                            : compileShell(nextView, nextSection, nextSection.faces);
-                    if (!textured && nextSection.faces != 0 && nextSection.glassFaces != 0) {
-                        GL11.glDeleteLists(nextSection.glassFaces, 1);
-                        nextSection.glassFaces = 0;
-                    }
-                    if (nextSection.faces != 0) nextSection.facesTextured = textured;
-                    nextSection.dirty = nextSection.faces == 0;
-                } else {
-                    nextSection.outline = compileOutline(nextView, nextSection);
-                    nextSection.outlineDirty = nextSection.outline == 0;
-                }
+                if ((nextView.layers & PreviewStream.HATCH) != 0 && nextSection.hasHatches && nextSection.marksDirty)
+                    rebuildMarks(nextSection);
+                else if (nextSection.dirty && nextSection.hasShell && (nextView.layers & PreviewStream.SHELL) != 0)
+                    rebuildFaces(nextSection);
+                else rebuildOutline(nextSection);
             }
         } finally {
             GL11.glPopMatrix();
@@ -888,108 +1158,69 @@ public final class BuilderRenderer extends BuilderProxy {
         }
     }
 
-    private void drawMarkers(boolean held) {
+    private void drawMarkers(boolean held, boolean highlightMarker) {
         if (visibleHatches.isEmpty() && visibleControllers.isEmpty()) return;
         GL11.glEnable(GL11.GL_DEPTH_TEST);
         GL11.glEnable(GL11.GL_CULL_FACE);
         GL11.glCullFace(GL11.GL_BACK);
         GL11.glEnable(GL11.GL_BLEND);
         GL11.glBlendFunc(EXTBlendColor.GL_CONSTANT_ALPHA_EXT, EXTBlendColor.GL_ONE_MINUS_CONSTANT_ALPHA_EXT);
-        if (held) {
-            // The terminal can reveal buried markers. Other held items use only the normal translucent pass.
-            GL11.glDepthFunc(GL11.GL_GREATER);
-            GL14.glBlendColor(0, 0, 0, .20f);
-            drawVisibleCells();
-            GL11.glDisable(GL11.GL_BLEND);
-        } else {
-            GL14.glBlendColor(0, 0, 0, SHELL_ALPHA / 255f);
-        }
+        // Only empty world cells contribute marker faces. Keep the exterior and its merged edges aligned.
+        if (held) GL11.glDisable(GL11.GL_BLEND);
+        else GL14.glBlendColor(0, 0, 0, SHELL_ALPHA / 255f);
+        GL11.glDisable(GL11.GL_TEXTURE_2D);
         GL11.glDepthFunc(GL11.GL_LEQUAL);
         GL11.glDepthMask(held);
-        GL11.glEnable(GL11.GL_TEXTURE_2D);
-        TextureManager textures = Minecraft.getMinecraft().getTextureManager();
-        if (textures.getTexture(MARKER_GRID) == null) textures.loadTexture(MARKER_GRID, new MarkerGridTexture());
-        textures.bindTexture(MARKER_GRID);
-        // Full-size markers can coincide with a real machine before the build scan confirms that position.
         GL11.glEnable(GL11.GL_POLYGON_OFFSET_FILL);
         GL11.glPolygonOffset(1f, 1f);
-        drawVisibleCells();
+        drawVisibleCells(highlightMarker);
         GL11.glDisable(GL11.GL_POLYGON_OFFSET_FILL);
-        GL11.glDisable(GL11.GL_TEXTURE_2D);
         GL11.glDepthMask(false);
     }
 
-    private static boolean confirmed(View view, ChunkCoordinates position) {
-        Section section = view.sections.get(new ChunkPosition(position.posX >> 4, position.posY >> 4, position.posZ >> 4));
-        if (section == null) return false;
-        int i = (position.posX & 15) | ((position.posZ & 15) << 4) | ((position.posY & 15) << 8);
-        return (section.confirmed[i >> 6] & (1L << (i & 63))) != 0;
-    }
-
-    private static boolean showController(View view, World world) {
-        long tick = world.getTotalWorldTime();
-        if (view.controllerCheckTick != tick) {
-            view.controllerCheckTick = tick;
-            ChunkCoordinates p = view.controller;
-            // Machine fronts can have recessed geometry; preserve the real face even before the task scans it.
-            view.showController = !confirmed(view, p) && !(world.blockExists(p.posX, p.posY, p.posZ)
-                    && world.getBlock(p.posX, p.posY, p.posZ) == GregTechAPI.sBlockMachines);
+    private void drawHatchOutlines(boolean held) {
+        if (!visibleHatches.isEmpty()) {
+            GL11.glEnable(GL11.GL_BLEND);
+            GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
+            GL11.glDisable(GL11.GL_LINE_STIPPLE);
+            GL11.glLineWidth(1.5f);
+            GL11.glColor4f(.90f, .95f, .96f, held ? .90f : SHELL_ALPHA / 255f);
+            // The faces are biased back, so the edges can use normal world depth.
+            for (Section s : visibleHatches) if (s.outline != 0) drawSectionList(s, s.outline);
         }
-        return view.showController;
     }
 
-    private void drawVisibleCells() {
-        for (Section s : visibleHatches) {
-            GL11.glPushMatrix();
-            GL11.glTranslatef(s.x, s.y, s.z);
-            GL11.glCallList(s.marks);
-            GL11.glPopMatrix();
+    private void drawVisibleCells(boolean highlightMarker) {
+        for (Section s : visibleHatches) if (s.marks != 0) {
+            int list = highlightMarker && s == highlightedHatch && !s.marksDirty ? hoveredHatchList(s) : s.marks;
+            drawSectionList(s, list);
         }
         if (!visibleControllers.isEmpty()) {
             Tessellator t = Tessellator.instance;
             t.startDrawingQuads();
-            for (ChunkCoordinates p : visibleControllers) {
+            for (View view : visibleControllers) {
+                PreviewGrip moving = renderGrip(view);
+                ChunkCoordinates p = moving == null ? view.controller : moving.at;
+                int color = highlightMarker && view == highlightedController ? markerTint(HOST_COLOR) : HOST_COLOR;
                 for (int side = 0; side < 6; side++) {
                     int axis = side / 2;
                     int plane = axis == 0 ? p.posX : axis == 1 ? p.posY : p.posZ;
                     int u = axis == 0 ? p.posY : axis == 1 ? p.posZ : p.posX;
                     int v = axis == 0 ? p.posZ : axis == 1 ? p.posX : p.posY;
-                    markerFace(t, side, plane + (side & 1), u, v, 1, 1, HOST_COLOR);
+                    markerFace(t, side, plane + (side & 1), u, v, 1, 1, color);
                 }
             }
             t.draw();
         }
     }
 
-    private static final class MarkerGridTexture extends AbstractTexture {
-        @Override
-        public void loadTexture(IResourceManager resources) {
-            // One opaque tile per voxel. Mipmaps fade the thin grid in the distance.
-            int size = 32, levels = 5;
-            int[][] pixels = new int[levels + 1][];
-            pixels[0] = new int[size * size];
-            Arrays.fill(pixels[0], 0xffffffff);
-            for (int i = 0; i < size; i++) {
-                pixels[0][i] = 0xffbbbbbb;
-                pixels[0][i * size] = 0xffbbbbbb;
-            }
-            TextureUtil.allocateTextureImpl(getGlTextureId(), levels, size, size, 1f);
-            TextureUtil.uploadTextureMipmap(TextureUtil.generateMipmapData(levels, size, pixels),
-                    size, size, 0, 0, true, false);
-        }
-    }
-
     private static void markerFace(Tessellator t, int side, int plane, int u, int v, int width, int height, int color) {
         int axis = side / 2;
         boolean positive = (side & 1) != 0;
-        t.setColorRGBA_I(shade(color, axis == 0 ? 82 : axis == 1 && positive ? 100 : 69), 255);
-        t.setTextureUV(0, 0);
+        t.setColorRGBA_I(color, 255);
         vertex(t, axis, plane, u, v);
-        t.setTextureUV(positive ? width : 0, positive ? 0 : height);
         vertex(t, axis, plane, positive ? u + width : u, positive ? v : v + height);
-        t.setTextureUV(width, height);
         vertex(t, axis, plane, u + width, v + height);
-        t.setTextureUV(positive ? 0 : width, positive ? height : 0);
         vertex(t, axis, plane, positive ? u : u + width, positive ? v + height : v);
     }
 
@@ -1035,24 +1266,34 @@ public final class BuilderRenderer extends BuilderProxy {
         t.draw();
     }
 
-    private Section drawSections(View view, Frustrum camera, boolean editable) {
+    private Section drawSections(View view, Frustrum camera) {
         Section candidate = null;
+        PreviewGrip moving=renderGrip(view);
         GL11.glEnable(GL11.GL_DEPTH_TEST);
         GL11.glEnable(GL11.GL_BLEND);
         GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
         GL11.glEnable(GL11.GL_CULL_FACE);
-        GL11.glCullFace(GL11.GL_BACK);
+        boolean mirrored = moving != null && moving.mirrored;
+        GL11.glCullFace(mirrored ? GL11.GL_FRONT : GL11.GL_BACK);
         // Real blocks win the depth test while a paced packet or mesh rebuild is pending.
         GL11.glPolygonOffset(1f, 1f);
+        visibleSections.clear();
         for (Section s : view.sections.values()) {
-            if (!camera.isBoundingBoxInFrustum(s.box)) continue;
+            if (!(moving==null ? camera.isBoundingBoxInFrustum(s.box) : moving.visible(camera,s.box))) continue;
+            if (refreshSite(s, moving, true)) visibleSections.add(s);
+        }
+        // Resolve all visible neighbour masks first. Replace previously drawn mixed sections in
+        // the same frame, so a newly placed block never blanks the other cells in its batch.
+        for (Section s : visibleSections) {
+            if (s.replaceFaces && s.hasShell && (view.layers & PreviewStream.SHELL) != 0) rebuildFaces(s);
+            if (s.replaceMarks && s.hasHatches && (view.layers & PreviewStream.HATCH) != 0) rebuildMarks(s);
+            if (s.replaceOutline && s.hasHatches && (view.layers & PreviewStream.HATCH) != 0) rebuildOutline(s);
             GL11.glPushMatrix();
-            GL11.glTranslatef(s.x, s.y, s.z);
+            translateSection(s, moving);
             boolean shell = (view.layers & PreviewStream.SHELL) != 0 && s.hasShell;
             boolean hatches = (view.layers & PreviewStream.HATCH) != 0 && s.hasHatches;
-            boolean outline = editable && shell && s.hasChoices;
-            if (hatches && s.marks != 0) visibleHatches.add(s);
-            if ((shell && s.dirty || hatches && s.marksDirty || outline && s.outlineDirty)
+            if (hatches && (s.marks != 0 || s.outline != 0)) visibleHatches.add(s);
+            if (s.needsMesh(view.layers)
                     && (candidate == null || s.lastCompilation < candidate.lastCompilation)) candidate = s;
             if (shell && s.faces != 0) {
                 GL11.glEnable(GL11.GL_POLYGON_OFFSET_FILL);
@@ -1071,19 +1312,96 @@ public final class BuilderRenderer extends BuilderProxy {
             }
             if (shell && s.facesTextured && s.glassFaces != 0) {
                 double dx = s.x + 8 - cameraX, dy = s.y + 8 - cameraY, dz = s.z + 8 - cameraZ;
-                s.sortDistance = dx * dx + dy * dy + dz * dz;
+                s.sortDistance = moving==null ? dx * dx + dy * dy + dz * dz
+                        : moving.distance(s.x+8,s.y+8,s.z+8,cameraX,cameraY,cameraZ);
                 transparentSections.add(s);
-            }
-            if (outline && s.outline != 0 && s.facesTextured) texturedOutlines.add(s);
-            if (outline && s.outline != 0 && !s.facesTextured) {
-                GL11.glDisable(GL11.GL_LINE_STIPPLE);
-                GL11.glLineWidth(1.5f);
-                GL11.glColor4f(.90f, .95f, .96f, .90f);
-                GL11.glCallList(s.outline);
             }
             GL11.glPopMatrix();
         }
+        visibleSections.clear();
+        if (mirrored) GL11.glCullFace(GL11.GL_BACK);
         return candidate;
+    }
+
+    /** Warm the destination under the normal one-list-per-frame budget while the old lists stay visible. */
+    private Section pendingMoveMesh(View destination, Frustrum camera) {
+        destination.waitingForSite = false;
+        if (destination.box == null || !camera.isBoundingBoxInFrustum(destination.box)) return null;
+        Section candidate = null;
+        for (Section s : destination.sections.values()) {
+            if (!camera.isBoundingBoxInFrustum(s.box)) continue;
+            if (!refreshSite(s, null, false)) {
+                destination.waitingForSite = true;
+                continue;
+            }
+            if (s.needsMesh(destination.layers)
+                    && (candidate == null || s.lastCompilation < candidate.lastCompilation)) candidate = s;
+        }
+        return candidate;
+    }
+
+    private void observe(World world) {
+        if (observedWorld == world) return;
+        if (occupancy != null) occupancy.close();
+        observedWorld = world;
+        occupancy = world == null ? null : new ProjectionOccupancy(world);
+    }
+
+    private boolean refreshSite(Section s, PreviewGrip moving, boolean presenting) {
+        s.site.bind(occupancy, moving, s.x, s.y, s.z);
+        if (!s.site.dirty) return true;
+        boolean freeDrag = moving != null && !moving.released;
+        boolean faces = presenting && s.faces != 0 && (s.owner.layers & PreviewStream.SHELL) != 0;
+        boolean marks = presenting && s.marks != 0 && (s.owner.layers & PreviewStream.HATCH) != 0;
+        boolean outline = presenting && s.outline != 0 && (s.owner.layers & PreviewStream.HATCH) != 0;
+        if (!freeDrag && samplingBudget <= 0 && !faces && !marks && !outline) return false;
+        long start = System.nanoTime();
+        s.site.read(s, sampledOccupancy, s.owner.textured);
+        if (!Arrays.equals(s.occupied, sampledOccupancy)) {
+            int shellBorders = changedBorders(s.occupied, sampledOccupancy);
+            int borders = s.updateVisibility(sampledOccupancy);
+            s.occupied = Arrays.equals(sampledOccupancy, EMPTY_MASK) ? EMPTY_MASK : sampledOccupancy.clone();
+            s.replaceFaces |= faces && s.hasShell && s.faces == 0;
+            s.replaceMarks |= marks && s.hasHatches && s.marks == 0;
+            s.replaceOutline |= outline && s.hasHatches && s.outline == 0;
+            invalidateHatchNeighbors(s.owner, s, borders, presenting && (s.owner.layers & PreviewStream.HATCH) != 0);
+            for (int side = 0; side < s.near.length; side++) {
+                Section near = s.near[side];
+                if (near == null || (shellBorders & (1 << side)) == 0) continue;
+                near.dirty = true;
+                near.replaceFaces |= presenting && near.faces != 0 && (s.owner.layers & PreviewStream.SHELL) != 0;
+            }
+            invalidateTextureNeighbors(s.owner, s.x >> 4, s.y >> 4, s.z >> 4);
+        } else if (s.site.materialsChanged) {
+            // A replacement can change CTM neighbours even when the cell stays occupied.
+            invalidateTextureNeighbors(s.owner, s.x >> 4, s.y >> 4, s.z >> 4);
+        }
+        if (!freeDrag) samplingBudget -= System.nanoTime() - start;
+        return true;
+    }
+
+    private static void rebuildMarks(Section s) {
+        s.marks = compileHatches(s.owner, s);
+        s.marksDirty = s.marks == 0;
+        s.replaceMarks = false;
+    }
+
+    private static void rebuildOutline(Section s) {
+        s.outline = compileHatchOutline(s.owner, s);
+        s.outlineDirty = s.outline == 0;
+        s.replaceOutline = false;
+    }
+
+    private static void rebuildFaces(Section s) {
+        boolean textured = s.owner.textured && s.textured;
+        s.faces = textured ? compileTexturedShell(s.owner, s, s.faces) : compileShell(s.owner, s, s.faces);
+        if (!textured && s.faces != 0 && s.glassFaces != 0) {
+            GL11.glDeleteLists(s.glassFaces, 1);
+            s.glassFaces = 0;
+        }
+        if (s.faces != 0) s.facesTextured = textured;
+        s.dirty = s.faces == 0;
+        s.replaceFaces = false;
     }
 
     private void drawTransparentSections() {
@@ -1102,32 +1420,32 @@ public final class BuilderRenderer extends BuilderProxy {
         GL11.glDepthMask(false);
         GL11.glPolygonOffset(1f, 1f);
         GL11.glEnable(GL11.GL_POLYGON_OFFSET_FILL);
-        for (Section section : transparentSections) {
-            GL11.glPushMatrix();
-            GL11.glTranslatef(section.x, section.y, section.z);
-            GL11.glCallList(section.glassFaces);
-            GL11.glPopMatrix();
-        }
+        for (Section section : transparentSections) drawSectionList(section, section.glassFaces);
         GL11.glDisable(GL11.GL_POLYGON_OFFSET_FILL);
         GL11.glDisable(GL11.GL_ALPHA_TEST);
         GL11.glDisable(GL11.GL_TEXTURE_2D);
     }
 
-    private void drawTexturedOutlines() {
-        if (texturedOutlines.isEmpty()) return;
-        GL11.glEnable(GL11.GL_DEPTH_TEST);
-        GL11.glEnable(GL11.GL_BLEND);
-        GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
-        GL11.glDisable(GL11.GL_TEXTURE_2D);
-        GL11.glDisable(GL11.GL_LINE_STIPPLE);
-        GL11.glLineWidth(1.5f);
-        GL11.glColor4f(.90f, .95f, .96f, .90f);
-        for (Section section : texturedOutlines) {
-            GL11.glPushMatrix();
-            GL11.glTranslatef(section.x, section.y, section.z);
-            GL11.glCallList(section.outline);
-            GL11.glPopMatrix();
-        }
+    private PreviewGrip renderGrip(View v) {
+        if (v != null && v.fixedPose != null) return v.fixedPose;
+        PreviewGrip g=grip;
+        return g!=null && g.moving && !g.rejected && v!=null && v.revision==g.revision && g.id.equals(v.id) ? g : null;
+    }
+
+    private static void translateSection(Section section, PreviewGrip grip) {
+        if (grip != null) grip.transform();
+        GL11.glTranslatef(section.x,section.y,section.z);
+    }
+
+    private void drawSectionList(Section section, int list) {
+        PreviewGrip grip = renderGrip(section.owner);
+        boolean mirrored = grip != null && grip.mirrored;
+        GL11.glPushMatrix();
+        if (mirrored) GL11.glCullFace(GL11.GL_FRONT);
+        translateSection(section, grip);
+        GL11.glCallList(list);
+        if (mirrored) GL11.glCullFace(GL11.GL_BACK);
+        GL11.glPopMatrix();
     }
 
     private static int compileHatches(View view, Section s) {
@@ -1136,14 +1454,55 @@ public final class BuilderRenderer extends BuilderProxy {
         GL11.glNewList(list, GL11.GL_COMPILE);
         Tessellator t = Tessellator.instance;
         t.startDrawingQuads();
-        HatchMesh.emit(s.hatch, s.confirmed, s.markerRoles(view), (side, slot) -> {
-            Section neighbor = s.near[side];
-            return neighbor != null && (neighbor.hatch[slot >> 6] & (1L << (slot & 63))) != 0;
-        }, (side, plane, u, v, width, height, role) ->
+        emitHatchFaces(view, s, (side, plane, u, v, width, height, role) ->
                 markerFace(t, side, plane, u, v, width, height, HATCH_ROLES[role].color));
         t.draw();
         GL11.glEndList();
+        s.marksRevision++;
         return list;
+    }
+
+    private static void emitHatchFaces(View view, Section s, HatchMesh.Face faces) {
+        HatchMesh.emit(s.hatch, s.occupied, s.markerRoles(view), (side, slot) -> {
+            Section neighbor = s.near[side];
+            int word = slot >> 6;
+            return neighbor != null && (neighbor.hatch[word] & ~neighbor.occupied[word] & (1L << (slot & 63))) != 0;
+        }, faces);
+    }
+
+    private static int markerTint(int color) {
+        return color + shade(0xffffff - color, 40);
+    }
+
+    private int hoveredHatchList(Section s) {
+        if (hoverMarks == 0) hoverMarks = GL11.glGenLists(1);
+        if (hoverMarks == 0) return s.marks;
+        if (s != cachedHatchSection || s.marksRevision != cachedMarksRevision) {
+            cachedHatchFaces = new HatchMesh.Selection();
+            emitHatchFaces(s.owner, s, cachedHatchFaces);
+            cachedHatchSection = s;
+            cachedMarksRevision = s.marksRevision;
+            cachedHatchSlot = -1;
+        }
+        if (highlightedHatchSlot == cachedHatchSlot) return hoverMarks;
+        GL11.glNewList(hoverMarks, GL11.GL_COMPILE);
+        Tessellator t = Tessellator.instance;
+        t.startDrawingQuads();
+        cachedHatchFaces.draw(highlightedHatchSlot, (side, plane, u, v, width, height, role) ->
+                markerFace(t, side, plane, u, v, width, height, HATCH_ROLES[role].color),
+                (side, plane, u, v, width, height, role) ->
+                markerFace(t, side, plane, u, v, width, height, markerTint(HATCH_ROLES[role].color)));
+        t.draw();
+        GL11.glEndList();
+        cachedHatchSlot = highlightedHatchSlot;
+        return hoverMarks;
+    }
+
+    private void clearHatchSelection() {
+        cachedHatchSection = null;
+        cachedHatchFaces = null;
+        if (hoverMarks != 0) GL11.glDeleteLists(hoverMarks, 1);
+        hoverMarks = 0;
     }
 
     private static int compileTexturedShell(View view, Section s, int previous) {
@@ -1172,8 +1531,7 @@ public final class BuilderRenderer extends BuilderProxy {
             Section adjacent = crossing ? s.near[side] : s;
             if (adjacent == null) return false;
             long bit = 1L << (neighbor & 63);
-            if (((adjacent.solid[neighbor >> 6] | adjacent.optional[neighbor >> 6]) & bit) == 0) return false;
-            // Installed blocks still occlude. Glass keeps the opaque faces behind it visible.
+            if (((adjacent.solid[neighbor >> 6] | adjacent.optional[neighbor >> 6]) & ~adjacent.occupied[neighbor >> 6] & bit) == 0) return false;
             return BlockPreviewTextures.occludes(adjacent.appearance(neighbor), current);
         };
         long[][][] deferred = new long[2][][];
@@ -1183,9 +1541,12 @@ public final class BuilderRenderer extends BuilderProxy {
             GL11.glEnable(GL11.GL_TEXTURE_2D);
             tessellator.startDrawingQuads();
             tessellator.setBrightness(0xf000f0);
-            ProjectedBlockFaces.emit(s.solid, s.optional, s.confirmed, s.hatch, host, roles, boundary, (side, slot) -> {
+            ProjectedBlockFaces.emit(s.solid, s.optional, s.occupied, s.hatch, host, roles,
+                    slot -> s.appearance(slot).fence, boundary, (side, slot) -> {
                 BlockPreviewTextures.Appearance appearance = s.appearance(slot);
-                if (!appearance.textured()) deferred[0] = ProjectedBlockFaces.remember(deferred[0], side, slot);
+                if (side == ProjectedBlockFaces.MODEL) PreviewFence.draw(tessellator, appearance, slot, SHELL_ALPHA, access,
+                        s.x + (slot & 15), s.y + (slot >> 8), s.z + (slot >> 4 & 15), 0);
+                else if (!appearance.textured()) deferred[0] = ProjectedBlockFaces.remember(deferred[0], side, slot);
                 else if (appearance.translucent) deferred[1] = ProjectedBlockFaces.remember(deferred[1], side, slot);
                 else BlockPreviewTextures.face(tessellator, appearance, side, slot, SHELL_ALPHA, access,
                             s.x + (slot & 15), s.y + (slot >> 8), s.z + (slot >> 4 & 15));
@@ -1251,17 +1612,17 @@ public final class BuilderRenderer extends BuilderProxy {
             Section source = halo[13 + dx + 3 * dy + 9 * dz];
             if (source == null) return 0;
             int slot = (x & 15) | ((z & 15) << 4) | ((y & 15) << 8);
-            if ((source.confirmed[slot >> 6] & (1L << (slot & 63))) != 0 && world != null
+            if ((source.occupied[slot >> 6] & (1L << (slot & 63))) != 0 && world != null
                     && world.provider.dimensionId == view.dim) {
                 try {
-                    if (world.blockExists(x, y, z)) {
-                        Block installed = world.getBlock(x, y, z);
+                    int[] at = source.site.worldCell(x, y, z);
+                    if (world.blockExists(at[0], at[1], at[2])) {
+                        Block installed = world.getBlock(at[0], at[1], at[2]);
                         if (installed != Blocks.air)
-                            return PreviewBlockAccess.state(installed, world.getBlockMetadata(x, y, z));
+                            return PreviewBlockAccess.state(installed, world.getBlockMetadata(at[0], at[1], at[2]));
                     }
-                } catch (RuntimeException | LinkageError unavailable) {
-                    // An unavailable native client chunk never replaces a proved packet identity with air.
-                }
+                } catch (RuntimeException | LinkageError unavailable) { /* Treat the unknown neighbour as air. */ }
+                return 0;
             }
             if (source.renderSlots == null) return 0;
             int index = source.renderSlots[slot] & 65535;
@@ -1293,9 +1654,9 @@ public final class BuilderRenderer extends BuilderProxy {
                 for (int v = 0; v < 16; v++)
                     for (int u = 0; u < 16; u++) {
                         int i = slot(axis, plane, u, v);
-                        // Confirmed blocks still occlude their neighbours, including across section edges.
+                        // Occupied world cells never contribute projected faces.
                         long bit = 1L << (i & 63);
-                        if ((s.confirmed[i >> 6] & bit) != 0 || ((s.solid[i >> 6] | s.optional[i >> 6]) & bit) == 0)
+                        if ((s.occupied[i >> 6] & bit) != 0 || ((s.solid[i >> 6] | s.optional[i >> 6]) & bit) == 0)
                             continue;
                         // The role mesh supplies this face. Keeping it in both layers would blend it twice.
                         if (roleLayer && (i == host || (s.hatch[i >> 6] & (1L << (i & 63))) != 0)) continue;
@@ -1304,10 +1665,8 @@ public final class BuilderRenderer extends BuilderProxy {
                         int neighbor = slot(axis, n & 15, u, v);
                         // Render the editable region's exterior, including deliberately empty choices.
                         // Faces between projected options share a plane and need no interior fill.
-                        long choice = s.choice(i);
-                        if (next != null && (next.choice(neighbor) != 0
-                                || solid(next, neighbor) && (choice == 0
-                                    || (next.confirmed[neighbor >> 6] & (1L << (neighbor & 63))) != 0))) continue;
+                        if (next != null && (next.occupied[neighbor >> 6] & (1L << (neighbor & 63))) == 0
+                                && (next.choiceMaterial(neighbor) || solid(next, neighbor) && !s.choiceMaterial(i))) continue;
                         int color = s.color(i);
                         cells[v * 16 + u] = color == 0 ? -1 : color;
                     }
@@ -1356,21 +1715,25 @@ public final class BuilderRenderer extends BuilderProxy {
         return item == null ? "?" : new ItemStack(item, 1, style.damage).getDisplayName();
     }
 
-    private static int compileOutline(View view, Section s) {
+    private static int compileHatchOutline(View view, Section s) {
         int list = s.outline == 0 ? GL11.glGenLists(1) : s.outline;
         if (list == 0) return 0;
         // Resolve the halo once. An edge can touch a diagonal section even if both face neighbours are empty.
-        Section[] halo = new Section[27];
+        HatchMesh.Roles[] halo = new HatchMesh.Roles[27];
         for (int dz = -1; dz <= 1; dz++) for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
-            halo[13 + dx + 3 * dy + 9 * dz] = view.sections.get(
+            if (dx != 0 && dy != 0 && dz != 0) continue;
+            Section neighbor = view.sections.get(
                     new ChunkPosition((s.x >> 4) + dx, (s.y >> 4) + dy, (s.z >> 4) + dz));
+            if (neighbor != null && neighbor.hasHatches)
+                halo[13 + dx + 3 * dy + 9 * dz] = new HatchMesh.Roles(
+                        neighbor.hatch, neighbor.occupied, neighbor.markerRoles(view));
         }
         GL11.glNewList(list, GL11.GL_COMPILE);
         Tessellator t = Tessellator.instance;
         t.startDrawing(GL11.GL_LINES);
-        ChoiceOutline.emit(s.choices, (x, y, z) -> {
-            Section neighbor = halo[13 + (x >> 4) + 3 * (y >> 4) + 9 * (z >> 4)];
-            return neighbor == null ? 0 : neighbor.choice((x & 15) | ((z & 15) << 4) | ((y & 15) << 8));
+        ChoiceOutline.emit(s.hatch, s.occupied, (x, y, z) -> {
+            HatchMesh.Roles neighbor = halo[13 + (x >> 4) + 3 * (y >> 4) + 9 * (z >> 4)];
+            return neighbor == null ? 0 : neighbor.type((x & 15) | ((z & 15) << 4) | ((y & 15) << 8));
         }, (axis, x, y, z, length) -> {
             t.addVertex(x, y, z);
             t.addVertex(x + (axis == 0 ? length : 0), y + (axis == 1 ? length : 0), z + (axis == 2 ? length : 0));
@@ -1380,7 +1743,7 @@ public final class BuilderRenderer extends BuilderProxy {
         return list;
     }
 
-    private static void drawPick(Pick pick) {
+    private static void drawPick(ChunkCoordinates at, int color) {
         GL11.glEnable(GL11.GL_DEPTH_TEST);
         GL11.glEnable(GL11.GL_CULL_FACE);
         GL11.glCullFace(GL11.GL_BACK);
@@ -1388,13 +1751,14 @@ public final class BuilderRenderer extends BuilderProxy {
         GL11.glDisable(GL11.GL_TEXTURE_2D);
         GL11.glDisable(GL11.GL_BLEND);
         GL11.glEnable(GL11.GL_POLYGON_OFFSET_FILL);
-        GL11.glPolygonOffset(-1f, -1f);
+        GL11.glPolygonOffset(0f, -3f);
         GL11.glPushMatrix();
-        GL11.glTranslated(pick.x, pick.y, pick.z);
+        GL11.glTranslated(at.posX, at.posY, at.posZ);
         Tessellator t = Tessellator.instance;
         t.startDrawingQuads();
-        int color = materialColor(pick.style);
-        for (int side = 0; side < 6; side++) markerFace(t, side, side & 1, 0, 0, 1, 1, color);
+        for (int side = 0; side < 6; side++)
+            markerFace(t, side, side & 1, 0, 0, 1, 1, color == 0 ? COLORS[side]
+                    : shade(color, side < 2 ? 82 : side == 3 ? 100 : 69));
         t.draw();
         GL11.glPopMatrix();
         GL11.glDisable(GL11.GL_POLYGON_OFFSET_FILL);

@@ -11,6 +11,7 @@ import net.minecraft.world.World;
 final class OrdinaryBuildSurvey {
     final Blueprint plan;
     final int revision, size;
+    private final int manualEdits;
     final Materials total = new Materials(), installed = new Materials(), missing = new Materials(),
             blocked = new Materials(), unverified = new Materials();
     int visited, totalCells, installedCells, missingCells, blockedCells, unknownCells, unloadedCells;
@@ -27,12 +28,13 @@ final class OrdinaryBuildSurvey {
         this.task = task;
         plan = task.plan;
         revision = task.revision;
+        manualEdits = task.manualEditGeneration;
         size = plan.size;
     }
 
     boolean valid(BuildTask candidate) {
         return !stale && candidate == task && task.plan == plan && plan.ready && plan.size == size
-                && task.revision == revision && !task.upgrading();
+                && task.revision == revision && task.manualEditGeneration == manualEdits && !task.upgrading();
     }
 
     /** Complete traversal does not imply a fully built structure or zero unavailable positions. */

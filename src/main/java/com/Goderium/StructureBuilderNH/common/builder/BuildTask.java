@@ -20,6 +20,7 @@ import net.minecraft.world.WorldServer;
 import net.minecraft.world.World;
 
 import java.util.*;
+import net.minecraftforge.common.util.ForgeDirection;
 
 final class BuildTask {
     enum State {
@@ -42,16 +43,22 @@ final class BuildTask {
     }
 
     final PlacementLedger ledger = new PlacementLedger(this);
+    private Map<Long, BitSet> structureCells;
+    private final Set<ChunkCoordinates> manualHatches = new HashSet<>();
+    private final ChunkCoordinates lookupHatch = new ChunkCoordinates();
     final TaskChunks workChunks = new TaskChunks();
     boolean deleteRequested, dismantleRequested;
     final BuilderTasks store;
     final String id, owner, tool;
-    final int dim, x, y, z;
-    final ExtendedFacing facing;
+    final int dim;
+    int x, y, z;
+    ExtendedFacing facing;
     boolean existing;
+    private boolean temporaryHost;
     String key = "", orderId = "", detail = "", reason = "";
     State state = State.DRAFT;
     boolean auto, received;
+    private boolean checkMaterialsOnly;
     ChunkCoordinates issue;
 
     void pointAt(int x, int y, int z) {
@@ -65,6 +72,7 @@ final class BuildTask {
     int tier = 1, cursor, total, placed, revision;
     boolean useSurvivalConstruct = RebuildConfig.useSurvivalConstruct;
     int siteRevision = -1, siteInstalled, siteTotal, siteUnknown;
+    int manualEditGeneration;
     int previewLayers;
     boolean texturedPreview;
     final Set<String> upgradeChannels = new LinkedHashSet<>();
@@ -144,6 +152,19 @@ final class BuildTask {
                 return;
             }
             boolean air = world.isAirBlock(result.x, result.y, result.z);
+            if (cell.isFluid()) {
+                // Leave process fluids to the machine or player, and keep empty cells visible in the projection.
+                if (air) {
+                    result.matches = cell.constraints == null
+                            || cell.constraints.stream().allMatch(c -> c.isFluid() || c.air);
+                    result.status = result.matches ? OrdinaryStatus.AIR : OrdinaryStatus.BLOCKED;
+                } else {
+                    result.matches = world.getBlock(result.x, result.y, result.z) == cell.block
+                            && materialMatches(cell, world, result.x, result.y, result.z);
+                    result.status = result.matches ? OrdinaryStatus.INSTALLED : OrdinaryStatus.BLOCKED;
+                }
+                return;
+            }
             result.matches = result.host ? anchorValid(world)
                     : materialMatches(cell, world, result.x, result.y, result.z);
             if (result.matches) {
@@ -362,9 +383,17 @@ final class BuildTask {
 
     MaterialSelection selection(int px, int py, int pz) {
         ensureSelections();
-        if (plan == null || !plan.ready || selectedMaterials == null || plan.choices.isEmpty()) return null;
+        return cachedSelection(px, py, pz);
+    }
+
+    MaterialSelection cachedSelection(int px, int py, int pz) {
+        if (plan == null || selectionPlan != plan || !plan.ready || selectedMaterials == null || plan.choices.isEmpty()) return null;
         int index = plan.indexAt(px, py, pz);
         return index < 0 ? null : selectedMaterials[index];
+    }
+
+    boolean hasCachedSelections() {
+        return plan != null && selectionPlan == plan;
     }
 
     boolean materialSelectable(int px, int py, int pz) {
@@ -484,14 +513,19 @@ final class BuildTask {
     }
 
     private boolean materialMatches(Blueprint.Cell cell, World world, int px, int py, int pz) {
-        if (cell.choice == null) return plan.matches(cell, world, px, py, pz);
-        MaterialSelection selection = selection(px, py, pz);
+        MaterialSelection selection = cell.choice == null ? null : selection(px, py, pz);
         if (selection != null && selection.supported) {
             if (selection.conflict) return false;
             if (selection.explicit && selection.group.indexAt(world, px, py, pz) != selection.index) return false;
             if (world.isAirBlock(px, py, pz) && selection.item() != null) return false;
         }
-        return plan.matches(cell, world, px, py, pz);
+        if (!plan.matches(cell, world, px, py, pz)) return false;
+        if (cell.hatch && !manualHatches.isEmpty() && !world.isAirBlock(px, py, pz)) {
+            lookupHatch.set(px, py, pz);
+            if (manualHatches.contains(lookupHatch))
+                return plan.checkManualHatch(cell, world, px, py, pz, target, facing);
+        }
+        return true;
     }
 
     private boolean initiallyConfirmed(int index) {
@@ -546,6 +580,7 @@ final class BuildTask {
 
     void resetPlan() {
         discardCachedPlan();
+        structureCells = null;
         confirmed = new BitSet();
         if (upgrading()) {
             cursor=0;
@@ -564,13 +599,188 @@ final class BuildTask {
         return !upgrading() && (state == State.DRAFT || state == State.PREVIEW || state == State.MISSING && !hasReserved());
     }
 
+    boolean shortcutDeletable() {
+        return state == State.DONE || state == State.DISMANTLED || state == State.PREVIEW && previewLayers != 0;
+    }
+
+    /** A preview grip edits the plan. Only a drop inspects the proposed site. */
+    boolean movable() {
+        return !existing && canCompletePreviewMove();
+    }
+
+    boolean canCompletePreviewMove() {
+        return state == State.PREVIEW && (previewLayers & (PreviewStream.SHELL | PreviewStream.HATCH)) != 0
+                && (!existing || temporaryHost) && target != null && !deleteRequested && !dismantleRequested && !upgrading()
+                && ledger.count == 0 && !hasReserved() && savedLink == null;
+    }
+
+    PreviewPose.Allowed allowedPoses() {
+        long low = 0, high = 0;
+        IAlignment alignment = plan.controller instanceof IAlignment ? (IAlignment) plan.controller : null;
+        for (ForgeDirection direction : ForgeDirection.VALID_DIRECTIONS) {
+            if (!plan.controller.isFacingValid(direction)) continue;
+            for (ExtendedFacing pose : ExtendedFacing.FOR_FACING.get(direction)) {
+                if (alignment == null ? pose != ExtendedFacing.of(direction) : !alignment.isNewExtendedFacingValid(pose)) continue;
+                int index = pose.getIndex();
+                if (index < 64) low |= 1L << index;
+                else high |= 1L << (index - 64);
+            }
+        }
+        return new PreviewPose.Allowed(low, high);
+    }
+
+    boolean movePreview(World world, int px, int py, int pz, ExtendedFacing next) {
+        if (!movable() || plan == null || !plan.ready || world == null || py < 0 || py >= world.getHeight()
+                || Math.abs((long)px) >= 30000000 || Math.abs((long)pz) >= 30000000 || !world.blockExists(px,py,pz)) return false;
+        boolean sameAnchor = x == px && y == py && z == pz;
+        // A real host at the source stays anchored. Dropping onto that same host only aligns the projection.
+        if (!sameAnchor && (!world.blockExists(x, y, z) || targetHostFacing(world, x, y, z) != null)) return false;
+        boolean attach = !world.isAirBlock(px, py, pz);
+        if (attach) {
+            next = targetHostFacing(world, px, py, pz);
+            if (next == null) return false;
+        } else if (next == null || next != facing && !allowedPoses().reachable(facing, next)) return false;
+        if (sameAnchor && !attach && next == facing) return true;
+        applyPreviewMove(px, py, pz, next, attach);
+        return true;
+    }
+
+    private void applyPreviewMove(int px, int py, int pz, ExtendedFacing next, boolean attach) {
+        if (next != facing) {
+            PreviewPose transform=new PreviewPose(facing,next);
+            materialCells=transform.rotateSelections(materialCells,true);
+            materialGroups=transform.rotateSelections(materialGroups,false);
+            materialSelections=transform.rotateSelections(materialSelections,false);
+        }
+        x=px; y=py; z=pz; facing=next;
+        if (attach) existing = temporaryHost = true;
+        pending.clear(); manualHatches.clear();
+        needed.rows.clear(); shortage.rows.clear(); errors.rows.clear();
+        cursor=total=placed=0; siteRevision=-1; detail="";
+        resetPlan();
+    }
+
+    boolean previewMarkerAt(int px, int py, int pz) {
+        if (issue != null && issue.posX == px && issue.posY == py && issue.posZ == pz && repairableIssue()) return true;
+        if ((previewLayers & (PreviewStream.HATCH | PreviewStream.SHELL)) == 0 || target == null || deleteRequested) return false;
+        boolean markers = (previewLayers & PreviewStream.HATCH) != 0;
+        boolean host = x == px && y == py && z == pz;
+        if (markers && host) return true;
+        if (plan == null || !plan.ready) return false;
+        Blueprint.Cell cell = plan.cellAt(px, py, pz);
+        if (cell == null || (!host && !cell.hatch)) return false;
+        if (markers && state == State.PREVIEW) return true;
+        if (initiallyConfirmed(plan.indexAt(px, py, pz))) return false;
+        MaterialSelection choice = !markers && cell.air ? selection(px, py, pz) : null;
+        return markers || !cell.air || choice != null && choice.supported;
+    }
+
     boolean upgrading() { return !upgradeChannels.isEmpty(); }
+
+    boolean structureAt(World world, int px, int py, int pz) {
+        if (deleteRequested || target == null) return false;
+        if (previewMarkerAt(px, py, pz)) return true;
+        if (px == x && py == y && pz == z) return !world.isAirBlock(px, py, pz);
+        if (plan == null || !plan.ready) {
+            if (py < 0 || py >= 256) return false;
+            if (structureCells == null) return ledger.matches(world, px, py, pz);
+            BitSet section = structureCells.get(PlacementLedger.key(px, py, pz));
+            return section != null && section.get(Blueprint.slot(px, py, pz)) && !world.isAirBlock(px, py, pz);
+        }
+        Blueprint.Cell cell = plan.cellAt(px, py, pz);
+        if (cell == null || cell.air && !cell.hatch && cell.choice == null) return false;
+        if (!world.isAirBlock(px, py, pz)) return true;
+        if ((previewLayers & PreviewStream.SHELL) == 0 || initiallyConfirmed(plan.indexAt(px, py, pz))) return false;
+        if (!cell.air) return true;
+        MaterialSelection choice = selection(px, py, pz);
+        return choice != null && choice.supported;
+    }
+
+    private void captureStructureCells() {
+        Map<Long, BitSet> snapshot = new HashMap<>();
+        for (Blueprint.Section section : plan.sections) {
+            // Ledger keys reserve four bits for the section's world height.
+            if (section.y < 0 || section.y >= 16) continue;
+            BitSet cells = section.structureCells();
+            if (!cells.isEmpty()) snapshot.put(PlacementLedger.key(section.x << 4, section.y << 4, section.z << 4), cells);
+        }
+        if (!snapshot.equals(structureCells)) {
+            structureCells = snapshot;
+            changed();
+        }
+    }
+
+    private NBTTagList saveStructureCells() {
+        NBTTagList data = new NBTTagList();
+        for (Map.Entry<Long, BitSet> section : structureCells.entrySet()) {
+            NBTTagCompound tag = new NBTTagCompound();
+            tag.setLong("section", section.getKey());
+            tag.setByteArray("cells", section.getValue().toByteArray());
+            data.appendTag(tag);
+        }
+        return data;
+    }
+
+    private void loadStructureCells(NBTTagList data) {
+        structureCells = new HashMap<>();
+        for (int i = 0; i < data.tagCount(); i++) {
+            NBTTagCompound tag = data.getCompoundTagAt(i);
+            byte[] bits = tag.getByteArray("cells");
+            if (!tag.hasKey("section", 4) || bits.length == 0 || bits.length > 512) continue;
+            structureCells.put(tag.getLong("section"), BitSet.valueOf(bits));
+        }
+    }
+
+    boolean canChangeCell(ChunkCoordinates p) {
+        if (p == null || target == null || deleteRequested || dismantleRequested || upgrading()
+                || !(editable() || state == State.BLOCKED) || savedLink != null) return false;
+        if (p.posX == x && p.posY == y && p.posZ == z) return true;
+        Blueprint.Cell cell = plan == null || !plan.ready ? null : plan.cellAt(p.posX, p.posY, p.posZ);
+        return cell != null && cell.hatch;
+    }
+
+    boolean repairableIssue() {
+        return state == State.BLOCKED && canChangeCell(issue) && (issue.posX != x || issue.posY != y || issue.posZ != z);
+    }
+
+    void singleCellChanged(World world, ChunkCoordinates p, boolean placedBlock) {
+        if (placedBlock) {
+            if (p.posX != x || p.posY != y || p.posZ != z) manualHatches.add(new ChunkCoordinates(p));
+            else if (!existing && anchorValid(world)) existing = temporaryHost = true;
+            ledger.record(world, p.posX, p.posY, p.posZ);
+        } else {
+            manualHatches.remove(p);
+            ledger.forget(p.posX, p.posY, p.posZ);
+        }
+        if (plan != null && plan.ready && confirmed != null) {
+            int index = plan.indexAt(p.posX, p.posY, p.posZ);
+            if (index >= 0) confirm(index, false);
+        }
+        // A write proves ownership. Only the ordinary scan can certify that the part fits.
+        siteRevision = -1;
+        manualEditGeneration++;
+        invalidateOrdinaryProgress();
+        if (state == State.MISSING) {
+            needed.rows.clear(); shortage.rows.clear(); errors.rows.clear();
+            state = previewLayers == 0 ? State.DRAFT : State.PREVIEW;
+        }
+        changed();
+    }
+
+    void depositManualDrops(EntityPlayerMP player, WorldServer world) {
+        Wireless net = Wireless.find(this, world, player);
+        if (net != null) deposit(net, salvage, false);
+    }
 
     /** Channel-page permission only; review must never enable the world/material editor. */
     boolean canConfigureChannels() {
         return !hasReserved() && savedLink == null && !ordering()
                 && (state == State.DRAFT || state == State.PREVIEW || state == State.MISSING
                     || state == State.UPGRADE_REVIEW || state == State.BLOCKED && upgrading() && !upgradeApproved);
+    }
+
+    boolean usesConfiguredSource() {
+        return useSurvivalConstruct == RebuildConfig.useSurvivalConstruct;
     }
 
     boolean keepsUpgradeBinding() { return !upgradeNetwork.isEmpty(); }
@@ -582,9 +792,23 @@ final class BuildTask {
 
     boolean attachExisting(WorldServer world) {
         if (!canConfigureChannels() || target == null || world == null || world.provider.dimensionId != dim
-                || !world.blockExists(x,y,z) || !anchorValid(world)) return false;
-        if (!existing) { existing = true; changed(); }
+                || !world.blockExists(x,y,z)) return false;
+        ExtendedFacing actual = targetHostFacing(world, x, y, z);
+        if (actual == null) return false;
+        if (actual != facing) {
+            if (existing || ledger.count != 0 || deleteRequested || dismantleRequested || upgrading()
+                    || state != State.DRAFT && state != State.PREVIEW) return false;
+            applyPreviewMove(x, y, z, actual, true);
+        } else if (!existing) { existing = temporaryHost = true; changed(); }
         return true;
+    }
+
+    void releaseMissingTemporaryHost(World world) {
+        if (temporaryHost && editable() && world.blockExists(x, y, z) && world.isAirBlock(x, y, z)) {
+            existing = temporaryHost = false;
+            ledger.forget(x, y, z);
+            changed();
+        }
     }
 
     /** Call before writing new tier/channel values, while the old ready plan can validate the selected scope. */
@@ -698,8 +922,10 @@ final class BuildTask {
         changed();
     }
 
-    void configureTarget(ItemStack stack) {
+    boolean configureTarget(ItemStack stack) {
         if (!Materials.equal(target, stack)) {
+            if (ledger.count > 0) return false;
+            manualHatches.clear();
             materialSelections = new NBTTagCompound();
             materialCells = new NBTTagCompound();
             materialGroups = new NBTTagCompound();
@@ -710,6 +936,7 @@ final class BuildTask {
         observedChannels.clear();
         store.channelMemory.restore(this);
         resetDraft();
+        return true;
     }
 
     void resetDraft() {
@@ -772,7 +999,10 @@ final class BuildTask {
                         useSurvivalConstruct);
             }
             if (!plan.ready) plan.advance(deadline);
-            if (plan.ready) ensureSelections();
+            if (plan.ready) {
+                ensureSelections();
+                captureStructureCells();
+            }
             if (plan.ready && confirmed == null) {
                 confirmed = new BitSet(plan.size);
                 confirmed.set(0, plan.size);
@@ -795,13 +1025,23 @@ final class BuildTask {
         actor.addChatMessage(
                 new ChatComponentTranslation(
                         "structurebuildernh.chat." + key,
-                        target == null ? "" : target.getDisplayName(),
+                        target == null ? new ChatComponentTranslation("item.sbnh.builder.name") : target.getDisplayName(),
                         x,
                         y,
                         z));
     }
 
     void start() {
+        start(false);
+    }
+
+    void recheckMaterials() {
+        if (state == State.MISSING) start(true);
+    }
+
+    private void start(boolean checkOnly) {
+        if (state == State.SCANNING) return;
+        checkMaterialsOnly = checkOnly;
         if (upgrading()) {
             if (state == State.UPGRADE_REVIEW) { startUpgrade(); return; }
             if (state == State.BLOCKED && !upgradeApproved) {
@@ -845,7 +1085,7 @@ final class BuildTask {
                 p.addChatMessage(
                         new ChatComponentTranslation(
                                 "structurebuildernh.chat.blocked",
-                                target.getDisplayName(),
+                                target == null ? new ChatComponentTranslation("item.sbnh.builder.name") : target.getDisplayName(),
                                 px,
                                 py,
                                 pz,
@@ -859,13 +1099,19 @@ final class BuildTask {
     }
 
     private boolean anchorValid(World world) {
-        TileEntity te = world.getTileEntity(x, y, z);
-        if (!(te instanceof IGregTechTileEntity)) return false;
+        return targetHostFacing(world, x, y, z) == facing;
+    }
+
+    private ExtendedFacing targetHostFacing(World world, int px, int py, int pz) {
+        TileEntity te = world.getTileEntity(px, py, pz);
+        if (!(te instanceof IGregTechTileEntity)) return null;
         IGregTechTileEntity gt = (IGregTechTileEntity) te;
-        return gt.getMetaTileID() == target.getMetadata()
-                && gt.getFrontFacing() == facing.getDirection()
-                && (!(gt.getMetaTileEntity() instanceof IAlignment)
-                        || ((IAlignment) gt.getMetaTileEntity()).getExtendedFacing() == facing);
+        if (gt.getMetaTileEntity() == null || gt.getMetaTileID() != target.getMetadata()) return null;
+        ForgeDirection front = gt.getFrontFacing();
+        if (front == null || front == ForgeDirection.UNKNOWN) return null;
+        ExtendedFacing pose = gt.getMetaTileEntity() instanceof IAlignment
+                ? ((IAlignment) gt.getMetaTileEntity()).getExtendedFacing() : ExtendedFacing.of(front);
+        return pose != null && pose.getDirection() == front ? pose : null;
     }
 
     private boolean requireChunk(WorldServer world, int px, int py, int pz) {
@@ -921,15 +1167,14 @@ final class BuildTask {
         }
         changed();
         if (cursor < plan.size) return;
-        if (pending.isEmpty()) {
+        if (pending.isEmpty() && !checkMaterialsOnly) {
             finish(actor, world);
             return;
         }
-        if (actor.capabilities.isCreativeMode) {
+        if (pending.isEmpty() || actor.capabilities.isCreativeMode) {
             cursor = 0;
             reason = "";
-            state = State.QUEUED;
-            changed();
+            materialsAvailable();
             return;
         }
         Wireless net = Wireless.find(this, world, actor);
@@ -939,7 +1184,7 @@ final class BuildTask {
         if (shortage.rows.isEmpty()) {
             quote(actor, net, true);
             if (shortage.rows.isEmpty()) {
-                state = State.QUEUED;
+                materialsAvailable();
                 return;
             }
         }
@@ -951,6 +1196,12 @@ final class BuildTask {
     boolean hasReserved() {
         return !backpack.rows.isEmpty() || !held.rows.isEmpty() || !salvage.rows.isEmpty()
                 || upgradeRecovery != null || upgradeRecoveryFault;
+    }
+
+    private void materialsAvailable() {
+        state = checkMaterialsOnly ? State.READY : State.QUEUED;
+        checkMaterialsOnly = false;
+        changed();
     }
 
     private void scanUpgrade(EntityPlayerMP actor, WorldServer world, long deadline) {
@@ -989,7 +1240,7 @@ final class BuildTask {
         upgradeReviewSources=upgradeScanSources;
         upgradeScan.clear();
         if (actor.capabilities.isCreativeMode) {
-            state=State.QUEUED; reason=""; changed(); return;
+            reason=""; materialsAvailable(); return;
         }
         Wireless net=Wireless.find(this,world,actor);
         String status=upgradeDepositProblem(net);
@@ -998,7 +1249,7 @@ final class BuildTask {
         quote(actor,net,false);
         if (shortage.rows.isEmpty()) {
             quote(actor,net,true);
-            if (shortage.rows.isEmpty()) { state=State.QUEUED; reason=""; changed(); return; }
+            if (shortage.rows.isEmpty()) { reason=""; materialsAvailable(); return; }
         }
         state=State.MISSING;
         revision++; changed(); notify(actor,"missing");
@@ -1127,7 +1378,7 @@ final class BuildTask {
             }
         }
         reason = "";
-        if (state == State.REFUND) {
+        if (state == State.REFUND || state == State.DONE) {
             if (order.link != null) order.link.cancel();
             clearOrder();
         } else order.tick(net, online);
@@ -1182,25 +1433,26 @@ final class BuildTask {
     }
 
     private void deposit(Wireless net, Materials from) {
+        deposit(net, from, true);
+    }
+
+    private void deposit(Wireless net, Materials from, boolean updateRevision) {
         for (Materials.Entry e : new ArrayList<>(from.rows.values())) {
             int accepted = net.refund(e);
             if (accepted > 0) {
                 from.add(e.item, -accepted);
-                revision++;
+                if (updateRevision) revision++;
                 changed();
             }
         }
     }
 
     void cancel(EntityPlayerMP actor, WorldServer world) {
-        // In REFUND the existing GUI uses cancel again as its retry action. Preserve the requested
-        // return-to-build intent there, while explicit deletion/dismantling always takes precedence.
         if (state!=State.REFUND || deleteRequested || dismantleRequested) upgradeReturnToBuild=false;
         cancelForRefund(actor,world);
     }
 
     private void cancelForRefund(EntityPlayerMP actor, WorldServer world) {
-        boolean manualRecovery = state == State.REFUND && key.isEmpty();
         if (state != State.REFUND) {
             state = State.REFUND;
             previewLayers = 0;
@@ -1215,16 +1467,12 @@ final class BuildTask {
             releaseUpgradePhaseData();
             changed();
         }
-        if (manualRecovery && savedLink == null) {
-            recover(actor);
-            revision++;
-            changed();
-        }
         if (world != null && actor.worldObj == world) retryRefund(actor, world);
     }
 
     void retryRefund(EntityPlayerMP actor, WorldServer world) {
         if (!recoverUpgrade(world)) return;
+        returnBackpack(actor);
         if (!upgradeNetwork.isEmpty() && !upgradeNetwork.equals(key)) {
             reason="upgradeNetwork"; changed(); return;
         }
@@ -1238,17 +1486,17 @@ final class BuildTask {
             if (savedLink != null) return;
         }
         String status = "";
-        if (hasReserved()) {
+        if (!held.rows.isEmpty() || !salvage.rows.isEmpty()) {
             Wireless net = Wireless.find(this, world, actor);
             status = depositProblem(net, !salvage.rows.isEmpty());
+            if (status.equals("network")) status = "refundNetwork";
             if (status.isEmpty()) {
-                if (upgrading()) deposit(net, salvage);
                 deposit(net, held);
-                deposit(net, backpack);
                 deposit(net, salvage);
-                if (hasReserved()) status = "refundSpace";
+                if (!held.rows.isEmpty() || !salvage.rows.isEmpty()) status = "refundSpace";
             }
         }
+        if (status.isEmpty() && !backpack.rows.isEmpty()) status = "refundBagSpace";
         if (!reason.equals(status)) {
             reason = status;
             changed();
@@ -1283,14 +1531,14 @@ final class BuildTask {
     }
 
     private void returnBackpack(EntityPlayerMP actor) {
-        for (Materials.Entry e : new ArrayList<>(backpack.rows.values()))
-            backpack.add(e.item, -giveToInventory(actor, e.item, e.count));
-    }
-
-    void recover(EntityPlayerMP actor) {
-        returnBackpack(actor);
-        for (Materials.Entry e : new ArrayList<>(held.rows.values()))
-            held.add(e.item, -giveToInventory(actor, e.item, e.count));
+        for (Materials.Entry e : new ArrayList<>(backpack.rows.values())) {
+            int moved = giveToInventory(actor, e.item, e.count);
+            if (moved > 0) {
+                backpack.add(e.item, -moved);
+                revision++;
+                changed();
+            }
+        }
     }
 
     void requestDismantle(EntityPlayerMP actor, WorldServer world) {
@@ -1401,14 +1649,13 @@ final class BuildTask {
     void finish(EntityPlayerMP actor, WorldServer world) {
         if (!upgradeNetwork.isEmpty() && !upgradeNetwork.equals(key)) { reason="upgradeNetwork"; changed(); return; }
         if (upgrading() && !salvage.rows.isEmpty() && !returnSalvage(Wireless.find(this,world,actor),world)) return;
-        refund(Wireless.find(this, world, actor));
-        returnBackpack(actor);
         funding.clear();
         confirmed = new BitSet();
         issue = null;
         state = State.DONE;
         previewLayers = 0;
         reason = "";
+        retryRefund(actor, world);
         changed();
         notify(actor, upgrading() ? "upgraded" : "done");
         discardCachedPlan();
@@ -1650,6 +1897,15 @@ final class BuildTask {
     NBTTagCompound save() {
         NBTTagCompound n = new NBTTagCompound();
         if (ledger.count > 0) n.setTag("placements", ledger.save());
+        if (structureCells != null) n.setTag("structureCells", saveStructureCells());
+        if (!manualHatches.isEmpty()) {
+            int[] positions = new int[manualHatches.size() * 3];
+            int i = 0;
+            for (ChunkCoordinates p : manualHatches) {
+                positions[i++] = p.posX; positions[i++] = p.posY; positions[i++] = p.posZ;
+            }
+            n.setIntArray("manualHatches", positions);
+        }
         n.setBoolean("deleteRequested",deleteRequested);
         n.setBoolean("dismantleRequested",dismantleRequested);
         n.setString("id", id);
@@ -1662,6 +1918,7 @@ final class BuildTask {
         n.setInteger("z", z);
         n.setInteger("facing", facing.getIndex());
         n.setBoolean("existing", existing);
+        if (temporaryHost) n.setBoolean("temporaryHost", true);
         if (upgrading()) {
             NBTTagList scope=new NBTTagList();
             n.setBoolean("exactReplacement", true);
@@ -1688,6 +1945,7 @@ final class BuildTask {
         n.setString("detail", detail);
         if (issue != null) n.setIntArray("issue", new int[]{issue.posX, issue.posY, issue.posZ});
         n.setBoolean("auto", auto);
+        if (checkMaterialsOnly && state == State.SCANNING) n.setBoolean("checkMaterialsOnly", true);
         n.setBoolean("received", received);
         n.setInteger("tier", tier);
         n.setBoolean("useSurvivalConstruct", useSurvivalConstruct);
@@ -1732,7 +1990,12 @@ final class BuildTask {
                         n.getInteger("z"),
                         ExtendedFacing.byIndex(n.getInteger("facing")),
                         n.getBoolean("existing"));
+        t.temporaryHost = t.existing && n.getBoolean("temporaryHost");
         t.ledger.load(n.getCompoundTag("placements"));
+        if (n.hasKey("structureCells", 9)) t.loadStructureCells(n.getTagList("structureCells", 10));
+        int[] positions = n.getIntArray("manualHatches");
+        for (int i = 0; i + 2 < positions.length; i += 3)
+            t.manualHatches.add(new ChunkCoordinates(positions[i], positions[i + 1], positions[i + 2]));
         t.deleteRequested = n.getBoolean("deleteRequested");
         t.dismantleRequested = n.getBoolean("dismantleRequested");
         t.key = n.getString("key");
@@ -1781,6 +2044,7 @@ final class BuildTask {
             } catch (NumberFormatException ignored) {}
         }
         t.auto = n.getBoolean("auto");
+        t.checkMaterialsOnly = n.getBoolean("checkMaterialsOnly");
         t.received = n.getBoolean("received");
         t.tier = n.getInteger("tier");
         t.previewLayers = n.getByte("previewLayers") & 7;
@@ -1823,6 +2087,7 @@ final class BuildTask {
         boolean savedSource = n.getBoolean("useSurvivalConstruct");
         if (t.state == State.DRAFT || t.state == State.PREVIEW) {
             if (t.useSurvivalConstruct != savedSource) {
+                t.structureCells = null;
                 t.confirmed = new BitSet();
                 t.pending.clear();
                 t.cursor = t.placed = t.total = 0;

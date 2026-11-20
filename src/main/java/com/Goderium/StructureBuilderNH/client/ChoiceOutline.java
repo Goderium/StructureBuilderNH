@@ -1,10 +1,10 @@
 package com.Goderium.StructureBuilderNH.client;
 
-/** Cache-time outlines of editable voxel regions; ordinary/fixed preview cells are not included. */
+/** Cache-time outlines of contiguous voxel regions with a shared type. */
 final class ChoiceOutline {
     interface Voxels {
         /**
-         * Zero means no editable voxel. Other values identify material AND group, including an air option.
+         * Zero means no visible voxel. Equal nonzero values form a region.
          * IDs must compare equally across sections. Coordinates are local and range from -1 through 16;
          * a query can cross two section faces at once, so looking up only six face neighbours is insufficient.
          */
@@ -22,22 +22,21 @@ final class ChoiceOutline {
 
     /**
      * Emits each geometric edge once, merging consecutive collinear units within this section.
-     * Bits use slot = x | z << 4 | y << 8 and contain all local editable candidates, including air.
+     * Occupancy and hidden bits use slot = x | z << 4 | y << 8.
      * Empty sections do not allocate scratch storage or call the sampler. Nonempty sections use 3.4 KiB
      * of temporary primitive masks, with no per-voxel/edge objects. Call only when rebuilding a cache.
      * Changes at a boundary must invalidate sections sharing that face or edge (up to 18 neighbours).
      */
-    static void emit(long[] editable, Voxels voxels, Segment sink) {
-        if (editable == null) return;
-        int words = Math.min(64, editable.length);
+    static void emit(long[] occupied, long[] hidden, Voxels voxels, Segment sink) {
+        int words = occupied.length;
         boolean any = false;
         for (int word = 0; word < words; word++)
-            if (editable[word] != 0) { any = true; break; }
+            if ((occupied[word] & ~hidden[word]) != 0) { any = true; break; }
         if (!any) return;
 
         int[] lines = new int[3 * LINES];
         for (int word = 0; word < words; word++)
-            for (long bits = editable[word]; bits != 0; bits &= bits - 1) {
+            for (long bits = occupied[word] & ~hidden[word]; bits != 0; bits &= bits - 1) {
                 int slot = word * 64 + Long.numberOfTrailingZeros(bits);
                 int x = slot & 15, y = slot >>> 8, z = slot >>> 4 & 15;
                 candidates(lines, 0, x, y, z);

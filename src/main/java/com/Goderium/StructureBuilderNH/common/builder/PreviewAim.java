@@ -16,6 +16,13 @@ public final class PreviewAim {
 
     private PreviewAim() {}
 
+    /** Break same-voxel ties identically on both sides, after the ray has determined distance. */
+    public static boolean prefer(boolean owned, String id, boolean previousOwned, String previousId, String selected) {
+        if (owned != previousOwned) return owned;
+        if (owned && !id.equals(previousId) && (id.equals(selected) || previousId.equals(selected))) return id.equals(selected);
+        return id.compareTo(previousId) < 0;
+    }
+
     public static ChunkCoordinates first(EntityPlayer player, VoxelTest selectable) {
         // Forge 1.7 uses different player position origins on the client and the server.
         double eyeY = player.posY + player.getEyeHeight()

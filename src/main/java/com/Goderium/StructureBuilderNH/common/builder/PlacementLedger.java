@@ -150,15 +150,20 @@ final class PlacementLedger {
             return true;
         });
         try {
-            block.onBlockHarvested(world, x, y, z, meta, actor);
-            if (!block.removedByPlayer(world, actor, x, y, z, !creative)) return false;
-            block.onBlockDestroyedByPlayer(world, x, y, z, meta);
-            if (!creative) block.harvestBlock(world, actor, x, y, z, meta);
-            return true;
+            return harvestBlock(actor, world, x, y, z, block, meta);
         } finally {
             if (previous == null) WorldHooks.DISMANTLE_DROPS.remove();
             else WorldHooks.DISMANTLE_DROPS.set(previous);
         }
+    }
+
+    static boolean harvestBlock(EntityPlayerMP actor, WorldServer world, int x, int y, int z, Block block, int meta) {
+        boolean harvest = !actor.capabilities.isCreativeMode;
+        block.onBlockHarvested(world, x, y, z, meta, actor);
+        if (!block.removedByPlayer(world, actor, x, y, z, harvest)) return false;
+        block.onBlockDestroyedByPlayer(world, x, y, z, meta);
+        if (harvest) block.harvestBlock(world, actor, x, y, z, meta);
+        return true;
     }
 
     ChunkCoordinates next() {
