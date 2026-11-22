@@ -1,5 +1,7 @@
 package com.Goderium.StructureBuilderNH.client;
 
+import com.Goderium.StructureBuilderNH.common.builder.StructureFluids;
+
 import bartworks.common.blocks.BWBlocksGlass;
 import gregtech.api.GregTechAPI;
 import gregtech.api.enums.Dyes;
@@ -14,6 +16,7 @@ import gregtech.api.util.GlassTier;
 import gregtech.common.blocks.BlockCasingsAbstract;
 import gregtech.common.blocks.BlockDecorativeFrame;
 import gregtech.common.blocks.BlockFrameBox;
+import gregtech.common.blocks.BlockMachines;
 import gregtech.common.render.GTRenderedTexture;
 import gregtech.common.render.GTCopiedBlockTextureRender;
 
@@ -78,6 +81,8 @@ final class BlockPreviewTextures {
         final int meta;
         final boolean opaque;
         final boolean glass, frame, fence, translucent, worldIcon;
+        final boolean browserSolidSurface;
+        final PreviewFluid fluid;
         final Layer[][] faces;
 
         Appearance(Block block, int meta, boolean opaque, Layer[][] faces) {
@@ -86,18 +91,32 @@ final class BlockPreviewTextures {
 
         Appearance(Block block, int meta, boolean opaque, Layer[][] faces, boolean glass, boolean frame,
                 boolean translucent, boolean worldIcon) {
+            this(block, meta, opaque, faces, glass, frame, translucent, worldIcon, null);
+        }
+
+        Appearance(Block block, int meta, boolean opaque, Layer[][] faces, boolean glass, boolean frame,
+                boolean translucent, boolean worldIcon, PreviewFluid fluid) {
             this.block = block;
             this.meta = meta;
             this.opaque = opaque;
             this.faces = faces;
             this.glass = glass;
+            this.fluid = fluid;
             this.frame = frame;
             this.fence = isFence(block);
             this.translucent = translucent;
+            browserSolidSurface = translucent && !glass && fluid == null && block != null
+                    && PreviewCubeProfiles.amberSurface(block, meta);
             this.worldIcon = worldIcon;
         }
 
         boolean textured() { return faces != null; }
+
+        boolean hasGlowOverlay(int side) {
+            if (!opaque || fluid != null) return false;
+            Layer[] layers = faces[SIDES[side]];
+            return layers.length > 1 && layers[layers.length - 1].fullBright;
+        }
     }
 
     static Appearance get(int id, int meta, int machine) {
@@ -127,9 +146,15 @@ final class BlockPreviewTextures {
         return block instanceof BlockFence && block.getRenderType() == 11 && block.getRenderBlockPass() == 0;
     }
 
+    private static boolean isGlass(Block block, int meta, boolean opaque) {
+        return block instanceof BWBlocksGlass || !opaque && block.getMaterial() == Material.glass
+                || GlassTier.getGlassBlockTier(block, meta) != null;
+    }
+
     private static Appearance resolve(Block block, int meta) {
         if (block == null || block == Blocks.air) return FALLBACK;
         try {
+            if (StructureFluids.isFluid(block)) return PreviewFluid.resolve(block, meta);
             // GT casings/coils and BW glass use custom render IDs despite being complete cubes.
             boolean casing = block instanceof BlockCasingsAbstract;
             boolean frame = block instanceof BlockFrameBox || block instanceof BlockDecorativeFrame;
@@ -138,8 +163,7 @@ final class BlockPreviewTextures {
                 return FALLBACK;
             if (block instanceof BlockFrameBox) meta &= BlockFrameBox.MATERIAL_MASK;
             boolean opaque = block.isOpaqueCube();
-            boolean glass = block instanceof BWBlocksGlass || GlassTier.getGlassBlockTier(block, meta) != null
-                    || !opaque && block.getMaterial() == Material.glass;
+            boolean glass = isGlass(block, meta, opaque);
             boolean fence = isFence(block);
             if (!casing && !frame && !glass && !fence && !(block instanceof BlockBreakable)
                     && !block.renderAsNormalBlock() && !PreviewCubeProfiles.cube(block, meta)) return FALLBACK;
@@ -233,15 +257,36 @@ final class BlockPreviewTextures {
         }
     }
 
-    private static boolean valid(IIcon icon) {
+    static boolean valid(IIcon icon) {
         float u0 = icon.getMinU(), u1 = icon.getMaxU(), v0 = icon.getMinV(), v1 = icon.getMaxV();
         return Float.isFinite(u0) && Float.isFinite(u1) && Float.isFinite(v0) && Float.isFinite(v1)
                 && u0 >= 0 && u1 <= 1 && v0 >= 0 && v1 <= 1 && u0 < u1 && v0 < v1;
     }
 
     static boolean occludes(Appearance neighbor, Appearance current) {
-        if (neighbor.frame || neighbor.fence) return false;
+        if (neighbor.fluid != null) return current.fluid != null && current.fluid.matches(current.block, neighbor.block);
+        if (neighbor.frame) return current.frame;
+        if (neighbor.fence) return false;
         return neighbor.opaque || current.textured() && neighbor.block == current.block && neighbor.meta == current.meta;
+    }
+
+    /** Connected frames omit their internal faces. Keep a solid backing face visible through a cutout. */
+    static boolean worldOccludes(Appearance neighbor, Appearance current) {
+        if (neighbor.fluid != null) return current.fluid != null && current.fluid.matches(current.block, neighbor.block);
+        if (neighbor.frame) return current.frame;
+        if (neighbor.fence) return false;
+        if (neighbor.glass) return current.glass && neighbor.block == current.block && neighbor.meta == current.meta;
+        // Passive GT machine appearances have six complete sides. Legacy frame MTEs are flagged above.
+        return neighbor.opaque || neighbor.block instanceof BlockMachines;
+    }
+
+    static boolean worldOccludes(Block installed, int meta, Appearance current) {
+        if (installed == null || installed == Blocks.air) return false;
+        if (current.fluid != null && current.fluid.matches(current.block, installed)) return true;
+        if (current.frame && (installed instanceof BlockFrameBox || installed instanceof BlockDecorativeFrame)) return true;
+        if (current.glass && current.block == installed && current.meta == meta) return true;
+        // Some registered tiered glasses share an otherwise opaque block ID with normal casings.
+        return installed.isOpaqueCube() && !isGlass(installed, meta, true);
     }
 
     static int nativeSide(int side) { return SIDES[side]; }
@@ -252,9 +297,20 @@ final class BlockPreviewTextures {
 
     static void face(Tessellator tessellator, Appearance appearance, int side, int slot, int alpha,
             IBlockAccess access, int worldX, int worldY, int worldZ) {
+        if (appearance.fluid != null) {
+            appearance.fluid.face(RENDERER, tessellator, appearance, side, slot, alpha, access, worldX, worldY, worldZ);
+            return;
+        }
+        faceLayers(tessellator, appearance, side, slot, alpha, access, worldX, worldY, worldZ, 0,
+                appearance.faces[SIDES[side]].length);
+    }
+
+    static void faceLayers(Tessellator tessellator, Appearance appearance, int side, int slot, int alpha,
+            IBlockAccess access, int worldX, int worldY, int worldZ, int first, int end) {
         int nativeSide = SIDES[side];
         int x = slot & 15, y = slot >> 8, z = slot >> 4 & 15;
-        for (Layer layer : appearance.faces[nativeSide]) {
+        for (int i = first; i < end; i++) {
+            Layer layer = appearance.faces[nativeSide][i];
             shade(tessellator, layer, side, alpha);
             IIcon icon = layer.icon;
             if (access != null) {
@@ -283,7 +339,11 @@ final class BlockPreviewTextures {
     }
 
     static void shade(Tessellator tessellator, Layer layer, int side, int alpha) {
-        int color = layer.color, light = layer.fullBright ? 100 : SHADE[side];
+        shade(tessellator, layer.color, layer.fullBright, side, alpha);
+    }
+
+    static void shade(Tessellator tessellator, int color, boolean fullBright, int side, int alpha) {
+        int light = fullBright ? 100 : SHADE[side];
         color = ((color >> 16 & 255) * light / 100 << 16)
                 | ((color >> 8 & 255) * light / 100 << 8) | (color & 255) * light / 100;
         tessellator.setColorRGBA_I(color, alpha);

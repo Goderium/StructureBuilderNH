@@ -10,11 +10,10 @@ import cpw.mods.fml.common.FMLCommonHandler;
 import cpw.mods.fml.common.Mod;
 import cpw.mods.fml.common.SidedProxy;
 import cpw.mods.fml.common.event.FMLInitializationEvent;
+import cpw.mods.fml.common.event.FMLPostInitializationEvent;
 import cpw.mods.fml.common.event.FMLPreInitializationEvent;
 import cpw.mods.fml.common.event.FMLServerStoppingEvent;
 import cpw.mods.fml.common.registry.GameRegistry;
-
-import gregtech.api.enums.ItemList;
 
 import net.minecraft.item.ItemStack;
 import net.minecraftforge.common.ForgeChunkManager;
@@ -57,8 +56,12 @@ public class StructureBuilderNH {
             GameRegistry.addShapelessRecipe(
                     new ItemStack(BuilderItem.ITEM),
                     terminal,
-                    ItemList.Energy_LapotronicOrb2.get(1),
                     StructureLibAPI.getDefaultHologramItem());
+    }
+
+    @Mod.EventHandler
+    public void postInit(FMLPostInitializationEvent event) {
+        TerminalCardRecipe.register();
     }
 
     @Mod.EventHandler

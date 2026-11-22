@@ -38,7 +38,8 @@ import java.util.function.Consumer;
 
 /** A GUI-owned read-only blueprint. No tasks, chunk tickets, world queries or material reservations. */
 public final class BrowserSession implements AutoCloseable {
-    private static final long CAPTURE_NANOS = 2_000_000L;
+    private static final long CAPTURE_NANOS = 8_000_000L;
+    private static final int FRAMES_PER_TICK = 8, BYTES_PER_TICK = 228_000;
     private static final int CACHE_CELLS = 65536;
     private final UUID id = UUID.randomUUID();
     private final EntityPlayerMP player;
@@ -147,7 +148,11 @@ public final class BrowserSession implements AutoCloseable {
             if (!header) sendHeader(true);
             if (!borrowed && !plan.ready) {
                 ChannelProbe.begin(observed);
-                try { plan.advance(Math.min(deadline, System.nanoTime() + CAPTURE_NANOS / 2)); }
+                try {
+                    long captureDeadline = Math.min(deadline, System.nanoTime() + CAPTURE_NANOS / 2);
+                    for (int batch = 0; batch < 4 && !plan.ready && System.nanoTime() < captureDeadline; batch++)
+                        plan.advance(captureDeadline);
+                }
                 finally { ChannelProbe.end(); }
             }
             observed.addAll(plan.browserChannels.observed());
@@ -170,7 +175,7 @@ public final class BrowserSession implements AutoCloseable {
                 sendHeader(false);
             }
             int frames = 0, bytes = 0;
-            while (frames < 2 && bytes < 57000) {
+            while (frames < FRAMES_PER_TICK && bytes < BYTES_PER_TICK) {
                 if (outbound.isEmpty()) {
                     if (System.nanoTime() >= deadline) break;
                     int dirty = dirtySections.nextSetBit(dirtyCursor);
@@ -184,8 +189,9 @@ public final class BrowserSession implements AutoCloseable {
                         if (outbound.isEmpty()) break;
                     } else break;
                 }
-                BrowserPacket next = outbound.pollFirst();
-                if (next == null) break;
+                BrowserPacket next = outbound.peekFirst();
+                if (next == null || bytes + next.wireBytes > BYTES_PER_TICK) break;
+                outbound.removeFirst();
                 sender.accept(next);
                 bytes += next.wireBytes;
                 if (next.completedSection >= 0 && !emittedSections.get(next.completedSection)) {
@@ -297,8 +303,7 @@ public final class BrowserSession implements AutoCloseable {
             Integer local = localIds.get(materialId);
             if (local == null) { palette.add(materialId); local = palette.size(); localIds.put(materialId, local); }
             p.materialSlots[slot] = local.shortValue();
-            ItemStack item = cell.choice == null ? cell.item : cell.choice.optionItem(option);
-            boolean air = cell.choice == null ? cell.air : item == null;
+            boolean air = cell.choice == null ? cell.air : cell.choice.isAir(option);
             long bit = 1L << (slot & 63);
             if (air) { view.solid[slot >> 6] &= ~bit; view.optional[slot >> 6] |= bit; }
             else view.solid[slot >> 6] |= bit;
@@ -321,9 +326,10 @@ public final class BrowserSession implements AutoCloseable {
     private BrowserPacket.Material material(Blueprint.Cell cell, int option, int id, List<BrowserPacket.Group> added) {
         BrowserPacket.Material m = new BrowserPacket.Material();
         m.id = id; m.piece = cell.piece; m.symbol = cell.symbol;
-        m.item = ItemStack.copyItemStack(cell.choice == null ? cell.item : cell.choice.optionItem(option));
+        boolean fluidChoice = cell.choice != null && cell.choice.isFluid(option);
+        m.item = ItemStack.copyItemStack(cell.choice == null ? cell.item : fluidChoice ? null : cell.choice.optionItem(option));
         if (m.item != null) m.item.stackSize = 1;
-        m.air = cell.choice == null ? cell.air : m.item == null;
+        m.air = cell.choice == null ? cell.air : cell.choice.isAir(option);
         m.hatch = cell.hatch; m.dots = cell.dots;
         if (cell.hatch) m.hatchKeys = hatchTypes.resolve(cell.element, plan.controller);
         m.channels = plan.browserChannels.names(cell);
@@ -336,7 +342,8 @@ public final class BrowserSession implements AutoCloseable {
             m.group = group;
         }
         if (!m.air) {
-            try { m.render = appearance(cell, m.item, cell.choice != null); }
+            try { m.render = fluidChoice ? render(cell.choice.optionBlock(option), cell.choice.optionMeta(option), -1, -1)
+                    : appearance(cell, m.item, cell.choice != null); }
             catch (RuntimeException | LinkageError unsupported) { /* Keep semantic/color fallback. */ }
         }
         return m;
@@ -349,7 +356,7 @@ public final class BrowserSession implements AutoCloseable {
         g.groupSelectable = choice.groupSelectable();
         if (choice.optionCount() > 4096) throw new IllegalArgumentException("Too many browser candidates");
         g.options = new ItemStack[choice.optionCount()];
-        for (int i = 0; i < g.options.length; i++) g.options[i] = ItemStack.copyItemStack(choice.optionItem(i));
+        for (int i = 0; i < g.options.length; i++) g.options[i] = ItemStack.copyItemStack(choice.displayItem(i));
         return g;
     }
 

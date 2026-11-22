@@ -1,6 +1,16 @@
 repositories {
     mavenCentral()
     maven {
+        url = 'https://cursemaven.com/'
+        content { includeGroup 'curse.maven' }
+        metadataSources { artifact() }
+    }
+    maven {
+        url = 'https://maven.ic2.player.to/'
+        content { includeGroup 'net.industrial-craft' }
+        metadataSources { artifact() }
+    }
+    maven {
         name = 'GTNH Maven'
         url = 'https://nexus.gtnewhorizons.com/repository/public/'
     }

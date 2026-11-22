@@ -1,7 +1,10 @@
 // Fixed compile-time APIs; GTNH supplies these mods at runtime.
 // Dependencies are downloaded from repositories.gradle, not bundled into this mod.
 dependencies {
+    compileOnly(rfg.deobf('curse.maven:cofh-core-69162:2388751')) { transitive = false }
+    compileOnly('net.industrial-craft:industrialcraft-2:2.2.828-experimental:dev') { transitive = false }
     compileOnly('com.github.GTNewHorizons:GT5-Unofficial:5.09.54.265:dev') { transitive = false }
+    compileOnly('com.github.GTNewHorizons:Galacticraft:3.4.37-GTNH:dev') { transitive = false }
     compileOnly('com.github.GTNewHorizons:Applied-Energistics-2-Unofficial:rv3-beta-1095-GTNH:dev') { transitive = false }
     compileOnly('com.github.GTNewHorizons:Chisel:2.17.34-GTNH:dev') { transitive = false }
     compileOnly('com.github.GTNewHorizons:StructureLib:1.4.46:dev') { transitive = false }

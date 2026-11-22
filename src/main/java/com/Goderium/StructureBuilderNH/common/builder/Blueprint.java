@@ -24,7 +24,6 @@ import gregtech.common.blocks.ItemMachines;
 
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockBeacon;
-import net.minecraft.block.BlockLiquid;
 import net.minecraft.entity.player.EntityPlayer;
 import net.minecraft.init.Blocks;
 import net.minecraft.item.*;
@@ -36,7 +35,6 @@ import net.minecraft.util.IChatComponent;
 import net.minecraft.world.*;
 import net.minecraft.world.chunk.*;
 import net.minecraftforge.common.util.ForgeDirection;
-import net.minecraftforge.fluids.IFluidBlock;
 
 import java.util.*;
 import java.util.function.IntPredicate;
@@ -76,6 +74,7 @@ public final class Blueprint extends GTDummyWorld {
     private boolean wroteAir;
     private TileEntity host, tile;
     boolean ready;
+    int solidityRevision;
 
     static final class Section {
         final int x, y, z, id;
@@ -84,6 +83,7 @@ public final class Blueprint extends GTDummyWorld {
         final long[] solid = new long[64], hatch = new long[64];
         final long[] confirmed = new long[64];
         private BitSet airChoiceSlots;
+        BitSet fluidSlots;
 
         Section(int x, int y, int z, int id) {
             this.x = x;
@@ -110,7 +110,7 @@ public final class Blueprint extends GTDummyWorld {
         final int dots;
         ForgeDirection front = ForgeDirection.UNKNOWN;
         MaterialChoice choice;
-        private boolean previewFluid;
+        private final boolean previewFluid;
         private PieceInputs inputs;
         String piece = "";
         String role = "";
@@ -132,7 +132,8 @@ public final class Blueprint extends GTDummyWorld {
 
         Cell(IStructureElement<Object> e, ItemStack s, Block b, int m, boolean a, int dots, boolean nativePredicate) {
             element = e;
-            item = s;
+            previewFluid = StructureFluids.isFluid(b);
+            item = previewFluid || StructureFluids.isFluidItem(s) ? null : s;
             block = b;
             inscribedRitual = isInscribedRitual(b, m);
             meta = m;
@@ -249,7 +250,7 @@ public final class Blueprint extends GTDummyWorld {
             int b,
             int c,
             IStructureWalker<T> walker) {
-        capture(elements, facing, px, py, pz, a, b, c, walker, controller, trigger, false);
+        capture(elements, facing, px, py, pz, a, b, c, walker, controller, trigger);
     }
 
     public <T> void captureSurvival(IStructureElement<T>[] elements, ExtendedFacing facing, int px, int py, int pz,
@@ -260,11 +261,11 @@ public final class Blueprint extends GTDummyWorld {
             element.placeBlock(context, world, x, y, z, snapshot);
             return true;
         };
-        capture(elements, facing, px, py, pz, a, b, c, sampler, context, snapshot, true);
+        capture(elements, facing, px, py, pz, a, b, c, sampler, context, snapshot);
     }
 
     private <T> void capture(IStructureElement<T>[] elements, ExtendedFacing facing, int px, int py, int pz,
-            int a, int b, int c, IStructureWalker<T> walker, Object context, ItemStack pieceTrigger, boolean survival) {
+            int a, int b, int c, IStructureWalker<T> walker, Object context, ItemStack pieceTrigger) {
         try {
             bounds = bounds.union(ShapeRegistry.bounds(elements, facing, px, py, pz, a, b, c));
         } catch (IllegalStateException unknown) {
@@ -274,7 +275,7 @@ public final class Blueprint extends GTDummyWorld {
         PieceInputs inputs = pieceInputs(context, pieceTrigger);
         int scope = shape == null ? 0 : inputs.shapeScopes.computeIfAbsent(shape,
                 value -> pieceScopes.merge(value.piece, 1, Integer::sum) - 1);
-        pieces.add(new Piece<>(elements, facing, px, py, pz, a, b, c, walker, scope, inputs, survival));
+        pieces.add(new Piece<>(elements, facing, px, py, pz, a, b, c, walker, scope, inputs));
     }
 
     private PieceInputs pieceInputs(Object context, ItemStack trigger) {
@@ -308,7 +309,6 @@ public final class Blueprint extends GTDummyWorld {
         final int[] abc, xyz = new int[3];
         final IStructureWalker<T> walker;
         final PieceInputs inputs;
-        final boolean survival;
         final ShapeRegistry.Shape shape;
         final IStructureDefinition<?> definition;
         final int scope;
@@ -323,13 +323,12 @@ public final class Blueprint extends GTDummyWorld {
                 int a,
                 int b,
                 int c,
-                IStructureWalker<T> w, int scope, PieceInputs inputs, boolean survival) {
+                IStructureWalker<T> w, int scope, PieceInputs inputs) {
             elements = e;
             shape = ShapeRegistry.get(e);
             definition = shape == null ? null : shape.definition();
             this.scope = scope;
             this.inputs = inputs;
-            this.survival = survival;
             facing = f;
             this.x = x;
             this.y = y;
@@ -407,15 +406,12 @@ public final class Blueprint extends GTDummyWorld {
         }
         boolean nativePredicate = predicateCache.computeIfAbsent(e, MaterialChoice::hasNativePredicate);
         // The construction default can be air even when the native structure predicate rejects it.
-        boolean air = allowsAir(e) || wroteAir && sample == Blocks.air
-                && e.couldBeValid(inputs.context, this, px, py, pz, inputs.trigger);
+        boolean sampledFluid = StructureFluids.isFluid(sample);
+        boolean air = !sampledFluid && (allowsAir(e) || wroteAir && sample == Blocks.air
+                && e.couldBeValid(inputs.context, this, px, py, pz, inputs.trigger));
         ItemStack item = null;
         ItemStack constructedItem = null;
-        // Survival readers can describe working fluids as structure pieces. Keep the block for
-        // rendering without treating a registered technical ItemBlock as obtainable material.
-        boolean previewFluid = walk.survival && !air && !(e instanceof IStructureElementChain)
-                && (sample instanceof IFluidBlock || sample instanceof BlockLiquid);
-        if (!air && !previewFluid) {
+        if (!air && !sampledFluid) {
             if (tile instanceof IGregTechTileEntity
                     && ((IGregTechTileEntity) tile).getMetaTileEntity() != null)
                 item = ((IGregTechTileEntity) tile).getMetaTileEntity().getStackForm(1);
@@ -458,7 +454,8 @@ public final class Blueprint extends GTDummyWorld {
         }
         Block block = sample;
         int blockMeta = meta;
-        if (!air && !previewFluid && nativePredicate) {
+        if (!air && nativePredicate && (!sampledFluid
+                || !e.couldBeValid(inputs.context, this, px, py, pz, inputs.trigger))) {
             if (!inputs.materialDefaults.containsKey(e))
                 inputs.materialDefaults.put(e, MaterialChoice.nativeDefault(
                         this, e, constructedItem, block, blockMeta, px, py, pz, inputs.context, inputs.trigger));
@@ -469,6 +466,12 @@ public final class Blueprint extends GTDummyWorld {
                 blockMeta = material.meta;
             }
         }
+        if ((block == Blocks.air || block == StructureLibAPI.getBlockHint()) && item != null
+                && StructureFluids.isFluid(Block.getBlockFromItem(item.getItem()))) {
+            block = Block.getBlockFromItem(item.getItem());
+            blockMeta = item.getItem().getMetadata(item.getMetadata());
+        }
+        if (StructureFluids.isFluid(block)) item = null;
         // Inscribed ritual stones have no obtainable item variant. Charge a blank and inscribe after placement.
         if (isInscribedRitual(block, blockMeta))
             item = new ItemStack(block, 1, 0);
@@ -479,7 +482,7 @@ public final class Blueprint extends GTDummyWorld {
         Map<String, Cell> orientedCells = roleCells.computeIfAbsent(front, ignored -> new HashMap<>());
         Cell cell = orientedCells.get(role);
         if (cell == null || cell.element != e || cell.block != block || cell.meta != blockMeta
-                || cell.air != air || cell.previewFluid != previewFluid || !Materials.equal(cell.item, item)) {
+                || cell.air != air || !Materials.equal(cell.item, item)) {
             cell = new Cell(
                     e,
                     item,
@@ -489,17 +492,16 @@ public final class Blueprint extends GTDummyWorld {
                     dots,
                     nativePredicate);
             cell.front = front;
-            cell.previewFluid = previewFluid;
             cell.inputs = inputs;
             cell.piece = piece;
             cell.role = role;
             cell.symbol = symbol;
-            if (!previewFluid && !choiceCache.containsKey(role)) {
+            if (!choiceCache.containsKey(role)) {
                 MaterialChoice group = MaterialChoice.discover(this, cell, px, py, pz, inputs.context, inputs.trigger);
                 choiceCache.put(role, group);
                 if (group != null) choices.add(group);
             }
-            if (!previewFluid) cell.choice = choiceCache.get(role);
+            cell.choice = choiceCache.get(role);
             inputs.last.put(e, cell);
             orientedCells.put(role, cell);
         }
@@ -614,7 +616,6 @@ public final class Blueprint extends GTDummyWorld {
             combined.front = hatch.hatch ? hatch.front : primary.front;
             if (hatch.hatch) combined.hatchSource = hatch.hatchSource == null ? hatch : hatch.hatchSource;
             combined.inputs = primary.inputs;
-            combined.previewFluid = primary.previewFluid;
             combined.piece = primary.piece;
             combined.role = primary.role;
             combined.symbol = primary.symbol;
@@ -623,6 +624,7 @@ public final class Blueprint extends GTDummyWorld {
             cell = combined;
         }
         s.cells[i] = cell;
+        setFluid(s, i, cell.isFluid());
         browserChannels.put(old, cell);
         if (cell.choice != null) cell.choice.count++;
         else if (cell.item != null) bill.add(cell.item, 1);
@@ -692,7 +694,8 @@ public final class Blueprint extends GTDummyWorld {
             sample = Blocks.air; meta = 0; tile = null; wroteAir = false;
             if (!cell.element.placeBlock(cell.inputs.context, this, px, py, pz, trigger)
                     || sx != px || sy != py || sz != pz || sample == Blocks.air
-                    || sample == StructureLibAPI.getBlockHint() || tile != null || sample.hasTileEntity(meta)) return null;
+                    || sample == StructureLibAPI.getBlockHint() || StructureFluids.isFluid(sample)
+                    || tile != null || sample.hasTileEntity(meta)) return null;
             Block block = sample;
             int blockMeta = meta;
             IStructureElement.BlocksToPlace choices = cell.element.getBlocksToPlace(
@@ -712,21 +715,36 @@ public final class Blueprint extends GTDummyWorld {
         }
     }
 
-    void displayAir(int cursor, boolean air) {
+    private static boolean setFluid(Section section, int slot, boolean fluid) {
+        if (section.fluidSlots == null) {
+            if (!fluid) return false;
+            section.fluidSlots = new BitSet();
+        }
+        if (section.fluidSlots.get(slot) == fluid) return false;
+        section.fluidSlots.set(slot, fluid);
+        return true;
+    }
+
+    void displayChoice(int cursor, boolean air, boolean fluid) {
         int position = positions[cursor], slot = position & 4095;
         Section section = sections.get(position >>> 12);
         long bit = 1L << (slot & 63);
-        section.solid[slot >> 6] = section.solid[slot >> 6] & ~bit | (air ? 0 : bit);
+        long current = section.solid[slot >> 6];
+        long updated = current & ~bit | (air ? 0 : bit);
+        if (setFluid(section, slot, fluid) || current != updated) {
+            section.solid[slot >> 6] = updated;
+            solidityRevision++;
+        }
     }
 
-    boolean accepts(Cell cell, ItemStack item, int px, int py, int pz) {
+    boolean accepts(Cell cell, int option, int px, int py, int pz) {
         int ox = sx, oy = sy, oz = sz, om = meta;
         Block previous = sample;
         TileEntity previousTile = tile;
         try {
             sx = px; sy = py; sz = pz;
-            sample = item == null ? Blocks.air : Block.getBlockFromItem(item.getItem());
-            meta = item == null ? 0 : item.getItem().getMetadata(item.getMetadata());
+            sample = cell.choice.optionBlock(option);
+            meta = cell.choice.optionMeta(option);
             tile = null;
             return matches(cell, this, px, py, pz);
         } finally {

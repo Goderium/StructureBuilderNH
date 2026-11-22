@@ -40,6 +40,7 @@ import net.minecraftforge.common.DimensionManager;
 
 import java.util.*;
 import java.util.function.BooleanSupplier;
+import java.util.function.IntSupplier;
 import java.util.function.Supplier;
 
 final class BuilderGui {
@@ -120,7 +121,9 @@ final class BuilderGui {
             deficits = new ListWidget<>(),
             jobs = new ListWidget<>();
     private final Map<String, String> sentProgress = new HashMap<>();
+    private final Map<String, TerminalLocation> sentLocations = new HashMap<>();
     private final Map<String, QueueLine> lines = new HashMap<>();
+    private boolean queueLayoutDirty;
     private OrdinaryBuildSurvey checkingSite, site, sentSite;
     private int nextSiteCheck;
     private final Map<ItemId, SiteRow> siteRows = new HashMap<>();
@@ -176,7 +179,10 @@ final class BuilderGui {
 
     private static final class QueueLine {
         static final int HEIGHT = 37, CONTENT = TASK_BODY - 10, PROGRESS_Y = 24;
-        final String name, position;
+        final String name;
+        TerminalLocation position;
+        TerminalLocation.Display location;
+        TerminalLocation.Columns columns;
         String phase = "", progress = "";
         int placed, total;
         boolean canDismantle, confirmDismantle, surveyed;
@@ -185,17 +191,15 @@ final class BuilderGui {
                 .left(TASK_BODY + 4).verticalCenter();
         final ButtonWidget<?> body = new ButtonWidget<>().size(TASK_BODY, HEIGHT);
         final TextRenderer renderer = new TextRenderer();
-        final TextRenderer.Line machine, location;
+        final TextRenderer.Line machine;
         TextRenderer.Line status;
         final IDrawable count;
         int barStart, countWidth;
         final Rectangle track = fill(TRACK), bar = fill(0xff73bfaa);
 
-        QueueLine(String name, String position) {
+        QueueLine(String name) {
             this.name = name;
-            this.position = position;
             machine = renderer.line(name);
-            location = renderer.line(position);
             count = IKey.dynamic(() -> progress).color(INK).shadow(false).alignment(Alignment.CenterRight);
         }
 
@@ -210,10 +214,23 @@ final class BuilderGui {
             }
         }
 
+        void setColumns(TerminalLocation.Columns next) {
+            int extra = next.split ? TerminalLocation.Columns.LINE_HEIGHT : 0;
+            boolean resize = (columns != null && columns.split) != next.split;
+            columns = next;
+            location.fit(next);
+            body.markTooltipDirty();
+            if (resize) {
+                body.height(HEIGHT + extra);
+                entry.height(HEIGHT + extra);
+            }
+        }
+
         void draw(GuiContext ctx, int x, int y, int w, int h, WidgetTheme theme) {
-            int left = x + 5, line = y + PROGRESS_Y;
+            int extra = columns != null && columns.split ? TerminalLocation.Columns.LINE_HEIGHT : 0;
+            int left = x + 5, line = y + PROGRESS_Y + extra;
             drawLine(machine, left, y + 2, CONTENT, INK);
-            drawLine(location, left, y + 13, CONTENT, MUTED);
+            if (columns != null) columns.draw(location, left, y + 14, MUTED);
             drawLine(status, left, line, total > 0 ? barStart - 4 : CONTENT, ACCENT);
             if (total <= 0) return;
             int barY = line + 3;
@@ -232,7 +249,8 @@ final class BuilderGui {
         }
 
         String description() {
-            return name + "  " + position + "  " + phase + "  " + (surveyed ? tr("lastSiteCheck") + " " : "") + progress;
+            return name + "  " + (location == null ? "" : location.full) + "  " + phase + "  "
+                    + (surveyed ? tr("lastSiteCheck") + " " : "") + progress;
         }
     }
 
@@ -446,7 +464,11 @@ final class BuilderGui {
                         .nullable()
                         .build();
         sync.syncValue("target", target);
-        StringSyncValue position = str("position", () -> task == null ? "" : location(task));
+        IntSyncValue dimension = integer("dimension", () -> task == null ? 0 : task.dim);
+        IntSyncValue positionX = integer("positionX", () -> task == null ? 0 : task.x);
+        IntSyncValue positionY = integer("positionY", () -> task == null ? 0 : task.y);
+        IntSyncValue positionZ = integer("positionZ", () -> task == null ? 0 : task.z);
+        StringSyncValue dimensionName = str("dimensionName", () -> task == null ? "" : task.dimensionName());
         StringSyncValue facing = str("facing", () -> task == null ? "" : task.facing.getDirection().name());
         StringSyncValue phase =
                 str("phase", () -> task == null ? "pick" : "state." + task.state.name());
@@ -531,10 +553,8 @@ final class BuilderGui {
                         .slot(markerSlot())
                         .pos(EDGE, 9)
                         .tooltip(t -> t.addLine(IKey.str(tr((flags.getIntValue() & LOCKED_MARKER) != 0 ? "markerLocked" : "marker")))));
-        singleLine(main, this::name, 33, 4, 205, 17, INK);
-        label(main, () -> position.getStringValue().isEmpty() ? ""
-                : site(position.getStringValue()) + " | " + tr("facing." + facing.getStringValue()),
-                33, 22, W - EDGE - 33, 12, MUTED);
+        Widget<?> title = singleLine(main, this::name, 33, 4, 205, 17, INK);
+        if (!server()) installPositionHeader(main, title, dimension, dimensionName, positionX, positionY, positionZ, facing);
         button(main, W - EDGE - 63, 5, 63, () -> tr("queue"), "tasks", false);
         rule(main, EDGE, 36, LIST_WIDTH);
         BooleanSupplier settled =
@@ -1008,16 +1028,23 @@ final class BuilderGui {
         return s;
     }
 
+    private IntSyncValue integer(String id, IntSupplier get) {
+        IntSyncValue value = new IntSyncValue(get);
+        sync.syncValue(id, value);
+        return value;
+    }
+
     private Widget<?> label(
             ParentWidget<?> group, Supplier<String> text, int x, int y, int w, int h, int color) {
         return label(group, text, x, y, w, h, color, Alignment.CenterLeft);
     }
 
-    private static void singleLine(ParentWidget<?> group, Supplier<String> text,
+    private static Widget<?> singleLine(ParentWidget<?> group, Supplier<String> text,
             int x, int y, int w, int h, int color) {
         ScrollingTextWidget widget = new ScrollingTextWidget(IKey.dynamic(text)).pos(x, y).size(w, h)
                 .color(color).textAlign(Alignment.CenterLeft).shadow(false);
         group.child(widget);
+        return widget;
     }
 
     private Widget<?> label(
@@ -1122,12 +1149,77 @@ final class BuilderGui {
         return TextRenderer.getFontRenderer().getStringWidth(text);
     }
 
-    private static String location(BuildTask t) {
-        return t.dim + " | " + t.x + ", " + t.y + ", " + t.z;
+    private void installPositionHeader(ParentWidget<?> main, Widget<?> title, IntSyncValue dim, StringSyncValue dimName,
+            IntSyncValue x, IntSyncValue y, IntSyncValue z, StringSyncValue facing) {
+        final int width = W - EDGE - 33;
+        class Header extends Widget<Header> {
+            TerminalLocation source;
+            TerminalLocation.Display display;
+            TerminalLocation.Columns columns;
+            String facingKey = "";
+            boolean split, unicode;
+            long translationTime = -1;
+
+            void refresh() {
+                long revision = StatCollector.getLastTranslationUpdateTimeInMilliseconds();
+                boolean unicodeFont = TextRenderer.getFontRenderer().getUnicodeFlag();
+                boolean reload = revision != translationTime || unicode != unicodeFont;
+                translationTime = revision;
+                unicode = unicodeFont;
+                if (reload) {
+                    source = null;
+                    queueLayoutDirty = true;
+                }
+                if (view.getIntValue() == Page.TASKS.ordinal() && queueLayoutDirty) refreshQueueColumns();
+                if (view.getIntValue() != Page.MAIN.ordinal()) return;
+                if (selectedId.getStringValue().isEmpty()) {
+                    if (display == null) return;
+                    source = null;
+                    display = null;
+                } else {
+                    if (source != null && source.matches(dim.getIntValue(), dimName.getStringValue(),
+                            x.getIntValue(), y.getIntValue(), z.getIntValue()) && facingKey.equals(facing.getStringValue())) return;
+                    source = new TerminalLocation(dim.getIntValue(), dimName.getStringValue(),
+                            x.getIntValue(), y.getIntValue(), z.getIntValue());
+                    facingKey = facing.getStringValue();
+                    columns = new TerminalLocation.Columns(TextRenderer.getFontRenderer(), width, 205);
+                    display = new TerminalLocation.Display(source, facingKey.isEmpty() ? "" : tr("facing." + facingKey), columns.font);
+                    columns.include(display);
+                    columns.finish();
+                    display.fit(columns);
+                }
+                markTooltipDirty();
+                boolean twoLines = display != null && columns.split;
+                if (split != twoLines) {
+                    split = twoLines;
+                    // The upper line stops before the queue button. The lower line can use the entire header.
+                    title.top(split ? 1 : 4).height(split ? 12 : 17);
+                    top(split ? 13 : 22).height(split ? 22 : 12);
+                    if (main.isValid()) main.scheduleResize();
+                }
+            }
+        }
+        Header header = new Header().pos(33, 22).size(width, 12);
+        header.overlay((ctx, left, top, w, h, theme) -> {
+            if (header.display != null) header.columns.draw(header.display, left, top + 1, MUTED);
+        }).tooltipDynamic(t -> {
+            if (header.display != null) t.addLine(IKey.str(header.display.full));
+        });
+        main.child(header);
+        sync.onClientTick(header::refresh);
     }
 
-    private static String site(String location) {
-        return StatCollector.translateToLocalFormatted("structurebuildernh.site", location);
+    private void refreshQueueColumns() {
+        queueLayoutDirty = false;
+        if (lines.isEmpty()) return;
+        TerminalLocation.Columns columns = new TerminalLocation.Columns(TextRenderer.getFontRenderer(), QueueLine.CONTENT, QueueLine.CONTENT);
+        for (QueueLine row : lines.values()) {
+            row.location = new TerminalLocation.Display(row.position, "", columns.font);
+            columns.include(row.location);
+        }
+        columns.finish();
+        for (QueueLine row : lines.values()) row.setColumns(columns);
+        if (jobs.isValid()) jobs.scheduleResize();
     }
 
     private void sendChoice(boolean apply, int index, int revision) {
@@ -1257,7 +1349,7 @@ final class BuilderGui {
                 sync.callSyncedAction("rows", b -> {
                     b.writeByte(8);
                     b.writeBoolean(group.isAir(option));
-                    if (!group.isAir(option)) ByteBufAdapters.ITEM_STACK.serializeSafe(b, group.optionItem(option));
+                    if (!group.isAir(option)) ByteBufAdapters.ITEM_STACK.serializeSafe(b, group.displayItem(option));
                     b.writeVarIntToBuffer(counts[option]);
                 });
             }
@@ -1266,10 +1358,11 @@ final class BuilderGui {
         if (page == Page.TASKS) {
             List<BuildTask> tasks = BuilderTasks.get().list(player(), tool());
             StringBuilder membership = new StringBuilder("queue");
-            for (BuildTask t : tasks) membership.append(t.id);
+            for (BuildTask t : tasks) membership.append('|').append(t.id);
             if (!previous.contentEquals(membership)) {
                 previous = membership.toString();
                 sentProgress.clear();
+                sentLocations.clear();
                 sync.callSyncedAction("rows", b -> b.writeByte(0));
             }
             for (BuildTask t : tasks) {
@@ -1293,16 +1386,19 @@ final class BuilderGui {
                                 + "/"
                                 + (t.ledger.count > 0);
                 String last = sentProgress.put(t.id, progress);
-                if (progress.equals(last)) continue;
+                TerminalLocation old = sentLocations.get(t.id);
+                boolean moved = old == null || !old.matches(t.dim, t.dimensionName(), t.x, t.y, t.z);
+                if (!moved && progress.equals(last)) continue;
+                TerminalLocation position = moved ? new TerminalLocation(t.dim, t.dimensionName(), t.x, t.y, t.z) : old;
+                if (moved) sentLocations.put(t.id, position);
                 sync.callSyncedAction(
                         "rows",
                         b -> {
                             b.writeByte(last == null ? 2 : 3);
                             writeStringSafe(b, t.id);
-                            if (last == null) {
-                                ByteBufAdapters.ITEM_STACK.serializeSafe(b, t.target);
-                                writeStringSafe(b, location(t));
-                            }
+                            if (last == null) ByteBufAdapters.ITEM_STACK.serializeSafe(b, t.target);
+                            else b.writeBoolean(moved);
+                            if (moved) position.write(b);
                             writeStringSafe(
                                     b,
                                     t.state == BuildTask.State.REFUND
@@ -1399,7 +1495,7 @@ final class BuilderGui {
                 MaterialChoice group = task.plan.choices.get(index);
                 int[] quantities = task.effectiveAllocation(group);
                 for (int i = 0; i < quantities.length; i++) {
-                    if (group.isAir(i)) continue;
+                    if (group.isAir(i) || group.isFluid(i)) continue;
                     ItemStack item = group.optionItem(i);
                     ItemId id = ItemId.create(item);
                     ChoiceEntry entry = alternatives.get(id);
@@ -1533,6 +1629,7 @@ final class BuilderGui {
         if (type == 0) {
             siteRows.clear();
             lines.clear();
+            queueLayoutDirty = false;
             jobs.removeAll();
             materials.removeAll();
             deficits.removeAll();
@@ -1569,9 +1666,16 @@ final class BuilderGui {
             QueueLine row;
             if (type == 2) {
                 ItemStack target = ByteBufAdapters.ITEM_STACK.deserializeSafe(b);
-                row = new QueueLine(target == null ? terminalName() : target.getDisplayName(), site(readStringSafe(b)));
+                row = new QueueLine(target == null ? terminalName() : target.getDisplayName());
                 lines.put(id, row);
             } else row = lines.get(id);
+            if (type == 2 || b.readBoolean()) {
+                TerminalLocation position = TerminalLocation.read(b);
+                if (row != null) {
+                    row.position = position;
+                    queueLayoutDirty = true;
+                }
+            }
             String state = readStringSafe(b);
             int placed = b.readVarIntFromBuffer(), total = b.readVarIntFromBuffer();
             boolean preview = b.readBoolean(), canDismantle = b.readBoolean();

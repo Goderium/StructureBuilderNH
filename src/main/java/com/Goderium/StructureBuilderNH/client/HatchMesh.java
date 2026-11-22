@@ -151,6 +151,15 @@ final class HatchMesh {
         }
     }
 
+    static int exposedSides(long[] hatches, long[] hidden, Boundary neighbors, int slot) {
+        int sides = 0;
+        for (int side = 0; side < 6; side++) {
+            if (!occluded(hatches, hidden, neighbors, side, slot, slot & 15, slot >> 8, slot >> 4 & 15))
+                sides |= 1 << side;
+        }
+        return sides;
+    }
+
     private static boolean occluded(long[] hatches, long[] hidden, Boundary neighbors, int side, int slot, int x, int y, int z) {
         int axis = side >>> 1;
         int plane = axis == 0 ? x : axis == 1 ? y : z;

@@ -50,6 +50,10 @@ final class PreviewCubeProfiles {
 
     static boolean fullBright(Block block) { return PROFILES.get(block.getClass()).fullBright; }
 
+    static boolean amberSurface(Block block, int meta) {
+        return (meta == 0 || meta == 1) && PROFILES.get(block.getClass()).translucentCube;
+    }
+
     /** The same public base/glow getters used by the native world renderer, resolved once per class. */
     static BlockPreviewTextures.Layer[][] layers(Block block, int meta, int tint) {
         Profile profile = PROFILES.get(block.getClass());

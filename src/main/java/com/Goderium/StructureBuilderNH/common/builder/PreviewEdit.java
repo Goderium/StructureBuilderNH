@@ -1,6 +1,7 @@
 package com.Goderium.StructureBuilderNH.common.builder;
 
 import com.Goderium.StructureBuilderNH.StructureBuilderNH;
+import com.Goderium.StructureBuilderNH.config.RebuildConfig;
 import cpw.mods.fml.common.network.NetworkRegistry;
 import cpw.mods.fml.common.network.simpleimpl.*;
 import cpw.mods.fml.relauncher.Side;
@@ -9,6 +10,7 @@ import net.minecraft.entity.player.EntityPlayer;
 import net.minecraft.entity.player.EntityPlayerMP;
 import net.minecraft.item.ItemStack;
 import net.minecraft.util.ChunkCoordinates;
+import net.minecraft.util.Vec3;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -150,11 +152,11 @@ public final class PreviewEdit implements IMessage {
         BuilderTasks store = BuilderTasks.get();
         Hit hit = pick(store, actor);
         if (hit == null) return false;
-        if (actor.isSneaking() && hit.owned) {
-            TaskAction.openMarker(store, actor, hit.task, null);
-            return true;
-        }
-        return hit.projected || hit.marker;
+        // Visible projections use the client action, including group editing and press/hold.
+        if (hit.projected || !hit.owned) return true;
+        ChunkCoordinates cell = !actor.isSneaking() && hit.task.canChangeCell(hit.position) ? hit.position : null;
+        TaskAction.openMarker(store, actor, hit.task, cell);
+        return true;
     }
 
     private static final class Hit {
@@ -199,8 +201,8 @@ public final class PreviewEdit implements IMessage {
                 boolean hatch = cell != null && cell.hatch;
                 boolean issue = task.repairableIssue() && task.issue.posX == x && task.issue.posY == y && task.issue.posZ == z;
                 boolean marker = issue || (host || hatch) && (roles || shell);
-                boolean projected = air && (marker || shell);
-                if (issue || projected || owned && !air && task.structureAt(player.worldObj, x, y, z)) {
+                boolean projected = air && (marker || shell) && PreviewStream.visibleTo(task, player);
+                if (projected || owned && !air && task.structureAt(player.worldObj, x, y, z)) {
                     result[0] = new Hit(task, x, y, z, owned, projected, marker);
                 }
             }
@@ -209,10 +211,58 @@ public final class PreviewEdit implements IMessage {
         return result[0];
     }
 
-    static BuildTask pickHost(BuilderTasks store, EntityPlayerMP player, UUID id, int revision) {
-        Hit h=pick(store,player);
-        return h!=null && h.owned && h.marker && h.projected && h.task.id.equals(id.toString()) && h.task.revision==revision
-                && h.position.posX==h.task.x && h.position.posY==h.task.y && h.position.posZ==h.task.z ? h.task : null;
+    static final class HostHit {
+        final BuildTask task;
+        final boolean canTap;
+
+        HostHit(BuildTask task, boolean canTap) {
+            this.task = task;
+            this.canTap = canTap;
+        }
+    }
+
+    static HostHit pickHost(BuilderTasks store, EntityPlayerMP player, UUID id, int revision) {
+        Hit near = pick(store, player);
+        String requested = id.toString();
+        if (near != null) {
+            BuildTask task = near.task;
+            return near.owned && near.marker && near.projected && task.id.equals(requested) && task.revision == revision
+                    && near.position.posX == task.x && near.position.posY == task.y && near.position.posZ == task.z
+                    ? new HostHit(task, true) : null;
+        }
+
+        ItemStack held = player.getHeldItem();
+        if (player.isDead || player.worldObj == null || player.worldObj.isRemote
+                || !player.playerNetServerHandler.netManager.isChannelOpen()
+                || player.openContainer != player.inventoryContainer
+                || held == null || held.getItem() != BuilderItem.ITEM || !held.hasTagCompound()) return null;
+        if (held.getTagCompound().getString("tool").isEmpty()) return null;
+        String selected = held.getTagCompound().getString("selected");
+        Vec3 eye = PreviewAim.eye(player);
+        double reach = PreviewAim.dragReach(RebuildConfig.dragMaxDistance);
+        List<BuildTask> candidates = new ArrayList<>();
+        for (BuildTask task : store.list(player, held)) {
+            if (task.dim == player.dimension && task.movable() && task.plan != null && task.plan.ready
+                    && (task.previewLayers & (PreviewStream.HATCH | PreviewStream.SHELL)) != 0
+                    && PreviewStream.visibleTo(task, player)
+                    && eye.squareDistanceTo(task.x + .5, task.y + .5, task.z + .5) <= reach * reach
+                    && player.worldObj.blockExists(task.x, task.y, task.z)
+                    && player.worldObj.isAirBlock(task.x, task.y, task.z)) candidates.add(task);
+        }
+        if (candidates.isEmpty()) return null;
+
+        BuildTask[] result = {null};
+        PreviewAim.first(player, reach, (x, y, z) -> {
+            for (BuildTask task : candidates) {
+                if (task.x == x && task.y == y && task.z == z
+                        && (result[0] == null || PreviewAim.prefer(true, task.id, true, result[0].id, selected)))
+                    result[0] = task;
+            }
+            return result[0] != null;
+        });
+        BuildTask picked = result[0];
+        return picked != null && picked.id.equals(requested) && picked.revision == revision
+                ? new HostHit(picked, false) : null;
     }
 
     private void apply(BuilderTasks store, EntityPlayerMP player) {
@@ -228,7 +278,7 @@ public final class PreviewEdit implements IMessage {
         try {
             if (request <= 0 || (group ? steps != 0 : steps == 0 || steps < -MAX_STEPS || steps > MAX_STEPS)) return;
             Hit picked = pick(store, player);
-            if (picked == null || !picked.owned || !picked.projected || (picked.task.previewLayers & PreviewStream.SHELL) == 0
+            if (picked == null || !picked.owned || (picked.task.previewLayers & PreviewStream.SHELL) == 0
                     || !picked.task.editable() || !picked.task.materialSelectable(x, y, z) || !picked.task.id.equals(taskId.toString()) || picked.task.revision != revision
                     || x != picked.position.posX || y != picked.position.posY || z != picked.position.posZ) return;
             BuildTask task = picked.task;

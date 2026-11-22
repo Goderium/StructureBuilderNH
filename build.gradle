@@ -3,7 +3,7 @@ plugins {
     id 'com.gtnewhorizons.retrofuturagradle' version '2.0.2'
 }
 group = providers.gradleProperty('modGroup').get()
-version = providers.gradleProperty('modVersion').get()
+apply from: 'gradle/build-version.gradle'
 java { toolchain { languageVersion = JavaLanguageVersion.of(8) } }
 minecraft {
     mcVersion = providers.gradleProperty('minecraftVersion').get()
@@ -27,4 +27,11 @@ tasks.jar {
     from('LICENSE') { into 'META-INF' }
     manifest.attributes('FMLCorePlugin': 'com.Goderium.StructureBuilderNH.loader.EarlyLoader',
         'FMLCorePluginContainsFMLMod': 'true', 'ForceLoadAsMod': 'true')
+}
+
+tasks.register('writeBuildMetadata', WriteProperties) {
+    destinationFile = layout.buildDirectory.file('build-metadata.properties')
+    encoding = 'UTF-8'
+    property('version', project.version.toString())
+    property('jar_name', tasks.named('reobfJar').flatMap { it.archiveFileName })
 }

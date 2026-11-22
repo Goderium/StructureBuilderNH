@@ -1,6 +1,7 @@
 package com.Goderium.StructureBuilderNH.common.builder;
 
 import com.Goderium.StructureBuilderNH.StructureBuilderNH;
+import com.Goderium.StructureBuilderNH.config.RebuildConfig;
 import com.gtnewhorizon.structurelib.alignment.enumerable.ExtendedFacing;
 
 import cpw.mods.fml.common.network.simpleimpl.*;
@@ -30,6 +31,8 @@ public final class PreviewDragMessage implements IMessage {
     private boolean supportsMoveHandoff;
     private BuildTask task;
     private int slot;
+    private boolean canTap;
+    private double grabDistance, grabOffset;
 
     public PreviewDragMessage() {}
 
@@ -159,7 +162,8 @@ public final class PreviewDragMessage implements IMessage {
                 && task.tool.equals(held.getTagCompound().getString("tool"))
                 && store.jobs.get(task.id) == task
                 && task.revision == revision
-                && task.movable() && p.worldObj.isAirBlock(task.x, task.y, task.z);
+                && task.movable() && p.worldObj.blockExists(task.x, task.y, task.z)
+                && p.worldObj.isAirBlock(task.x, task.y, task.z);
     }
 
     static void drain(BuilderTasks store) {
@@ -178,14 +182,37 @@ public final class PreviewDragMessage implements IMessage {
         PreviewEdit.NET.sendTo(reply, player);
     }
 
+    private boolean withinDropDepth(double distance, boolean sameAnchor) {
+        // The client keeps the original center-to-ray offset and then rounds each axis to a block.
+        double tolerance = Math.min(grabOffset, 2 * PreviewAim.HALF_BLOCK_DIAGONAL)
+                + PreviewAim.HALF_BLOCK_DIAGONAL + PreviewAim.EPSILON;
+        double min = RebuildConfig.dragMinDistance - tolerance;
+        double max = RebuildConfig.dragMaxDistance + tolerance;
+        if (sameAnchor) {
+            // A grip can rotate in place when its original center is just outside the drag range.
+            min = Math.min(min, grabDistance - PreviewAim.EPSILON);
+            max = Math.max(max, grabDistance + PreviewAim.EPSILON);
+        }
+        return distance >= min && distance <= max;
+    }
+
     private void apply(EntityPlayerMP p, BuilderTasks store) {
         if (op == PRESS) {
-            task = PreviewEdit.pickHost(store, p, id, revision);
-            if (task == null || !task.movable() || !p.worldObj.isAirBlock(task.x, task.y, task.z)) {
+            PreviewEdit.HostHit hit = PreviewEdit.pickHost(store, p, id, revision);
+            task = hit == null ? null : hit.task;
+            if (task == null || !task.movable() || !p.worldObj.blockExists(task.x, task.y, task.z)
+                    || !p.worldObj.isAirBlock(task.x, task.y, task.z)) {
                 reject(p);
                 return;
             }
+            canTap = hit.canTap;
             slot = p.inventory.currentItem;
+            Vec3 eye = PreviewAim.eye(p);
+            Vec3 center = Vec3.createVectorHelper(task.x + .5, task.y + .5, task.z + .5);
+            Vec3 look = p.getLook(1);
+            grabDistance = eye.distanceTo(center);
+            grabOffset = eye.addVector(look.xCoord * grabDistance, look.yCoord * grabDistance, look.zCoord * grabDistance)
+                    .distanceTo(center);
             grips.put(p, this);
             return;
         }
@@ -202,19 +229,26 @@ public final class PreviewDragMessage implements IMessage {
         }
         BuildTask t = grip.task;
         if (op == TAP) {
-            if (p.getDistanceSq(t.x + .5, t.y + .5, t.z + .5) > 15 * 15) {
+            if (!grip.canTap || p.getDistanceSq(t.x + .5, t.y + .5, t.z + .5) > 15 * 15) {
                 reject(p);
                 return;
             }
             PreviewEdit.TaskAction.openMarker(store, p, t, new ChunkCoordinates(t.x, t.y, t.z));
             return;
         }
-        Vec3 eye = Vec3.createVectorHelper(p.posX, p.posY + p.getEyeHeight(), p.posZ);
+        Vec3 eye = PreviewAim.eye(p);
         Vec3 dest = Vec3.createVectorHelper(x + .5, y + .5, z + .5);
-        boolean close = eye.distanceTo(dest) <= 13;
+        double distance = eye.distanceTo(dest);
+        boolean reachable = grip.withinDropDepth(distance, x == t.x && y == t.y && z == t.z)
+                && p.worldObj.blockExists(x, y, z);
+        if (reachable && distance > PreviewAim.USE_REACH) {
+            Vec3 direction = Vec3.createVectorHelper((dest.xCoord - eye.xCoord) / distance,
+                    (dest.yCoord - eye.yCoord) / distance, (dest.zCoord - eye.zCoord) / distance);
+            reachable = PreviewAim.loadedReach(p.worldObj, eye, direction, distance) >= distance;
+        }
         MovingObjectPosition hit =
-                close ? p.worldObj.rayTraceBlocks(eye, dest, false, true, false) : null;
-        if (!close
+                reachable ? p.worldObj.rayTraceBlocks(eye, dest, false, true, false) : null;
+        if (!reachable
                 || hit != null && (hit.blockX != x || hit.blockY != y || hit.blockZ != z)
                 || pose >= ExtendedFacing.VALUES.length
                 || !t.movePreview(p.worldObj, x, y, z, ExtendedFacing.VALUES[pose])) {

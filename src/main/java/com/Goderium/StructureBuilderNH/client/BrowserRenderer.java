@@ -15,6 +15,7 @@ import net.minecraft.item.ItemStack;
 import net.minecraft.world.ChunkPosition;
 import org.lwjgl.BufferUtils;
 import org.lwjgl.opengl.GL11;
+import org.lwjgl.opengl.GL13;
 import org.lwjgl.opengl.GL14;
 import org.lwjgl.opengl.GLContext;
 
@@ -38,7 +39,7 @@ public final class BrowserRenderer implements AutoCloseable {
     private static final int PROXY_SECTIONS = 8;
     private static final int MAX_GEOMETRIES = 768, MAX_LISTS = 8192, PICK_STEPS = 8192;
     private static final int CONSTANT_ALPHA = 0x8003, ONE_MINUS_CONSTANT_ALPHA = 0x8004;
-    private static final long FRAME_WINDOW = 16000000L, FRAME_BUDGET = 3000000L;
+    private static final long FRAME_WINDOW = 16_000_000L, FRAME_BUDGET = 12_000_000L;
     private static final Deque<State> RETIRED = new ArrayDeque<>();
     private static final Deque<Framebuffer> RETIRED_IMAGES = new ArrayDeque<>();
     private static final int[] DX = { -1, 1, 0, 0, 0, 0 };
@@ -81,19 +82,30 @@ public final class BrowserRenderer implements AutoCloseable {
             z = row.z;
             air = m.air;
             hatch = m.hatch;
-            if (row.material.displayName == null) {
-                String display = "";
-                try { if (item != null) display = item.getDisplayName(); }
-                catch (RuntimeException | LinkageError unsupported) { /* Broken names cannot close the window. */ }
-                row.material.displayName = display;
-            }
-            name = row.material.displayName;
+            name = displayName(row.material);
         }
+    }
+
+    private static String displayName(BrowserScene.Material material) {
+        if (material.displayName == null) {
+            String name = "";
+            try {
+                if (material.data.item != null) name = material.data.item.getDisplayName();
+                else if (!material.data.air) {
+                    BlockPreviewTextures.Appearance model = appearance(material);
+                    if (model.fluid != null) name = model.fluid.type != null ? model.fluid.type.getLocalizedName()
+                            : model.block.getLocalizedName();
+                }
+            } catch (RuntimeException | LinkageError unsupported) { /* Keep the generic block label. */ }
+            material.displayName = name;
+        }
+        return material.displayName;
     }
 
     /** A recorded model voxel; options preserve explicit null/leave-empty candidates. Never mutates a task. */
     public static final class Pick {
         public final int x, y, z, materialId, group, dots;
+        public final String name;
         public final ItemStack item;
         public final ItemStack[] options;
         public final String piece, groupKey, hatchName;
@@ -107,6 +119,7 @@ public final class BrowserRenderer implements AutoCloseable {
             this.y = y;
             this.z = z;
             materialId = m.id;
+            name = displayName(material);
             group = m.group;
             dots = m.dots;
             item = m.item;
@@ -426,8 +439,8 @@ public final class BrowserRenderer implements AutoCloseable {
         long deadline = now + FRAME_BUDGET;
         drainRetired(Math.min(deadline, now + 300000L));
         if (state == null) return;
-        state.scene.advance(Math.min(deadline, System.nanoTime() + 1100000L), 16384);
-        for (int n = 0; n < 4; n++) {
+        state.scene.advance(Math.min(deadline, System.nanoTime() + 4_400_000L), 65536);
+        for (int n = 0; n < 16 && System.nanoTime() < deadline; n++) {
             BrowserScene.Replacement replacement = state.scene.replacements.pollFirst();
             if (replacement == null) break;
             state.replace(replacement);
@@ -530,6 +543,9 @@ public final class BrowserRenderer implements AutoCloseable {
         submission.prepare(shown, cam);
         GL11.glDepthMask(true);
         GL11.glEnable(GL11.GL_DEPTH_TEST);
+        // Holes in cutout icons must leave the depth buffer available for the surface behind them.
+        GL11.glEnable(GL11.GL_ALPHA_TEST);
+        GL11.glAlphaFunc(GL11.GL_GREATER, 0);
         GL11.glPushMatrix();
         GL11.glTranslated(-cam.x, -cam.y, -cam.z);
         try {
@@ -815,6 +831,7 @@ public final class BrowserRenderer implements AutoCloseable {
         final List<Geometry> transparent = new ArrayList<>();
         final Submission[] submissions = { new Submission(0), new Submission(1), new Submission(2) };
         final Deque<BrowserScene.Section> whole = new ArrayDeque<>();
+        final int[] batchFaces = new int[BATCH * 6];
         final Deque<BrowserScene.Section> priorityNeighbors = new ArrayDeque<>();
         final List<Proxy> proxies = new ArrayList<>();
         final Deque<Proxy> dirtyProxies = new ArrayDeque<>();
@@ -1016,20 +1033,27 @@ public final class BrowserRenderer implements AutoCloseable {
             compiledBatches++;
             compiledCells += BATCH;
             if (access == null) access = new BrowserBlockAccess(owner.scene, section);
-            int[] faces = new int[BATCH * 6];
+            int[] faces = owner.batchFaces;
             int count = 0;
+            int solidRuns = 0, blendedRuns = 0;
+            boolean hatches = false;
+            boolean airChoices = false;
             int begin = batch * BATCH, end = begin + BATCH;
             for (int index = begin; index < end; index++) {
                 int slot = visitedSlot(index);
                 BrowserScene.Material material = owner.scene.material(section, slot);
-                if (material == null || material.data.air || !inSlice(slot) || !inFocus(material)) continue;
-                int x = section.x + (slot & 15), y = section.y + (slot >> 8), z = section.z + (slot >> 4 & 15);
-                BlockPreviewTextures.Appearance current = appearance(material);
-                if (current.fence) {
-                    faces[count++] = slot * 8 + ProjectedBlockFaces.MODEL;
+                if (material == null) continue;
+                if (material.data.air) {
+                    airChoices |= material.data.group >= 0;
                     continue;
                 }
-                for (int side = 0; side < 6; side++) {
+                if (!inFocus(material)) continue;
+                int x = section.x + (slot & 15), y = section.y + (slot >> 8), z = section.z + (slot >> 4 & 15);
+                BlockPreviewTextures.Appearance current = appearance(material);
+                int firstFace = count;
+                if (current.fence) {
+                    faces[count++] = slot * 8 + ProjectedBlockFaces.MODEL;
+                } else for (int side = 0; side < 6; side++) {
                     BrowserScene.Material neighbor = access.material(x + DX[side], y + DY[side], z + DZ[side]);
                     boolean adjacent = neighbor != null && !neighbor.data.air && inFocus(neighbor);
                     if (mode == 1 || mode == 2 && sliced) {
@@ -1038,7 +1062,10 @@ public final class BrowserRenderer implements AutoCloseable {
                     }
                     if (adjacent) {
                         BlockPreviewTextures.Appearance next = appearance(neighbor);
-                        if (current.textured() && current.block != null && !current.frame) {
+                        if (next.browserSolidSurface) continue;
+                        if (current.fluid != null || next.fluid != null) {
+                            if (BlockPreviewTextures.occludes(next, current)) continue;
+                        } else if (current.textured() && current.block != null && !current.frame) {
                             try {
                                 if (!current.block.shouldSideBeRendered(access, x + DX[side], y + DY[side],
                                         z + DZ[side], BlockPreviewTextures.nativeSide(side))) continue;
@@ -1047,11 +1074,18 @@ public final class BrowserRenderer implements AutoCloseable {
                     }
                     faces[count++] = slot * 8 + side;
                 }
+                if (firstFace == count) continue;
+                int run = 1 << textureRun(0, current);
+                if (current.translucent && !current.browserSolidSurface) blendedRuns |= run;
+                else solidRuns |= run;
+                hatches |= material.data.hatch;
             }
-            opaque[batch] = compile(faces, count, 0, opaque[batch]);
-            glass[batch] = compile(faces, count, 1, glass[batch]);
-            roles[batch] = compile(faces, count, 2, roles[batch]);
-            markers[batch] = compileMarkers(begin, end, markers[batch]);
+            if (count != 0) {
+                if (solidRuns != 0) opaque[batch] = compile(faces, count, 0, solidRuns);
+                if (blendedRuns != 0) glass[batch] = compile(faces, count, 1, blendedRuns);
+                if (hatches) roles[batch] = compile(faces, count, 2, 1);
+            }
+            if (airChoices) markers[batch] = compileMarkers(begin, end, markers[batch]);
             batch++;
             if (finished()) access = null;
         }
@@ -1083,23 +1117,10 @@ public final class BrowserRenderer implements AutoCloseable {
             return cut;
         }
 
-        private int compile(int[] faces, int count, int pass, int previous) {
-            boolean any = false;
-            for (int i = 0; i < count; i++) {
-                BrowserScene.Material material = owner.scene.material(section, faces[i] >> 3);
-                BlockPreviewTextures.Appearance appearance = appearance(material);
-                if (pass == 2 ? material.data.hatch : pass == 1 ? appearance.translucent : !appearance.translucent) {
-                    any = true;
-                    break;
-                }
-            }
-            if (!any) {
-                if (previous != 0) { GL11.glDeleteLists(previous, 1); owner.lists--; }
-                return 0;
-            }
-            int list = previous == 0 ? GL11.glGenLists(1) : previous;
+        private int compile(int[] faces, int count, int pass, int runs) {
+            int list = GL11.glGenLists(1);
             if (list == 0) return 0;
-            if (previous == 0) owner.lists++;
+            owner.lists++;
             GL11.glNewList(list, GL11.GL_COMPILE);
             GL11.glPushMatrix();
             GL11.glTranslated(section.x - owner.scene.originX, section.y - owner.scene.originY,
@@ -1107,19 +1128,29 @@ public final class BrowserRenderer implements AutoCloseable {
             Tessellator tessellator = Tessellator.instance;
             try {
                 // Separate atlas and semantic fallback runs; no texture changes inside glBegin/glEnd.
-                for (int texture = 0; texture < 2; texture++) {
-                    if (texture == 1) GL11.glEnable(GL11.GL_TEXTURE_2D); else GL11.glDisable(GL11.GL_TEXTURE_2D);
+                for (int texture = 0; texture < 3; texture++) {
+                    if ((runs & (1 << texture)) == 0) continue;
+                    if (texture != 0) GL11.glEnable(GL11.GL_TEXTURE_2D); else GL11.glDisable(GL11.GL_TEXTURE_2D);
+                    if (texture == 2) {
+                        // Amber has a uniformly translucent atlas alpha even on its closed outer surface.
+                        // Use the normal shaded atlas RGB and the vertex's solid coverage.
+                        GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL11.GL_TEXTURE_ENV_MODE, GL13.GL_COMBINE);
+                        GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL13.GL_COMBINE_RGB, GL11.GL_MODULATE);
+                        GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL13.GL_SOURCE0_RGB, GL11.GL_TEXTURE);
+                        GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL13.GL_SOURCE1_RGB, GL13.GL_PRIMARY_COLOR);
+                        GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL13.GL_COMBINE_ALPHA, GL11.GL_REPLACE);
+                        GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL13.GL_SOURCE0_ALPHA, GL13.GL_PRIMARY_COLOR);
+                    }
                     tessellator.startDrawingQuads();
                     tessellator.setBrightness(0xf000f0);
                     for (int i = 0; i < count; i++) {
                         int slot = faces[i] >> 3, side = faces[i] & 7;
                         BrowserScene.Material material = owner.scene.material(section, slot);
                         BlockPreviewTextures.Appearance appearance = appearance(material);
-                        boolean textured = pass != 2 && appearance.textured();
-                        if (textured != (texture == 1)) continue;
-                        if (pass == 2 ? !material.data.hatch : pass == 1 ? !appearance.translucent : appearance.translucent)
-                            continue;
-                        if (textured) {
+                        if (textureRun(pass, appearance) != texture) continue;
+                        boolean blended = appearance.translucent && !appearance.browserSolidSurface;
+                        if (pass == 2 ? !material.data.hatch : (pass == 1) != blended) continue;
+                        if (texture != 0) {
                             try {
                                 int x = section.x + (slot & 15), y = section.y + (slot >> 8), z = section.z + (slot >> 4 & 15);
                                 if (side == ProjectedBlockFaces.MODEL) {
@@ -1141,9 +1172,15 @@ public final class BrowserRenderer implements AutoCloseable {
                         }
                     }
                     tessellator.draw();
+                    if (texture == 2) GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL11.GL_TEXTURE_ENV_MODE, GL11.GL_MODULATE);
                 }
             } finally { GL11.glPopMatrix(); GL11.glEndList(); }
             return list;
+        }
+
+        private int textureRun(int pass, BlockPreviewTextures.Appearance appearance) {
+            if (pass == 2 || !appearance.textured()) return 0;
+            return appearance.browserSolidSurface ? 2 : 1;
         }
 
         private int compileMarkers(int begin, int end, int previous) {

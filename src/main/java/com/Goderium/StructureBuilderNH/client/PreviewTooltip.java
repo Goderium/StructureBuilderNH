@@ -15,7 +15,7 @@ import java.util.Objects;
 
 final class PreviewTooltip {
     private final List<String> lines = new ArrayList<>();
-    private String title, hint;
+    private String title, hint, action;
     private int widthLimit, panelWidth, titleLines, modifier;
     private boolean hatch, expanded;
 
@@ -28,17 +28,18 @@ final class PreviewTooltip {
         title = null;
     }
 
-    void draw(Minecraft mc, ScaledResolution screen, String title, String hint, int color, boolean hatch) {
+    void draw(Minecraft mc, ScaledResolution screen, String title, String hint, String action, int color, boolean hatch) {
         FontRenderer font = mc.fontRendererObj;
         int width = Math.max(1, Math.min(256, screen.getScaledWidth() - 14));
         int key = mc.gameSettings.keyBindSneak.getKeyCode();
         boolean expand = hatch && (key == 0 || BuilderRenderer.previewModifierDown());
         if (width != widthLimit || !title.equals(this.title) || !Objects.equals(hint, this.hint)
-                || hatch != this.hatch || expand != expanded || key != modifier) {
+                || !Objects.equals(action, this.action) || hatch != this.hatch || expand != expanded || key != modifier) {
             widthLimit = width;
             this.title = title;
             this.hint = hint;
             this.hatch = hatch;
+            this.action = action;
             expanded = expand;
             modifier = key;
             lines.clear();
@@ -49,6 +50,7 @@ final class PreviewTooltip {
                     addHatchLines(font, modifierName(mc));
                 else lines.addAll(font.listFormattedStringToWidth(hint, width));
             }
+            if (action != null) lines.addAll(font.listFormattedStringToWidth(action, width));
             panelWidth = 0;
             for (String line : lines) panelWidth = Math.max(panelWidth, font.getStringWidth(line));
         }

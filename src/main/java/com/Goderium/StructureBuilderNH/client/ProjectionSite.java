@@ -12,10 +12,15 @@ final class ProjectionSite implements Runnable, ProjectionOccupancy.MaterialSink
     private int minX, minY, minZ, maxX, maxY, maxZ;
     private final int[] cell = new int[3];
     // Triples (source slot, block ID, metadata) in the same ascending slot order for every pose.
-    private int[] materials;
-    private int materialLength, writeIndex;
-    boolean materialsChanged;
+    private int[] materials, nextMaterials;
+    private int materialLength, writeIndex, readIndex;
+    final PreviewRegion changedCells = new PreviewRegion();
+    private int sectionX, sectionY, sectionZ;
     boolean dirty = true;
+
+    boolean boundTo(ProjectionOccupancy next, PreviewGrip nextPose) {
+        return next == world && nextPose == pose && (pose == null || facing == pose.facing);
+    }
 
     void bind(ProjectionOccupancy next, PreviewGrip nextPose, int x, int y, int z) {
         // While dragging, the complete blueprint follows the controller independently of either site.
@@ -23,7 +28,7 @@ final class ProjectionSite implements Runnable, ProjectionOccupancy.MaterialSink
             next = null;
             nextPose = null;
         }
-        if (next == world && nextPose == pose && (pose == null || facing == pose.facing)) return;
+        if (boundTo(next, nextPose)) return;
         unwatch();
         world = next;
         pose = nextPose;
@@ -45,14 +50,14 @@ final class ProjectionSite implements Runnable, ProjectionOccupancy.MaterialSink
             maxZ = Math.max(az, cell[2]) >> 4;
         }
         for (int sy = minY; sy <= maxY; sy++) for (int sz = minZ; sz <= maxZ; sz++)
-            for (int sx = minX; sx <= maxX; sx++) world.watch(sx, sy, sz, this);
+            for (int sx = minX; sx <= maxX; sx++) world.watchChanges(sx, sy, sz, this);
     }
 
     void close() {
         unwatch();
         materials = null;
         materialLength = 0;
-        materialsChanged = false;
+        nextMaterials = null;
     }
 
     private void unwatch() {
@@ -76,15 +81,19 @@ final class ProjectionSite implements Runnable, ProjectionOccupancy.MaterialSink
 
     void read(BuilderRenderer.Section s, long[] result, boolean textured) {
         dirty = false;
-        materialsChanged = false;
-        writeIndex = 0;
+        changedCells.clear();
+        sectionX = s.x; sectionY = s.y; sectionZ = s.z;
+        writeIndex = readIndex = 0;
         ProjectionOccupancy.MaterialSink sink = textured ? this : null;
         if (world != null && pose == null) {
             world.read(minX, minY, minZ, s.solid, s.optional, s.hatch, result, sink);
         } else {
             readMoved(s, result, sink);
         }
-        if (textured && writeIndex != materialLength) materialsChanged = true;
+        if (nextMaterials != null) {
+            materials = nextMaterials;
+            nextMaterials = null;
+        }
         materialLength = writeIndex;
         if (materialLength == 0) materials = null;
         else if (materialLength <= materials.length / 4) materials = Arrays.copyOf(materials, materialLength);
@@ -92,16 +101,22 @@ final class ProjectionSite implements Runnable, ProjectionOccupancy.MaterialSink
 
     @Override
     public void record(int slot, int blockId, int metadata) {
-        if (writeIndex >= materialLength || materials[writeIndex] != slot || materials[writeIndex + 1] != blockId
-            || materials[writeIndex + 2] != metadata) {
-            materialsChanged = true;
-            if (materials == null) materials = new int[3];
-            else if (writeIndex == materials.length)
-                materials = Arrays.copyOf(materials, Math.min(4096 * 3, writeIndex * 2));
-            materials[writeIndex] = slot;
-            materials[writeIndex + 1] = blockId;
-            materials[writeIndex + 2] = metadata;
+        // Both snapshots are sorted by slot. Inserting one early cell leaves later cells unchanged.
+        while (readIndex < materialLength && materials[readIndex] < slot) readIndex += 3;
+        boolean found = readIndex < materialLength && materials[readIndex] == slot;
+        if (!found || materials[readIndex + 1] != blockId || materials[readIndex + 2] != metadata)
+            changedCells.include(sectionX + (slot & 15), sectionY + (slot >> 8), sectionZ + (slot >> 4 & 15));
+        if (nextMaterials == null && (!found || readIndex != writeIndex)) {
+            nextMaterials = new int[Math.max(3, materialLength)];
+            if (writeIndex != 0) System.arraycopy(materials, 0, nextMaterials, 0, writeIndex);
         }
+        if (nextMaterials != null && writeIndex == nextMaterials.length)
+            nextMaterials = Arrays.copyOf(nextMaterials, Math.min(4096 * 3, writeIndex * 2));
+        int[] target = nextMaterials == null ? materials : nextMaterials;
+        target[writeIndex] = slot;
+        target[writeIndex + 1] = blockId;
+        target[writeIndex + 2] = metadata;
+        if (found) readIndex += 3;
         writeIndex += 3;
     }
 

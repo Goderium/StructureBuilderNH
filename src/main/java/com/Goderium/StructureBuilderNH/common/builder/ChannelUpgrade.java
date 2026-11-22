@@ -138,7 +138,7 @@ final class ChannelUpgrade {
     void record(Blueprint.Cell old, Blueprint.Cell cell, int x, int y, int z) {
         Profile previous = profiles.get(old);
         if (previous != null) count(previous.channel, -1);
-        if (cell == null || cell.element == null || cell.air || cell.hatch || cell.inscribedRitual
+        if (cell == null || cell.element == null || cell.air || cell.hatch || cell.isFluid() || cell.inscribedRitual
                 || cell.choice != null || cell.constraints != null || rejected.contains(cell)) return;
         Profile profile = profiles.get(cell);
         if (profile == null) {

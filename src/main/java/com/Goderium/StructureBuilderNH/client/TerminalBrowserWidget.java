@@ -450,7 +450,7 @@ public final class TerminalBrowserWidget extends ParentWidget<TerminalBrowserWid
     }
 
     private String pickName(BrowserRenderer.Pick p) {
-        return p.item == null ? tr(p.air ? "previewAir" : "browser.block") : p.item.getDisplayName();
+        return p.name.isEmpty() ? tr(p.air ? "previewAir" : "browser.block") : p.name;
     }
     private static String coords(BrowserRenderer.Pick p) { return p.x + ", " + p.y + ", " + p.z; }
 

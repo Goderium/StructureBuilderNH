@@ -17,6 +17,7 @@ import net.minecraft.util.StatCollector;
 
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.BitSet;
 import java.util.Comparator;
 import java.util.List;
 
@@ -33,11 +34,14 @@ final class MaterialChoice {
     final List<ItemStack> items;
     final boolean allowsAir;
     final int defaultIndex;
+    private final Block sampledFluid;
+    private final int sampledMeta;
+    private final BitSet fluidOptions = new BitSet();
     final int x, y, z;
     int count;
 
     private MaterialChoice(String key, String piece, char symbol, List<ItemStack> items, boolean allowsAir,
-            int defaultIndex, int x, int y, int z) {
+            int defaultIndex, int x, int y, int z, Blueprint.Cell cell) {
         this.x = x;
         this.y = y;
         this.z = z;
@@ -47,21 +51,46 @@ final class MaterialChoice {
         this.items = items;
         this.allowsAir = allowsAir;
         this.defaultIndex = defaultIndex;
+        sampledFluid = cell.isFluid() ? cell.block : null;
+        sampledMeta = cell.meta;
+        for (int i = 0; i < items.size(); i++)
+            if (StructureFluids.isFluid(optionBlock(i))) fluidOptions.set(i);
     }
 
     boolean groupSelectable() { return symbol != '\0'; }
     int optionCount() { return items.size() + (allowsAir ? 1 : 0); }
     boolean isAir(int index) { return allowsAir && index == items.size(); }
     ItemStack optionItem(int index) { return index >= 0 && index < items.size() ? items.get(index) : null; }
+    boolean isFluid(int index) { return index >= 0 && fluidOptions.get(index); }
+    Block optionBlock(int index) {
+        if (index == 0 && sampledFluid != null) return sampledFluid;
+        ItemStack item = optionItem(index);
+        return item == null ? Blocks.air : Block.getBlockFromItem(item.getItem());
+    }
+    int optionMeta(int index) {
+        if (index == 0 && sampledFluid != null) return sampledMeta;
+        ItemStack item = optionItem(index);
+        return item == null ? 0 : item.getItem().getMetadata(item.getMetadata());
+    }
+    ItemStack displayItem(int index) {
+        if (!isFluid(index) || optionItem(index) != null) return optionItem(index);
+        return gregtech.api.util.GTUtility.getFluidDisplayStack(StructureFluids.fluid(optionBlock(index)));
+    }
     String optionName(int index) {
+        if (isFluid(index)) {
+            net.minecraftforge.fluids.Fluid fluid = StructureFluids.fluid(optionBlock(index));
+            return fluid == null ? optionBlock(index).getLocalizedName() : fluid.getLocalizedName();
+        }
         ItemStack item = optionItem(index);
         return item == null ? StatCollector.translateToLocal("structurebuildernh.previewAir") : item.getDisplayName();
     }
 
     String optionToken(int index) {
         if (isAir(index)) return "air";
+        if (isFluid(index) && optionItem(index) == null)
+            return "fluid:" + Block.blockRegistry.getNameForObject(optionBlock(index)) + "@" + optionMeta(index);
         // Optional native branches follow the channel's current example when its tier changes.
-        if (allowsAir && items.size() == 1 && index == 0) return "native";
+        if (allowsAir && items.size() == 1 && index == 0 && !isFluid(index)) return "native";
         ItemStack item = optionItem(index);
         return item == null ? "" : Item.itemRegistry.getNameForObject(item.getItem()) + "@" + item.getMetadata();
     }
@@ -142,14 +171,17 @@ final class MaterialChoice {
         boolean air = Blueprint.allowsAir(cell.element);
         // Any-meta elements have exact world predicates, but cannot enumerate all of their item variants.
         if (cell.hatch || cell.inscribedRitual
-                || !nativeElement(cell.element, false) && !(air && cell.element instanceof IStructureElementChain))
+                || !nativeElement(cell.element, false)
+                        && !((air || cell.isFluid()) && cell.element instanceof IStructureElementChain))
             return null;
         IStructureElement.BlocksToPlace choices = cell.element.getBlocksToPlace(
                 context, plan, x, y, z, trigger, plan.env);
         if (choices == null || choices.getStacks() == null) return null;
         List<ItemStack> items = new ArrayList<>();
         for (ItemStack s : choices.getStacks()) {
-            if (s == null || !(s.getItem() instanceof ItemBlock) || s.hasTagCompound()
+            // StructureLib supplies a null-item stack for blocks without an item form (e.g. water).
+            if (s == null || s.getItem() == null) continue;
+            if (!(s.getItem() instanceof ItemBlock) || s.hasTagCompound()
                     || s.getMetadata() == 32767 || Block.getBlockFromItem(s.getItem()).hasTileEntity(s.getMetadata()))
                 return null;
             if (items.stream().noneMatch(a -> Materials.equal(a, s))) {
@@ -158,17 +190,28 @@ final class MaterialChoice {
                 items.add(unit);
             }
         }
-        if (items.size() < (air ? 1 : 2)) return null;
-        if (!air && items.stream().noneMatch(s -> Materials.equal(cell.item, s))) return null;
         items.sort(ITEM_ORDER);
-        if (cell.item != null && items.stream().anyMatch(s -> Materials.equal(cell.item, s))) {
+        if (cell.isFluid()) {
+            if (items.stream().noneMatch(s -> !StructureFluids.isFluid(Block.getBlockFromItem(s.getItem())))) return null;
+            ItemStack sampled = null;
+            for (ItemStack option : items) {
+                if (Block.getBlockFromItem(option.getItem()) == cell.block
+                        && option.getItem().getMetadata(option.getMetadata()) == cell.meta) { sampled = option; break; }
+            }
+            // The actual construction example has a real block state even if it has no ItemBlock.
+            if (sampled != null) items.remove(sampled);
+            items.add(0, sampled);
+        } else if (items.size() < (air ? 1 : 2)
+                || !air && items.stream().noneMatch(s -> Materials.equal(cell.item, s))) return null;
+        else if (cell.item != null && items.stream().anyMatch(s -> Materials.equal(cell.item, s))) {
             items.removeIf(s -> Materials.equal(s, cell.item));
             items.add(0, cell.item);
         }
         String key = cell.role;
-        MaterialChoice group = new MaterialChoice(key, cell.piece, cell.symbol, items, air, air ? items.size() : 0, x, y, z);
+        MaterialChoice group = new MaterialChoice(key, cell.piece, cell.symbol, items, air,
+                air && !cell.isFluid() ? items.size() : 0, x, y, z, cell);
         StringBuilder legacy = new StringBuilder().append(x-plan.x).append(',').append(y-plan.y).append(',').append(z-plan.z);
-        for (ItemStack item : items) legacy.append('/').append(Item.itemRegistry.getNameForObject(item.getItem()))
+        for (ItemStack item : items) if (item != null) legacy.append('/').append(Item.itemRegistry.getNameForObject(item.getItem()))
                 .append('@').append(item.getMetadata());
         group.legacyKey = legacy.toString();
         return group;
@@ -177,13 +220,14 @@ final class MaterialChoice {
     int indexAt(World world, int x, int y, int z) {
         Block b = world.getBlock(x, y, z);
         if (b == Blocks.air) return allowsAir ? items.size() : -1;
+        if (sampledFluid == b && world.getBlockMetadata(x, y, z) == sampledMeta) return 0;
         Item item = Item.getItemFromBlock(b);
         int damage = b.getDamageValue(world, x, y, z);
         if (item instanceof ISpecialItemBlock)
             damage = ((ISpecialItemBlock) item).getItemMetaFromBlockMeta(b, damage);
         for (int i = 0; i < items.size(); i++) {
             ItemStack choice = items.get(i);
-            if (choice.getItem() == item && choice.getMetadata() == damage) return i;
+            if (choice != null && choice.getItem() == item && choice.getMetadata() == damage) return i;
         }
         return -1;
     }

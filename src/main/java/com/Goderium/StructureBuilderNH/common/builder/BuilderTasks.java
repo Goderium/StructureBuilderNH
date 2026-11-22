@@ -211,6 +211,7 @@ public final class BuilderTasks extends WorldSavedData {
                         z,
                         facing,
                         host != null);
+        t.rememberDimension(p.worldObj);
         if (host != null) {
             ItemStack target = host.getMetaTileEntity().getStackForm(1);
             NBTTagCompound itemTag = target.hasTagCompound()
@@ -220,6 +221,7 @@ public final class BuilderTasks extends WorldSavedData {
             t.configureTarget(target);
         }
         t.key = tag(stack).getString("network");
+        t.unlimitedRange = TerminalCardRecipe.hasRange(stack);
         if (host == null) unbound.put(t.owner, t);
         else register(t);
         select(stack, t);
@@ -306,8 +308,13 @@ public final class BuilderTasks extends WorldSavedData {
         if (!active.isEmpty()) Collections.rotate(active, -Math.floorMod(turn, active.size()));
         for (BuildTask t : active) {
             WorldServer world = DimensionManager.getWorld(t.dim);
+            t.rememberDimension(world);
             EntityPlayerMP player = players.get(t.owner);
             ItemStack item = tools.get(t.owner + t.tool);
+            if (item != null && t.unlimitedRange != TerminalCardRecipe.hasRange(item)) {
+                t.unlimitedRange = TerminalCardRecipe.hasRange(item);
+                markDirty();
+            }
             boolean present =
                     player != null && !player.isDead && player.worldObj == world && item != null;
             boolean work = t.state == BuildTask.State.INSPECTING_UPGRADE
@@ -340,6 +347,11 @@ public final class BuilderTasks extends WorldSavedData {
                 if (t.plan != null && turn - viewers.getOrDefault(t.id, turn - 2000) > 600) t.discardCachedPlan();
                 if (t.state == BuildTask.State.QUEUED || t.state == BuildTask.State.BUILDING)
                     t.reason = player == null ? "offline" : "tool";
+                continue;
+            }
+            if ("noEnergy".equals(t.reason) && Math.floorMod(turn - t.id.hashCode(), 20) != 0
+                    && (t.state == BuildTask.State.BUILDING || t.state == BuildTask.State.DISMANTLING)) {
+                t.workChunks.release();
                 continue;
             }
             if (t.state == BuildTask.State.DISMANTLING) {
@@ -408,7 +420,7 @@ public final class BuilderTasks extends WorldSavedData {
                 try {
                     WorldServer w = DimensionManager.getWorld(t.dim);
                     budget -= t.state == BuildTask.State.DISMANTLING
-                            ? t.dismantle(actor,w,item,share,buildDeadline) : t.build(actor,w,share,buildDeadline);
+                            ? t.dismantle(actor,w,item,share,buildDeadline) : t.build(actor,w,item,share,buildDeadline);
                 } catch (RuntimeException ex) {
                     failure(t, ex);
                 }

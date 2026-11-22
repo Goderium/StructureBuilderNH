@@ -47,12 +47,14 @@ final class Wireless {
         if (node == null || !node.isActive() || node.getGrid() == null) return null;
         for (IGridNode ap : node.getGrid().getMachines(TileWireless.class)) {
             IWirelessAccessPoint point = (IWirelessAccessPoint) ap.getMachine();
+            if (!point.isActive()) continue;
+            if (t.unlimitedRange) return new Wireless(ap, player, point);
             DimensionalCoord p = point.getLocation();
             double dx = (double) p.x - t.x,
                     dy = (double) p.y - t.y,
                     dz = (double) p.z - t.z,
                     r = point.getRange();
-            if (point.isActive() && p.getWorld() == world && dx * dx + dy * dy + dz * dz < r * r)
+            if (p.getWorld() == world && dx * dx + dy * dy + dz * dz < r * r)
                 return new Wireless(ap, player, point);
         }
         return null;

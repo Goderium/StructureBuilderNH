@@ -135,81 +135,96 @@ final class SingleCellPlacement {
             message = "cell.changed";
             return;
         }
-        BlockSnapshot before = BlockSnapshot.getBlockSnapshot(w, x, y, z);
-        java.util.List<PlacementLedger> owners = task.store.placementOwners(w, x, y, z);
-        boolean creative = actor.capabilities.isCreativeMode;
-        int slot = remove || creative ? -1 : findInventorySlot(actor);
-        ItemStack reserved = null;
-        if (!remove) {
-            if (slot >= 0) reserved = actor.inventory.decrStackSize(slot, 1);
-            else {
-                if (!creative) {
-                    Wireless net = Wireless.find(task, w, actor);
-                    if (net != null && !net.allows(appeng.api.config.SecurityPermissions.EXTRACT)) {
-                        message = "permission";
-                        return;
-                    }
-                    if (net == null || net.take(selected, 1, appeng.api.config.Actionable.MODULATE) != 1) {
-                        message = "cell.shortage";
-                        return;
-                    }
-                }
-                reserved = selected.copy();
-            }
+        ItemStack terminal = actor.getHeldItem();
+        TerminalEnergy operation = remove ? TerminalEnergy.REMOVE : occupied() ? TerminalEnergy.REPLACE : TerminalEnergy.PLACE;
+        double charge = operation.reserve(actor, terminal);
+        if (charge < 0) {
+            message = "noEnergy";
+            return;
         }
-        Materials drops = new Materials();
-        CellGuard guard = new CellGuard(w);
+        edit(actor, w, terminal, remove, charge);
+    }
+
+    private void edit(EntityPlayerMP actor, WorldServer w, ItemStack terminal, boolean remove, double charge) {
         boolean success = false;
-        boolean restored = true, attempted = false;
-        WorldHooks.WRITE.set(guard);
-        WorldHooks.DISMANTLE_DROPS.set((world, stack) -> {
-            if (world != w) return false;
-            if (guard.harvesting && stack.stackSize > 0) drops.add(stack, stack.stackSize);
-            return true;
-        });
         try {
-            boolean empty = !occupied() || PlacementLedger.harvestBlock(actor, w, x, y, z, oldBlock, oldMeta);
-            guard.harvesting = false;
-            if (empty && w.isAirBlock(x, y, z) && remove) {
-                success = true;
-            } else if (empty && w.isAirBlock(x, y, z) && !remove) {
-                attempted = true;
-                success = reserved.copy().tryPlaceItemIntoWorld(actor, w, x, y, z, ForgeDirection.UP.ordinal(), .5f, .5f, .5f)
-                        && !guard.outside && !w.isAirBlock(x, y, z);
-                if (success) orient(w.getTileEntity(x, y, z));
-            }
-        } catch (RuntimeException | LinkageError failure) {
-            success = false;
-            com.Goderium.StructureBuilderNH.StructureBuilderNH.LOG.warn("Single block placement failed at " + at, failure);
-        } finally {
-            try {
-                if (!success) {
-                    guard.harvesting = false;
-                    w.captureBlockSnapshots = false;
-                    w.capturedBlockSnapshots.clear();
-                    w.restoringBlockSnapshots = true;
-                    restored = restore(w, before);
-                    if (restored) for (PlacementLedger owner : owners) owner.record(w, x, y, z);
+            BlockSnapshot before = BlockSnapshot.getBlockSnapshot(w, x, y, z);
+            java.util.List<PlacementLedger> owners = task.store.placementOwners(w, x, y, z);
+            boolean creative = actor.capabilities.isCreativeMode;
+            int slot = remove || creative ? -1 : findInventorySlot(actor);
+            ItemStack reserved = null;
+            if (!remove) {
+                if (slot >= 0) reserved = actor.inventory.decrStackSize(slot, 1);
+                else {
+                    if (!creative) {
+                        Wireless net = Wireless.find(task, w, actor);
+                        if (net != null && !net.allows(appeng.api.config.SecurityPermissions.EXTRACT)) {
+                            message = "permission";
+                            return;
+                        }
+                        if (net == null || net.take(selected, 1, appeng.api.config.Actionable.MODULATE) != 1) {
+                            message = "cell.shortage";
+                            return;
+                        }
+                    }
+                    reserved = selected.copy();
                 }
-            } finally {
-                w.restoringBlockSnapshots = false;
-                WorldHooks.WRITE.remove();
-                WorldHooks.DISMANTLE_DROPS.remove();
-                if (!success && !creative && reserved != null && (restored || !attempted || !containsPlacement(w, reserved)))
-                    returnInput(actor, reserved, slot);
-                actor.inventory.markDirty();
             }
+            Materials drops = new Materials();
+            CellGuard guard = new CellGuard(w);
+            boolean restored = true, attempted = false;
+            WorldHooks.WRITE.set(guard);
+            WorldHooks.DISMANTLE_DROPS.set((world, stack) -> {
+                if (world != w) return false;
+                if (guard.harvesting && stack.stackSize > 0) drops.add(stack, stack.stackSize);
+                return true;
+            });
+            try {
+                boolean empty = !occupied() || PlacementLedger.harvestBlock(actor, w, x, y, z, oldBlock, oldMeta);
+                guard.harvesting = false;
+                if (empty && w.isAirBlock(x, y, z) && remove) {
+                    success = true;
+                } else if (empty && w.isAirBlock(x, y, z) && !remove) {
+                    attempted = true;
+                    success = reserved.copy().tryPlaceItemIntoWorld(actor, w, x, y, z, ForgeDirection.UP.ordinal(), .5f, .5f, .5f)
+                            && !guard.outside && !w.isAirBlock(x, y, z);
+                    if (success) orient(w.getTileEntity(x, y, z));
+                }
+            } catch (RuntimeException | LinkageError failure) {
+                success = false;
+                com.Goderium.StructureBuilderNH.StructureBuilderNH.LOG.warn("Single block placement failed at " + at, failure);
+            } finally {
+                try {
+                    if (!success) {
+                        guard.harvesting = false;
+                        w.captureBlockSnapshots = false;
+                        w.capturedBlockSnapshots.clear();
+                        w.restoringBlockSnapshots = true;
+                        restored = restore(w, before);
+                        if (restored) for (PlacementLedger owner : owners) owner.record(w, x, y, z);
+                    }
+                } finally {
+                    w.restoringBlockSnapshots = false;
+                    WorldHooks.WRITE.remove();
+                    WorldHooks.DISMANTLE_DROPS.remove();
+                    if (!success && !creative && reserved != null && (restored || !attempted || !containsPlacement(w, reserved)))
+                        returnInput(actor, reserved, slot);
+                    actor.inventory.markDirty();
+                }
+            }
+            if (success || !restored && (w.getBlock(x, y, z) != oldBlock || w.getBlockMetadata(x, y, z) != oldMeta
+                    || oldMachine >= 0 && machine(w.getTileEntity(x, y, z)) != oldMachine)) {
+                for (Materials.Entry e : drops.rows.values()) task.salvage.add(e.item, e.count);
+                task.singleCellChanged(w, at, success ? !remove : attempted && containsPlacement(w, reserved));
+            }
+            if (!task.salvage.rows.isEmpty()) task.depositManualDrops(actor, w);
+            refresh(actor);
+            if (!restored) message = "cell.recheck";
+            else if (!success) message = remove ? "cell.removeDenied" : "cell.denied";
+            else message = !task.salvage.rows.isEmpty() ? "cell.refund" : remove ? "cell.removed" : "cell.placed";
+        } finally {
+            if (!success) TerminalEnergy.refund(terminal, charge);
         }
-        if (success || !restored && (w.getBlock(x, y, z) != oldBlock || w.getBlockMetadata(x, y, z) != oldMeta
-                || oldMachine >= 0 && machine(w.getTileEntity(x, y, z)) != oldMachine)) {
-            for (Materials.Entry e : drops.rows.values()) task.salvage.add(e.item, e.count);
-            task.singleCellChanged(w, at, success ? !remove : attempted && containsPlacement(w, reserved));
-        }
-        if (!task.salvage.rows.isEmpty()) task.depositManualDrops(actor, w);
-        refresh(actor);
-        if (!restored) message = "cell.recheck";
-        else if (!success) message = remove ? "cell.removeDenied" : "cell.denied";
-        else message = !task.salvage.rows.isEmpty() ? "cell.refund" : remove ? "cell.removed" : "cell.placed";
     }
 
     private void orient(TileEntity placed) {

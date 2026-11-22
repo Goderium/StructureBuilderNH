@@ -48,7 +48,16 @@ final class ProjectionOccupancy implements IWorldAccess {
         world.addWorldAccess(this);
     }
 
-    synchronized void watch(int sx, int sy, int sz, Runnable listener) {
+    void watch(int sx, int sy, int sz, Runnable listener) {
+        watch(sx, sy, sz, listener, true);
+    }
+
+    /** The caller samples on registration. Adding a second tile does not invalidate its neighbours. */
+    void watchChanges(int sx, int sy, int sz, Runnable listener) {
+        watch(sx, sy, sz, listener, false);
+    }
+
+    private synchronized void watch(int sx, int sy, int sz, Runnable listener, boolean initialNotification) {
         if (closed || sy < 0 || sy >= 16) return;
         long key = ChunkCoordIntPair.chunkXZ2Int(sx, sz);
         Column column = (Column) columnIndex.getValueByKey(key);
@@ -56,6 +65,12 @@ final class ProjectionOccupancy implements IWorldAccess {
             column = new Column(sx, sz);
             columnIndex.add(key, column);
             columns.add(column);
+            if (!initialNotification) {
+                // watchChanges callers already sample this world state. Only an unticked
+                // column needs another observation before normal block notifications begin.
+                Chunk chunk = world.getChunkFromChunkCoords(sx, sz);
+                if (!chunk.isEmpty() && !chunk.func_150802_k()) awaitingChunkTick.add(column);
+            }
         }
         Set<Runnable> section = column.listeners.get(sy);
         if (section == null) {
@@ -63,7 +78,7 @@ final class ProjectionOccupancy implements IWorldAccess {
             column.listeners.set(sy, section);
             column.watched |= 1 << sy;
         }
-        if (section.add(listener)) mark(column, 1 << sy);
+        if (section.add(listener) && initialNotification) mark(column, 1 << sy);
     }
 
     synchronized void unwatch(int sx, int sy, int sz, Runnable listener) {
@@ -96,6 +111,11 @@ final class ProjectionOccupancy implements IWorldAccess {
         if (y < 0 || y >= 256 || columns.isEmpty()) return;
         Column column = (Column) columnIndex.getValueByKey(ChunkCoordIntPair.chunkXZ2Int(x >> 4, z >> 4));
         if (column != null) mark(column, 1 << (y >> 4));
+    }
+
+    synchronized void chunkChanged(int sx, int sz) {
+        Column column = (Column) columnIndex.getValueByKey(ChunkCoordIntPair.chunkXZ2Int(sx, sz));
+        if (column != null) mark(column, column.watched);
     }
 
     @Override

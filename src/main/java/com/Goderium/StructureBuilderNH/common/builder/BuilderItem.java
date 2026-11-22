@@ -1,6 +1,11 @@
 package com.Goderium.StructureBuilderNH.common.builder;
 
 import appeng.api.features.INetworkEncodable;
+import appeng.core.AEConfig;
+import appeng.core.localization.GuiText;
+import appeng.items.tools.powered.powersink.AEBasePoweredItem;
+import appeng.tile.networking.TileWireless;
+import com.google.common.base.Optional;
 
 import com.Goderium.StructureBuilderNH.StructureBuilderNH;
 
@@ -30,7 +35,7 @@ import net.minecraftforge.event.entity.player.PlayerInteractEvent;
 
 import java.util.List;
 
-public final class BuilderItem extends Item
+public final class BuilderItem extends AEBasePoweredItem
         implements IGuiHolder<PlayerInventoryGuiData>, INetworkEncodable {
     static final int MAX_RATE = 16_384;
     public static final BuilderItem ITEM = new BuilderItem();
@@ -50,7 +55,7 @@ public final class BuilderItem extends Item
                     .setTextureName("structurelib:itemConstructableTrigger");
 
     private BuilderItem() {
-        setMaxStackSize(1);
+        super(AEConfig.instance.wirelessTerminalBattery, Optional.absent());
         setUnlocalizedName("sbnh.builder");
         setTextureName("structurebuildernh:wireless_structure_terminal");
     }
@@ -103,6 +108,7 @@ public final class BuilderItem extends Item
             float a,
             float b,
             float c) {
+        if (!p.isSneaking() && w.getTileEntity(x, y, z) instanceof TileWireless) return false;
         if (w.isRemote) return StructureBuilderNH.proxy.editPreview(p);
         if (StructureBuilderNH.proxy.consumePreviewUse(p)) return true;
         TileEntity tile = w.getTileEntity(x, y, z);
@@ -132,15 +138,15 @@ public final class BuilderItem extends Item
 
     @SubscribeEvent
     public void pickPreview(PlayerInteractEvent event) {
-        if (event.action != PlayerInteractEvent.Action.RIGHT_CLICK_AIR
-                && event.action != PlayerInteractEvent.Action.RIGHT_CLICK_BLOCK) return;
+        // Only native item-use callbacks open server UIs. Protection checks can also post interact events.
+        if (!event.world.isRemote || (event.action != PlayerInteractEvent.Action.RIGHT_CLICK_AIR
+                && event.action != PlayerInteractEvent.Action.RIGHT_CLICK_BLOCK)) return;
         EntityPlayer player = event.entityPlayer;
         ItemStack held = player.getHeldItem();
         if (held == null || held.getItem() != this) return;
-        if (event.world.isRemote) {
-            if (StructureBuilderNH.proxy.editPreview(player))
-                event.setCanceled(true);
-        } else if (StructureBuilderNH.proxy.consumePreviewUse(player)) event.setCanceled(true);
+        if (event.action == PlayerInteractEvent.Action.RIGHT_CLICK_BLOCK && !player.isSneaking()
+                && event.world.getTileEntity(event.x, event.y, event.z) instanceof TileWireless) return;
+        if (StructureBuilderNH.proxy.editPreview(player)) event.setCanceled(true);
     }
 
     @Override
@@ -183,13 +189,18 @@ public final class BuilderItem extends Item
 
     @SideOnly(Side.CLIENT)
     @Override
-    public void addInformation(ItemStack s, EntityPlayer p, List lines, boolean advanced) {
-        lines.add(StatCollector.translateToLocal("structurebuildernh.help"));
-        lines.add(StatCollector.translateToLocal("structurebuildernh.helpAir"));
-        lines.add(
-                StatCollector.translateToLocal(
-                        getEncryptionKey(s).isEmpty()
-                                ? "structurebuildernh.unbound"
-                                : "structurebuildernh.bound"));
+    public boolean isFull3D() {
+        return false;
+    }
+
+    @SideOnly(Side.CLIENT)
+    @Override
+    public void addCheckedInformation(ItemStack s, EntityPlayer p, List<String> lines, boolean advanced) {
+        super.addCheckedInformation(s, p, lines, advanced);
+        boolean linked = !getEncryptionKey(s).isEmpty();
+        lines.add((linked ? EnumChatFormatting.GREEN : EnumChatFormatting.RED)
+                + (linked ? GuiText.Linked : GuiText.Unlinked).getLocal() + EnumChatFormatting.RESET);
+        if (TerminalCardRecipe.hasRange(s)) lines.add(StatCollector.translateToLocal("structurebuildernh.unlimitedRange"));
+        if (TerminalCardRecipe.hasEnergy(s)) lines.add(StatCollector.translateToLocal("structurebuildernh.unlimitedEnergy"));
     }
 }

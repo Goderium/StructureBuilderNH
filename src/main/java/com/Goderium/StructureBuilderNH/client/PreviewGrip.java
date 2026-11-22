@@ -22,17 +22,22 @@ final class PreviewGrip {
     final UUID id;
     final long sequence, pressedAt;
     final int revision, slot, dimension;
+    final boolean near;
     final String tool;
     final ChunkCoordinates origin, at;
     final ExtendedFacing original;
     private final PreviewPose.Allowed allowed;
     ExtendedFacing facing;
-    boolean moving, released, limited, mirrored;
+    boolean moving, released, limited, mirrored, inputReleased;
     volatile boolean rejected;
     long releasedAt;
-    private final double depth, grabX, grabY, grabZ;
+    private final double initialDepth, grabX, grabY, grabZ;
+    private final int minDistance, maxDistance;
+    private double depth;
+    private boolean distanceAdjusted;
     private PreviewPose rotation;
     private ForgeDirection pitchAxis;
+    ForgeDirection downwardFace;
     private final FloatBuffer matrix = BufferUtils.createFloatBuffer(16);
 
     PreviewGrip(
@@ -43,6 +48,9 @@ final class PreviewGrip {
             ChunkCoordinates p,
             ExtendedFacing original,
             PreviewPose.Allowed allowed,
+            int minDistance,
+            int maxDistance,
+            boolean near,
             EntityPlayer actor,
             long now) {
         this.id = id;
@@ -53,6 +61,9 @@ final class PreviewGrip {
         at = new ChunkCoordinates(p);
         this.original = original;
         this.allowed = allowed;
+        this.minDistance = minDistance;
+        this.maxDistance = maxDistance;
+        this.near = near;
         pitchAxis = original.getRelativeLeftInWorld();
         dimension = actor.dimension;
         slot = actor.inventory.currentItem;
@@ -61,11 +72,12 @@ final class PreviewGrip {
         double dx = p.posX + .5 - actor.posX,
                 dy = p.posY + .5 - eyeY,
                 dz = p.posZ + .5 - actor.posZ;
-        depth = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        initialDepth = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        depth = MathHelper.clamp_double(initialDepth, minDistance, maxDistance);
         Vec3 look = actor.getLook(1);
-        grabX = actor.posX + look.xCoord * depth;
-        grabY = eyeY + look.yCoord * depth;
-        grabZ = actor.posZ + look.zCoord * depth;
+        grabX = actor.posX + look.xCoord * initialDepth;
+        grabY = eyeY + look.yCoord * initialDepth;
+        grabZ = actor.posZ + look.zCoord * initialDepth;
         orient(original);
     }
 
@@ -76,14 +88,32 @@ final class PreviewGrip {
     void track(EntityPlayer p) {
         Vec3 look = p.getLook(1);
         double eye = eyeY(p);
+        // Keep the original cell available for a turn in place at the edge of the distance range.
+        if (!distanceAdjusted && depth != initialDepth
+                && MathHelper.floor_double(.5 + p.posX + look.xCoord * initialDepth - grabX) == 0
+                && MathHelper.floor_double(.5 + eye + look.yCoord * initialDepth - grabY) == 0
+                && MathHelper.floor_double(.5 + p.posZ + look.zCoord * initialDepth - grabZ) == 0) {
+            at.set(origin.posX, origin.posY, origin.posZ);
+            return;
+        }
         int x = origin.posX + MathHelper.floor_double(.5 + p.posX + look.xCoord * depth - grabX);
         int y = origin.posY + MathHelper.floor_double(.5 + eye + look.yCoord * depth - grabY);
         int z = origin.posZ + MathHelper.floor_double(.5 + p.posZ + look.zCoord * depth - grabZ);
         at.set(x, y, z);
     }
 
-    void scroll(boolean vertical, int steps) {
-        moving = true;
+    void scrollDistance(int steps) {
+        double next = MathHelper.clamp_double(depth + steps, minDistance, maxDistance);
+        distanceAdjusted |= next != depth;
+        depth = next;
+        limited = false;
+    }
+
+    int displayDistance() {
+        return (int) Math.round(depth);
+    }
+
+    void scrollRotation(boolean vertical, int steps) {
         ForgeDirection axis = vertical ? pitchAxis : ForgeDirection.UP;
         ExtendedFacing current = facing;
         for (int i = 0; i < Math.abs(steps); i++) {
@@ -102,6 +132,12 @@ final class PreviewGrip {
     void orient(ExtendedFacing next) {
         facing = next;
         rotation = new PreviewPose(original, next);
+        for (ForgeDirection face : ForgeDirection.VALID_DIRECTIONS) {
+            if (rotation.yx * face.offsetX + rotation.yy * face.offsetY + rotation.yz * face.offsetZ == -1) {
+                downwardFace = face;
+                break;
+            }
+        }
         mirrored = reversesWinding(original.getFlip()) != reversesWinding(next.getFlip());
         matrix.clear();
         matrix.put(

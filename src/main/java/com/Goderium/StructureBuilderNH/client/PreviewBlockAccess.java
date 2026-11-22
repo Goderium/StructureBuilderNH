@@ -10,7 +10,7 @@ import net.minecraftforge.common.util.ForgeDirection;
 import java.util.HashMap;
 import java.util.Map;
 
-/** Immutable near-neighbor snapshot with bounded projection-only reads for deeper native icon queries. */
+/** Cached projection neighborhood with bounded reads for deeper native icon queries. */
 final class PreviewBlockAccess implements IBlockAccess {
     interface Cells {
         /** Zero means air/unknown. This source must read the projection and never acquire world chunks. */
@@ -20,23 +20,30 @@ final class PreviewBlockAccess implements IBlockAccess {
     private static final int EDGE = 18, MAX_EXTRA = 4096;
     private final int x, y, z;
     private final Cells source;
+    PreviewRegion reads;
     private final long[] near = new long[EDGE * EDGE * EDGE];
     private final Map<Long, Long> extra = new HashMap<>();
 
-    private PreviewBlockAccess(int x, int y, int z, Cells source) {
+    private PreviewBlockAccess(int x, int y, int z, Cells source, boolean eager) {
         this.x = x;
         this.y = y;
         this.z = z;
         this.source = source;
+        if (!eager) return;
         for (int dy = -1; dy <= 16; dy++)
             for (int dz = -1; dz <= 16; dz++)
                 for (int dx = -1; dx <= 16; dx++)
-                    near[slot(dx, dy, dz)] = read(x + dx, y + dy, z + dz);
+                    near[slot(dx, dy, dz)] = read(x + dx, y + dy, z + dz) + 1;
     }
 
     static PreviewBlockAccess snapshot(int x, int y, int z, Cells source) {
         if (source == null) throw new IllegalArgumentException("Missing preview cell source");
-        return new PreviewBlockAccess(x, y, z, source);
+        return new PreviewBlockAccess(x, y, z, source, true);
+    }
+
+    /** A world mesh reads only the cells its emitted faces and native CTM actually inspect. */
+    static PreviewBlockAccess lazy(int x, int y, int z, Cells source) {
+        return new PreviewBlockAccess(x, y, z, source, false);
     }
 
     static long state(Block block, int meta) {
@@ -61,9 +68,13 @@ final class PreviewBlockAccess implements IBlockAccess {
     }
 
     private long at(int px, int py, int pz) {
+        if (reads != null) reads.include(px, py, pz);
         int dx = px - x, dy = py - y, dz = pz - z;
-        if (dx >= -1 && dx <= 16 && dy >= -1 && dy <= 16 && dz >= -1 && dz <= 16)
-            return near[slot(dx, dy, dz)];
+        if (dx >= -1 && dx <= 16 && dy >= -1 && dy <= 16 && dz >= -1 && dz <= 16) {
+            int i = slot(dx, dy, dz);
+            if (near[i] == 0) near[i] = read(px, py, pz) + 1;
+            return near[i] - 1;
+        }
         // Native column icons may inspect up to fifteen blocks below a section boundary.
         // Retain those reads within the same 27-section neighborhood used for mesh invalidation.
         if (dx < -16 || dx > 31 || dy < -16 || dy > 31 || dz < -16 || dz > 31

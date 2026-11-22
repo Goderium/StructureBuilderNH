@@ -1,5 +1,6 @@
 package com.Goderium.StructureBuilderNH.common.builder;
 
+import com.Goderium.StructureBuilderNH.config.RebuildConfig;
 import com.Goderium.StructureBuilderNH.util.Bounds;
 
 import cpw.mods.fml.common.network.NetworkRegistry;
@@ -38,20 +39,25 @@ import java.nio.charset.StandardCharsets;
 /** A paced stream of compact section masks, independent of the lifetime of the item GUI. */
 public final class PreviewStream {
     public static final int BOX = 1, SHELL = 2, HATCH = 4;
+    public static final int FOOTING_ROWS = 10;
+    public static final int BLOCK_NAME = 11;
     /** A committed drop. The revision and epoch identify its upcoming replacement projection. */
     public static final int MOVE_ACCEPTED = 8;
     /** All initial geometry for this drop's revision and current epoch has been sent. */
     public static final int MOVE_READY = 9;
     private static final SimpleNetworkWrapper NET =
-            NetworkRegistry.INSTANCE.newSimpleChannel("sbnh.preview8");
+            NetworkRegistry.INSTANCE.newSimpleChannel("sbnh.preview9");
     private static final int FRAGMENT_BYTES = 28000, MAX_SECTION_BYTES = 524288;
     private static final int MAX_FRAME_META = BlockFrameBox.MATERIAL_MASK | BlockFrameBox.MTE_BIT;
     private static final Map<String, PreviewStream> views = new HashMap<>();
+    private static final Map<EntityPlayerMP, NameRequest> nameRequests = new java.util.concurrent.ConcurrentHashMap<>();
     private final UUID taskId;
     private final BuildTask task;
     private final EntityPlayerMP viewer;
     private Blueprint sent;
     private Bounds bounds;
+    private PreviewFooting footingScan;
+    private int footingFace, footingPage;
     private int cursor, lastLayers, lastAmbiguousDots;
     private int revision = -1, epoch;
     private Long moveSequence;
@@ -65,6 +71,7 @@ public final class PreviewStream {
     private boolean lastController;
     private boolean lastRepairable;
     private int lastPose=-1, lastPoseRevision=-1, lastX, lastY, lastZ;
+    private int lastDragMinDistance, lastDragMaxDistance;
     private final Set<Integer> changedSections = new LinkedHashSet<>();
     private final Set<Integer> materialSections = new LinkedHashSet<>(), materialRefresh = new LinkedHashSet<>();
     private final Set<Integer> renderRefresh = new LinkedHashSet<>();
@@ -72,7 +79,7 @@ public final class PreviewStream {
     private final Map<ChunkPosition, Integer> siteSections = new HashMap<>();
     private static final long[] NO_INSTALLED_HATCHES = new long[0];
     private final Map<Integer, long[]> installedHatches = new HashMap<>();
-    private boolean preferUpdate = true;
+    private boolean preferUpdate = true, preferRender;
 
     private PreviewStream(BuildTask task, EntityPlayerMP viewer) {
         this.taskId = UUID.fromString(task.id);
@@ -82,7 +89,63 @@ public final class PreviewStream {
 
     public static void register() {
         NET.registerMessage(Handler.class, Packet.class, 0, Side.CLIENT);
+        NET.registerMessage(NameHandler.class, NameRequest.class, 1, Side.SERVER);
         MinecraftForge.EVENT_BUS.register(new ChunkWatcher());
+    }
+
+    /** The color-only stream never needs a render palette merely to name one targeted voxel. */
+    public static final class NameRequest implements IMessage {
+        public UUID id;
+        public int epoch, revision, x, y, z;
+
+        public void toBytes(ByteBuf b) {
+            b.writeLong(id.getMostSignificantBits()); b.writeLong(id.getLeastSignificantBits());
+            b.writeInt(epoch); b.writeInt(revision); b.writeInt(x); b.writeInt(y); b.writeInt(z);
+        }
+
+        public void fromBytes(ByteBuf b) {
+            id = new UUID(b.readLong(), b.readLong());
+            epoch = b.readInt(); revision = b.readInt(); x = b.readInt(); y = b.readInt(); z = b.readInt();
+        }
+
+        public void send() { NET.sendToServer(this); }
+    }
+
+    public static final class NameHandler implements IMessageHandler<NameRequest, IMessage> {
+        public IMessage onMessage(NameRequest message, MessageContext context) {
+            nameRequests.put(context.getServerHandler().playerEntity, message);
+            return null;
+        }
+    }
+
+    private Packet name(NameRequest request) {
+        if (task.plan == null || sent != task.plan || epoch != request.epoch || revision != request.revision
+                || revision != task.revision || (task.previewLayers & (SHELL | HATCH)) == 0
+                || viewer.dimension != task.dim || viewer.isDead
+                || viewer.getDistanceSq(request.x + .5, request.y + .5, request.z + .5) > 16 * 16) return null;
+        Blueprint.Cell cell = sent.cellAt(request.x, request.y, request.z);
+        if (cell == null) return null;
+        Packet reply = packet(BLOCK_NAME);
+        reply.x = request.x; reply.y = request.y; reply.z = request.z;
+        BuildTask.MaterialSelection selected = task.cachedSelection(reply.x, reply.y, reply.z);
+        ItemStack item = cell.item;
+        Block block = cell.block;
+        int meta = cell.meta;
+        if (selected != null && selected.supported && selected.group != null) {
+            // The client only requests a projected (empty-world) position. Use the selected plan identity.
+            item = selected.group.optionItem(selected.index);
+            block = selected.group.optionBlock(selected.index);
+            meta = selected.group.optionMeta(selected.index);
+        }
+        if (block != null && block != Blocks.air && block != com.gtnewhorizon.structurelib.StructureLibAPI.getBlockHint()) {
+            reply.nameBlock = Block.getIdFromBlock(block);
+            reply.nameMeta = meta;
+        }
+        if (item != null && item.getItem() != null) {
+            reply.nameItem = Item.getIdFromItem(item.getItem());
+            reply.nameDamage = item.getMetadata();
+        }
+        return reply;
     }
 
     private Packet packet(int type) {
@@ -102,6 +165,7 @@ public final class PreviewStream {
 
     private static final class Budget {
         int scans = 128, sections = 8, bytes = 98304;
+        int footingWords = 512, footingBytes = 8192;
     }
 
     static void acceptMove(BuildTask task, EntityPlayerMP player, long sequence) {
@@ -206,24 +270,39 @@ public final class PreviewStream {
                 views.put(task.id, view);
             }
             // Keep the captured projection stable; queued site updates resume on release.
-            if (PreviewDragMessage.holding(p, task) || waitingForMovePlan && task.plan == null) continue;
-            view.markers(task, issue);
+            if (waitingForMovePlan && task.plan == null) continue;
+            boolean held = PreviewDragMessage.holding(p, task);
+            if (!held) view.markers(task, issue);
             if (task.plan != null)
-                view.send(task, budgets.computeIfAbsent(task.owner, k -> new Budget()));
+                view.send(task, budgets.computeIfAbsent(task.owner, k -> new Budget()), held);
         }
+        nameRequests.forEach((player, request) -> {
+            if (!nameRequests.remove(player, request)) return;
+            PreviewStream view = views.get(request.id.toString());
+            if (view != null && view.viewer == player) {
+                Packet reply = view.name(request);
+                if (reply != null) NET.sendTo(reply, player);
+            }
+        });
     }
 
     private void markers(BuildTask task, ChunkCoordinates issue) {
         boolean controller = (task.previewLayers & (HATCH | SHELL)) != 0;
         boolean repairable = issue != null && task.repairableIssue();
         int pose = controller && task.plan != null && task.plan.ready && task.movable() ? task.facing.getIndex() : -1;
+        int dragMinDistance = RebuildConfig.dragMinDistance, dragMaxDistance = RebuildConfig.dragMaxDistance;
         if (lastController == controller && lastRepairable == repairable && Objects.equals(issue, lastIssue)
-                && pose==lastPose && (pose < 0 || lastPoseRevision == task.revision)
+                && pose==lastPose && (pose < 0 || lastPoseRevision == task.revision
+                        && lastDragMinDistance == dragMinDistance && lastDragMaxDistance == dragMaxDistance)
                 && lastX==task.x && lastY==task.y && lastZ==task.z) return;
         Packet pkt = packet(4);
         pkt.layers = (controller ? 1 : 0) | (issue != null ? 2 : 0) | (repairable ? 4 : 0) | (pose>=0 ? 8 : 0);
         pkt.pose=pose;
-        if (pose >= 0) pkt.allowed = task.allowedPoses();
+        if (pose >= 0) {
+            pkt.allowed = task.allowedPoses();
+            pkt.dragMinDistance = dragMinDistance;
+            pkt.dragMaxDistance = dragMaxDistance;
+        }
         pkt.x = task.x;
         pkt.y = task.y;
         pkt.z = task.z;
@@ -232,19 +311,67 @@ public final class PreviewStream {
         lastController = controller;
         lastRepairable = repairable;
         lastPose=pose; lastPoseRevision=task.revision; lastX=task.x; lastY=task.y; lastZ=task.z;
+        lastDragMinDistance = dragMinDistance;
+        lastDragMaxDistance = dragMaxDistance;
         lastIssue = issue;
     }
 
-    private void send(BuildTask task, Budget budget) {
+    private void sendFooting(Budget budget) {
+        if (footingScan == null || !footingScan.ready()) return;
+        while (footingFace < footingScan.faces.length) {
+            PreviewFooting.Rows face = footingScan.faces[footingFace];
+            if (footingPage == face.pages.size()) {
+                face.pages.clear();
+                footingFace++;
+                footingPage = 0;
+                continue;
+            }
+            int count = Math.min(PreviewFooting.PAGE_ROWS, face.size - footingPage * PreviewFooting.PAGE_ROWS);
+            int bytes = 32 + count * 14;
+            if (bytes > budget.bytes || bytes > budget.footingBytes) return;
+            Packet page = packet(FOOTING_ROWS);
+            page.footingFace = footingFace;
+            page.footingFirst = footingPage == 0;
+            page.footingLast = footingPage + 1 == face.pages.size();
+            page.footingRows = face.pages.get(footingPage);
+            page.footingCount = count;
+            NET.sendTo(page, viewer);
+            budget.bytes -= bytes;
+            budget.footingBytes -= bytes;
+            footingPage++;
+        }
+    }
+
+    private void send(BuildTask task, Budget budget, boolean held) {
         Blueprint plan = task.plan;
         boolean editable = task.editable() && plan.ready;
         boolean locateHatches = task.state == BuildTask.State.PREVIEW && (task.previewLayers & HATCH) != 0;
-        boolean textured = textured(task);
+        boolean textured = task.useTexturedWorldPreview();
         boolean reset = sent != plan, modeChanged = lastTextured != textured;
         boolean contentChanged = revision != task.revision;
         boolean refresh = reset || contentChanged || modeChanged;
+        if (held && (refresh || lastLayers != task.previewLayers)) return;
+        PreviewFooting oldFooting = footingScan;
+        boolean hasBox = (task.previewLayers & BOX) != 0 && plan.ready;
+        if (!hasBox || footingScan != null && (footingScan.plan != plan || footingScan.solidityRevision != plan.solidityRevision))
+            footingScan = null;
+        // Only the held terminal's selected task draws contacts, even if many other boxes are visible.
+        ItemStack hand = hasBox ? viewer.getHeldItem() : null;
+        boolean showFooting = hand != null && hand.getItem() == BuilderItem.ITEM && hand.hasTagCompound()
+                && task.id.equals(hand.getTagCompound().getString("selected"))
+                && task.tool.equals(hand.getTagCompound().getString("tool"));
+        if (showFooting) {
+            if (footingScan == null) footingScan = new PreviewFooting(plan);
+            budget.footingWords -= footingScan.advance(budget.footingWords);
+        }
+        boolean footingChanged = footingScan != oldFooting;
+        if (footingChanged) footingFace = footingPage = 0;
+        if (held && !footingChanged) {
+            if (showFooting) sendFooting(budget);
+            return;
+        }
         int ambiguous = plan.ready ? plan.ambiguousHatchDots() : 0;
-        if (refresh || lastLayers != task.previewLayers || !plan.bounds.equals(bounds)
+        if (refresh || lastLayers != task.previewLayers || !plan.bounds.equals(bounds) || footingChanged
                 || lastEditable != editable || lastAmbiguousDots != ambiguous || lastLocateHatches != locateHatches) {
             if (refresh) {
                 if (!reset && inFlight >= 0) {
@@ -299,6 +426,7 @@ public final class PreviewStream {
             pkt.layers = task.previewLayers;
             pkt.textured = textured;
             pkt.bounds = plan.bounds;
+            pkt.footingReset = footingChanged || reset;
             pkt.controllerMeta = task.target.getMetadata();
             pkt.tier = task.tier;
             pkt.ambiguousDots = ambiguous;
@@ -311,7 +439,8 @@ public final class PreviewStream {
             lastAmbiguousDots = ambiguous;
             bounds = plan.bounds;
         }
-        if (!plan.ready || (lastLayers & (SHELL | HATCH)) == 0) return;
+        if (showFooting) sendFooting(budget);
+        if (held || !plan.ready || (lastLayers & (SHELL | HATCH)) == 0) return;
         Iterator<Integer> updates = changedSections.iterator();
         while (budget.scans > 0 && budget.sections > 0 && budget.bytes > 0
                 && (cursor < plan.sections.size() || updates.hasNext() || !materialRefresh.isEmpty()
@@ -326,9 +455,10 @@ public final class PreviewStream {
                 if (outbound.isEmpty()) inFlight = -1;
                 continue;
             }
-            boolean material = !materialRefresh.isEmpty();
-            boolean update = !material && updates.hasNext() && (preferUpdate || cursor == plan.sections.size());
-            boolean render = !material && !update && !renderRefresh.isEmpty();
+            // Progress can stay nonempty for many ticks. Reserve alternate sends for missing palettes.
+            boolean render = !renderRefresh.isEmpty() && (preferRender || materialRefresh.isEmpty() && !updates.hasNext());
+            boolean material = !render && !materialRefresh.isEmpty();
+            boolean update = !render && !material && updates.hasNext() && (preferUpdate || cursor == plan.sections.size());
             Blueprint.Section section;
             if (material) {
                 int id = materialRefresh.iterator().next();
@@ -338,12 +468,14 @@ public final class PreviewStream {
             } else if (render) {
                 int id = renderRefresh.iterator().next();
                 renderRefresh.remove(id);
+                materialRefresh.remove(id);
                 section = plan.sections.get(id);
             } else if (update) {
                 section = plan.sections.get(updates.next());
                 updates.remove();
             } else section = plan.sections.get(cursor);
             preferUpdate = !update;
+            preferRender = !render;
             budget.scans--;
             Packet pkt = update ? progress(section) : section(task, section);
             if (!update && !material && !render) cursor++;
@@ -433,7 +565,7 @@ public final class PreviewStream {
 
     private Packet section(BuildTask task, Blueprint.Section section) {
         Packet pkt = progress(section);
-        pkt.textured = textured(task);
+        pkt.textured = task.useTexturedWorldPreview();
         pkt.type = pkt.textured ? 7 : 2;
         pkt.solid = section.solid.clone();
         pkt.hatch = section.hatch.clone();
@@ -468,13 +600,16 @@ public final class PreviewStream {
             MaterialChoice group = selection.group;
             boolean loaded = world != null && world.blockExists(x, y, z);
             int selected = loaded ? task.previewIndex(selection, world) : selection.index;
-            ItemStack item = loaded ? task.previewItem(selection, world) : group.optionItem(selected);
+            ItemStack item = loaded ? task.previewItem(selection, world)
+                    : group.isFluid(selected) ? null : group.optionItem(selected);
             Style style = new Style();
             style.group = roles.computeIfAbsent(group, ignored -> roles.size());
             style.item = item == null ? -1 : Item.getIdFromItem(item.getItem());
             style.damage = item == null ? 0 : item.getMetadata();
             style.option = selected;
-            style.air = item == null;
+            style.optionCount = group.optionCount();
+            boolean fluid = group.isFluid(selected);
+            style.air = item == null && !fluid;
             style.conflict = loaded ? task.previewConflict(selection, world) : selection.conflict;
             style.groupSelectable = group.groupSelectable();
             style.piece = selection.piece == null ? "" : selection.piece;
@@ -502,7 +637,8 @@ public final class PreviewStream {
                         render = renderMaterial(world.getBlock(x, y, z), world.getBlockMetadata(x, y, z),
                                 gt == null ? -1 : gt.getMetaTileID(), gt == null ? -1 : gt.getFrontFacing().ordinal());
                     }
-                    if (render == null) render = itemRender(item, cell.previewFront(task.facing.getDirection()).ordinal());
+                    if (render == null) render = fluid ? renderMaterial(group.optionBlock(selected), group.optionMeta(selected), -1, -1)
+                            : itemRender(item, cell.previewFront(task.facing.getDirection()).ordinal());
                     paintRender(pkt, renderPalette, i, render);
                 }
             }
@@ -512,10 +648,6 @@ public final class PreviewStream {
         pkt.dots = new byte[count];
         pkt.hatchTypes = HatchTypes.collect(task.plan, section, pkt.dots);
         return pkt;
-    }
-
-    private static boolean textured(BuildTask task) {
-        return task.texturedPreview && (task.previewLayers & SHELL) != 0;
     }
 
     private static void paintRender(Packet packet, Map<Long, Integer> palette, int slot, RenderMaterial render) {
@@ -582,10 +714,11 @@ public final class PreviewStream {
 
     static void clear() {
         views.clear();
+        nameRequests.clear();
     }
 
     public static final class Style {
-        public int item, damage, group, option;
+        public int item, damage, group, option, optionCount;
         public boolean air, conflict, groupSelectable;
         public String piece;
         public char symbol;
@@ -604,16 +737,22 @@ public final class PreviewStream {
     }
 
     public static final class Packet implements IMessage {
+        private static final long[] EMPTY_WORLD_MASK = new long[64];
         public UUID id;
         public int type, dim, layers, x, y, z, revision, epoch;
         /** Client grip sequence echoed by MOVE_ACCEPTED and MOVE_READY. */
         public long sequence;
         public int controllerMeta, tier, ambiguousDots, pose=-1;
+        // A legacy pose frame limits the client to the original short pickup and drop range.
+        public int dragMinDistance = RebuildConfig.DEFAULT_DRAG_MIN_DISTANCE, dragMaxDistance = PreviewAim.USE_REACH;
         public PreviewPose.Allowed allowed;
         public HatchTypes hatchTypes;
         public boolean reset, editable, textured, locateHatches;
         public String tool;
         public Bounds bounds;
+        public boolean footingReset, footingFirst, footingLast;
+        public int footingFace, footingCount;
+        public int[] footingRows;
         public long[] solid, hatch, confirmed, optional, painted;
         /** Actual GT hatches at projected hatch slots. Independent of structure validation and GUI picking. */
         public long[] installedHatches;
@@ -621,6 +760,8 @@ public final class PreviewStream {
         public short[] styleSlots;
         public List<RenderMaterial> renders;
         public short[] renderSlots;
+        /** One requested plan identity, localized by the viewer. */
+        public int nameBlock, nameMeta, nameItem = -1, nameDamage;
         public byte[] dots;
         public int transfer, part, parts, totalBytes;
         public byte[] payload;
@@ -635,6 +776,22 @@ public final class PreviewStream {
             b.writeInt(dim);
             b.writeInt(epoch);
             b.writeInt(revision);
+            if (type == BLOCK_NAME) {
+                b.writeInt(x); b.writeInt(y); b.writeInt(z);
+                b.writeInt(nameBlock); b.writeInt(nameMeta); b.writeInt(nameItem); b.writeInt(nameDamage);
+                return;
+            }
+            if (type == FOOTING_ROWS) {
+                b.writeByte(footingFace | (footingFirst ? 8 : 0) | (footingLast ? 16 : 0));
+                b.writeShort(footingCount);
+                for (int i = 0; i < footingCount * 4; i += 4) {
+                    b.writeInt(footingRows[i]);
+                    b.writeInt(footingRows[i + 1]);
+                    b.writeInt(footingRows[i + 2]);
+                    b.writeShort(footingRows[i + 3]);
+                }
+                return;
+            }
             if (type == MOVE_ACCEPTED || type == MOVE_READY) {
                 b.writeLong(sequence);
                 if (type == MOVE_ACCEPTED && pose >= 0) b.writeByte(pose);
@@ -663,11 +820,13 @@ public final class PreviewStream {
                     b.writeByte(pose);
                     b.writeLong(allowed.low);
                     b.writeLong(allowed.high);
+                    b.writeInt(dragMinDistance);
+                    b.writeInt(dragMaxDistance);
                 }
                 return;
             }
             if (type == 1) {
-                b.writeByte((layers & 7) | (locateHatches ? 64 : 0) | (textured ? 128 : 0));
+                b.writeByte((layers & 7) | (footingReset ? 32 : 0) | (locateHatches ? 64 : 0) | (textured ? 128 : 0));
                 b.writeBoolean(reset);
                 b.writeBoolean(editable);
                 ByteBufUtils.writeUTF8String(b, tool);
@@ -729,6 +888,11 @@ public final class PreviewStream {
                 writeMask(b, confirmed);
                 if (type == 7) writeRenders(b);
                 if (installedHatches != null) writeMask(b, installedHatches);
+                if ((type == 2 || type == 7) && !styles.isEmpty()) {
+                    // Keep old readers aligned through the optional installed-hatch mask.
+                    if (installedHatches == null) writeMask(b, EMPTY_WORLD_MASK);
+                    for (Style style : styles) ByteBufUtils.writeVarInt(b, style.optionCount, 5);
+                }
             }
         }
 
@@ -787,7 +951,7 @@ public final class PreviewStream {
                 material.validate();
                 renders.add(material);
             }
-            long[] projected = readMask(b);
+            long[] projected = readMask(b, true);
             renderSlots = count == 0 ? null : new short[4096];
             int run = 0, material = 0;
             for (int word = 0; word < 64; word++) {
@@ -818,9 +982,11 @@ public final class PreviewStream {
             }
         }
 
-        private static long[] readMask(ByteBuf b) {
-            long[] mask = new long[64];
+        private static long[] readMask(ByteBuf b, boolean readOnly) {
             long present = b.readLong();
+            // World payloads and the temporary render-slot mask are never mutated after decoding.
+            if (present == 0 && readOnly) return EMPTY_WORLD_MASK;
+            long[] mask = new long[64];
             while (present != 0) {
                 int i = Long.numberOfTrailingZeros(present);
                 mask[i] = b.readLong();
@@ -841,6 +1007,29 @@ public final class PreviewStream {
             dim = b.readInt();
             epoch = b.readInt();
             revision = b.readInt();
+            if (type == BLOCK_NAME) {
+                x = b.readInt(); y = b.readInt(); z = b.readInt();
+                nameBlock = b.readInt(); nameMeta = b.readInt(); nameItem = b.readInt(); nameDamage = b.readInt();
+                return;
+            }
+            if (type == FOOTING_ROWS) {
+                int flags = b.readUnsignedByte();
+                footingFace = flags & 7;
+                footingFirst = (flags & 8) != 0;
+                footingLast = (flags & 16) != 0;
+                footingCount = b.readUnsignedShort();
+                if (footingFace >= 6 || footingCount == 0 || footingCount > PreviewFooting.PAGE_ROWS
+                        || b.readableBytes() != footingCount * 14)
+                    throw new IllegalArgumentException("Invalid footing page");
+                footingRows = new int[footingCount * 4];
+                for (int i = 0; i < footingRows.length; i += 4) {
+                    footingRows[i] = b.readInt();
+                    footingRows[i + 1] = b.readInt();
+                    footingRows[i + 2] = b.readInt();
+                    footingRows[i + 3] = b.readUnsignedShort();
+                }
+                return;
+            }
             if (type == MOVE_ACCEPTED || type == MOVE_READY) {
                 sequence = b.readLong();
                 if (type == MOVE_ACCEPTED && b.isReadable()) pose = b.readUnsignedByte();
@@ -870,6 +1059,10 @@ public final class PreviewStream {
                 if ((layers & 8) != 0) {
                     pose = b.readUnsignedByte();
                     allowed = new PreviewPose.Allowed(b.readLong(), b.readLong());
+                    if (b.readableBytes() >= 2 * Integer.BYTES) {
+                        dragMinDistance = b.readInt();
+                        dragMaxDistance = b.readInt();
+                    }
                 }
                 return;
             }
@@ -892,20 +1085,21 @@ public final class PreviewStream {
                 controllerMeta = b.readInt();
                 tier = b.readInt();
                 ambiguousDots = b.readInt();
+                footingReset = (flags & 32) != 0;
             } else {
                 x = b.readInt();
                 y = b.readInt();
                 z = b.readInt();
                 if (type == 2 || type == 7) {
-                    solid = readMask(b);
-                    hatch = readMask(b);
+                    solid = readMask(b, worldProjection);
+                    hatch = readMask(b, worldProjection);
                     int count = 0;
                     for (long h : hatch) count += Long.bitCount(h);
                     dots = new byte[count];
                     b.readBytes(dots);
                     for (byte dot : dots) if ((dot & 255) > 16) throw new IllegalArgumentException("Invalid hatch dots");
                     hatchTypes = count == 0 ? HatchTypes.EMPTY : HatchTypes.read(b, count);
-                    optional = readMask(b);
+                    optional = readMask(b, worldProjection);
                     int styleCount = b.readUnsignedShort();
                     if (styleCount > 4096) throw new IllegalArgumentException("Too many preview styles");
                     styles = new ArrayList<>(styleCount);
@@ -927,7 +1121,7 @@ public final class PreviewStream {
                         style.piece = new String(name, StandardCharsets.UTF_8);
                         styles.add(style);
                     }
-                    painted = readMask(b);
+                    painted = readMask(b, worldProjection);
                     styleSlots = styleCount == 0 ? null : new short[4096];
                     int run = 0, style = 0;
                     for (int word = 0; word < 64; word++)
@@ -943,9 +1137,11 @@ public final class PreviewStream {
                         }
                     if (run != 0) throw new IllegalArgumentException("Preview material run overflow");
                 }
-                confirmed = readMask(b);
+                confirmed = readMask(b, worldProjection);
                 if (type == 7) readRenders(b);
-                installedHatches = worldProjection && b.isReadable() ? readMask(b) : null;
+                installedHatches = worldProjection && b.isReadable() ? readMask(b, true) : null;
+                if (worldProjection && (type == 2 || type == 7) && b.isReadable())
+                    for (Style style : styles) style.optionCount = ByteBufUtils.readVarInt(b, 5);
             }
         }
     }

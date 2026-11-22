@@ -51,10 +51,12 @@ final class BuildTask {
     final BuilderTasks store;
     final String id, owner, tool;
     final int dim;
+    private String dimensionName;
     int x, y, z;
     ExtendedFacing facing;
     boolean existing;
     private boolean temporaryHost;
+    boolean unlimitedRange;
     String key = "", orderId = "", detail = "", reason = "";
     State state = State.DRAFT;
     boolean auto, received;
@@ -105,6 +107,7 @@ final class BuildTask {
             orderFunding = new MaterialAssignments();
     Blueprint plan;
     MaterialOrder order;
+    private boolean obsoleteFluidOrder;
     private final int[] xyz = new int[3];
     private BitSet pending = new BitSet();
     private BitSet confirmed = new BitSet();
@@ -152,16 +155,21 @@ final class BuildTask {
                 return;
             }
             boolean air = world.isAirBlock(result.x, result.y, result.z);
-            if (cell.isFluid()) {
+            boolean previewFluid = selection == null ? cell.isFluid() : selection.group.isFluid(selection.index);
+            if (previewFluid) {
                 // Leave process fluids to the machine or player, and keep empty cells visible in the projection.
                 if (air) {
-                    result.matches = cell.constraints == null
-                            || cell.constraints.stream().allMatch(c -> c.isFluid() || c.air);
+                    result.matches = (selection == null || !selection.conflict) && (cell.constraints == null
+                            || cell.constraints.stream().allMatch(c -> c.isFluid() || c.air || c.choice == cell.choice && c.choice != null));
                     result.status = result.matches ? OrdinaryStatus.AIR : OrdinaryStatus.BLOCKED;
                 } else {
-                    result.matches = world.getBlock(result.x, result.y, result.z) == cell.block
+                    result.matches = (selection != null || world.getBlock(result.x, result.y, result.z) == cell.block)
                             && materialMatches(cell, world, result.x, result.y, result.z);
                     result.status = result.matches ? OrdinaryStatus.INSTALLED : OrdinaryStatus.BLOCKED;
+                    if (result.matches && !StructureFluids.isFluid(world.getBlock(result.x, result.y, result.z))) {
+                        result.installedMaterial = ordinaryInstalledMaterial(world, result);
+                        result.counted = result.installedMaterial != null;
+                    }
                 }
                 return;
             }
@@ -173,6 +181,10 @@ final class BuildTask {
                     result.status = OrdinaryStatus.AIR;
                 } else {
                     result.status = OrdinaryStatus.INSTALLED;
+                    if (StructureFluids.isFluid(world.getBlock(result.x, result.y, result.z))) {
+                        result.counted = false;
+                        return;
+                    }
                     if (itemDetails || result.material == null && selection != null && !selection.explicit)
                         result.installedMaterial = ordinaryInstalledMaterial(world, result);
                     // An implicit optional-air choice preserves an already installed native-valid solid.
@@ -275,7 +287,10 @@ final class BuildTask {
             index = group == null ? -1 : group.defaultIndex;
         }
 
-        ItemStack item() { return supported ? group.optionItem(index) : cell.item; }
+        ItemStack item() {
+            if (!supported) return cell.item;
+            return group.isFluid(index) ? null : group.optionItem(index);
+        }
         String name() { return supported ? group.optionName(index) : cell.item == null ? "" : cell.item.getDisplayName(); }
     }
 
@@ -356,11 +371,11 @@ final class BuildTask {
                     selection.index = next < remaining.length ? next : group.defaultIndex;
                     if (next < remaining.length) remaining[next]--;
                 }
-                if (!plan.accepts(selection.cell, selection.item(), selection.x, selection.y, selection.z)) {
+                if (!plan.accepts(selection.cell, selection.index, selection.x, selection.y, selection.z)) {
                     selection.conflict = true;
                     if (!selection.explicit) {
                         for (int i = 0; i < group.optionCount(); i++) {
-                            if (plan.accepts(selection.cell, group.optionItem(i), selection.x, selection.y, selection.z)) {
+                            if (plan.accepts(selection.cell, i, selection.x, selection.y, selection.z)) {
                                 selection.index = i;
                                 selection.conflict = false;
                                 break;
@@ -374,7 +389,7 @@ final class BuildTask {
         for (int i = 0; i < selectedMaterials.length; i++) {
             MaterialSelection selection = selectedMaterials[i];
             if (selection != null) {
-                plan.displayAir(i, selection.group.isAir(selection.index));
+                plan.displayChoice(i, selection.group.isAir(selection.index), selection.group.isFluid(selection.index));
                 materialTotals.get(selection.group)[selection.index]++;
             }
         }
@@ -398,8 +413,7 @@ final class BuildTask {
 
     boolean materialSelectable(int px, int py, int pz) {
         if (!editable() || plan == null || !plan.ready) return false;
-        int index = plan.indexAt(px, py, pz);
-        if (index < 0 || (confirmed == null ? !pending.get(index) : confirmed.get(index))) return false;
+        // Editing a planned choice invalidates its previous confirmation in materialsChanged.
         MaterialSelection selection = selection(px, py, pz);
         return selection != null && selection.supported;
     }
@@ -419,6 +433,7 @@ final class BuildTask {
         if (selection == null || !selection.supported) return null;
         if (!selection.explicit && world != null && !world.isAirBlock(selection.x, selection.y, selection.z)
                 && plan.matches(selection.cell, world, selection.x, selection.y, selection.z)) {
+            if (StructureFluids.isFluid(world.getBlock(selection.x, selection.y, selection.z))) return null;
             IStructureElement.BlocksToPlace present = IStructureElement.BlocksToPlace.create(
                     world.getBlock(selection.x, selection.y, selection.z),
                     world.getBlockMetadata(selection.x, selection.y, selection.z));
@@ -566,6 +581,16 @@ final class BuildTask {
 
     void changed() {
         store.markDirty();
+    }
+
+    String dimensionName() {
+        return dimensionName == null ? "" : dimensionName;
+    }
+
+    void rememberDimension(World world) {
+        if (dimensionName != null || world == null) return;
+        dimensionName = TaskDimension.identify(dim, world);
+        changed();
     }
 
     void discardCachedPlan() {
@@ -956,6 +981,11 @@ final class BuildTask {
     private boolean canChangePreview() {
         return target != null && state != State.DONE && state != State.REFUND && !dismantleRequested
                 && state != State.DISMANTLED && state != State.DISMANTLING && state != State.TEARDOWN_PAUSED;
+    }
+
+    boolean useTexturedWorldPreview() {
+        return texturedPreview && (previewLayers & PreviewStream.SHELL) != 0
+                && state != State.QUEUED && state != State.BUILDING && state != State.VERIFYING;
     }
 
     void setTexturedPreview(boolean textured) {
@@ -1359,6 +1389,19 @@ final class BuildTask {
             detach();
             return;
         }
+        if (obsoleteFluidOrder && ordering()) {
+            // A persisted AE request owns its original pattern. Cancel the original link before
+            // requesting a corrected bill; stock which already arrived stays in refundable escrow.
+            if (savedLink != null) {
+                if (order == null) order = new MaterialOrder(this, net, world);
+                if (order.link != null) order.link.cancel();
+            }
+            clearOrder();
+            state = State.MISSING;
+            reason = "missing";
+            if (online) submit(actor, world);
+            return;
+        }
         if (order != null
                 && (order.access != net.node
                         || order.getActionableNode() == null
@@ -1393,6 +1436,7 @@ final class BuildTask {
     }
 
     void clearOrder() {
+        obsoleteFluidOrder = false;
         detach();
         savedLink = null;
         orderId = "";
@@ -1573,11 +1617,21 @@ final class BuildTask {
             ChunkCoordinates p = ledger.next();
             int x = p.posX, y = p.posY, z = p.posZ;
             if (!requireChunk(world, x, y, z)) break;
-            if (ledger.matches(world, x, y, z) && !ledger.harvest(actor, world, blueprint, x, y, z)) {
-                stop("harvest", x, y, z);
-                state = State.TEARDOWN_PAUSED;
-                changed();
-                break;
+            if (ledger.matches(world, x, y, z)) {
+                double charge = TerminalEnergy.REMOVE.reserve(actor, blueprint);
+                if (charge < 0) { reason = "noEnergy"; changed(); break; }
+                boolean removed = false;
+                try {
+                    removed = ledger.harvest(actor, world, blueprint, x, y, z);
+                } finally {
+                    if (!removed) TerminalEnergy.refund(blueprint, charge);
+                }
+                if (!removed) {
+                    stop("harvest", x, y, z);
+                    state = State.TEARDOWN_PAUSED;
+                    changed();
+                    break;
+                }
             }
             ledger.forget(x, y, z);
             used++;
@@ -1664,8 +1718,8 @@ final class BuildTask {
         store.completed(this, actor, world);
     }
 
-    int build(EntityPlayerMP actor, WorldServer world, int budget, long deadline) {
-        if (upgrading()) return buildUpgrade(actor,world,budget,deadline);
+    int build(EntityPlayerMP actor, WorldServer world, ItemStack terminal, int budget, long deadline) {
+        if (upgrading()) return buildUpgrade(actor,world,terminal,budget,deadline);
         if (plan == null || !plan.ready || budget <= 0) return 0;
         if (!prepareOrdinaryProgress(world, deadline)) return 0;
         boolean creative = actor.capabilities.isCreativeMode;
@@ -1735,23 +1789,15 @@ final class BuildTask {
                     break;
                 }
             }
-            ItemStack unit = material.copy();
-            unit.stackSize = 1;
-            net.minecraft.block.Block beforeBlock = world.getBlock(px, py, pz);
-            int beforeMeta = world.getBlockMetadata(px, py, pz);
-            if (!blankRitual
-                    && !unit.tryPlaceItemIntoWorld(actor, world, px, py, pz, 1, .5f, .5f, .5f)) {
-                stop("denied", px, py, pz);
-                break;
+            double charge = TerminalEnergy.PLACE.reserve(actor, terminal);
+            if (charge < 0) { reason = "noEnergy"; break; }
+            boolean placedBlock = false;
+            try {
+                placedBlock = placeCell(actor, world, c, material, px, py, pz, blankRitual);
+            } finally {
+                if (!placedBlock) TerminalEnergy.refund(terminal, charge);
             }
-            if (c.inscribedRitual
-                    && world.getBlock(px, py, pz) == c.block
-                    && world.getBlockMetadata(px, py, pz) == 0) {
-                world.setBlockMetadataWithNotify(px, py, pz, c.meta, 3);
-            }
-            boolean mutated = beforeBlock != world.getBlock(px, py, pz)
-                    || beforeMeta != world.getBlockMetadata(px, py, pz);
-            if (!mutated) {
+            if (!placedBlock) {
                 stop("denied", px, py, pz);
                 break;
             }
@@ -1798,7 +1844,21 @@ final class BuildTask {
         return used;
     }
 
-    private int buildUpgrade(EntityPlayerMP actor, WorldServer world, int budget, long deadline) {
+    private boolean placeCell(EntityPlayerMP actor, WorldServer world, Blueprint.Cell cell, ItemStack material,
+            int x, int y, int z, boolean blankRitual) {
+        net.minecraft.block.Block before = world.getBlock(x, y, z);
+        int meta = world.getBlockMetadata(x, y, z);
+        if (!blankRitual) {
+            ItemStack unit = material.copy();
+            unit.stackSize = 1;
+            if (!unit.tryPlaceItemIntoWorld(actor, world, x, y, z, 1, .5f, .5f, .5f)) return false;
+        }
+        if (cell.inscribedRitual && world.getBlock(x, y, z) == cell.block && world.getBlockMetadata(x, y, z) == 0)
+            world.setBlockMetadataWithNotify(x, y, z, cell.meta, 3);
+        return before != world.getBlock(x, y, z) || meta != world.getBlockMetadata(x, y, z);
+    }
+
+    private int buildUpgrade(EntityPlayerMP actor, WorldServer world, ItemStack terminal, int budget, long deadline) {
         if (plan==null || !plan.ready || budget<=0 || !recoverUpgrade(world) || !upgradeAnchor(world)) return 0;
         if (world.getTotalWorldTime()<nextSalvageRetry) return 0;
         Wireless net=Wireless.find(this,world,actor);
@@ -1848,9 +1908,16 @@ final class BuildTask {
             }
             UpgradePlacement.Recovery transaction=new UpgradePlacement.Recovery(px,py,pz,result.oldBlock,result.oldMeta,
                     result.targetBlock,result.targetMeta,ledger.matches(world,px,py,pz));
+            double charge = TerminalEnergy.REPLACE.reserve(actor, terminal);
+            if (charge < 0) { reason = "noEnergy"; changed(); break; }
             upgradeRecovery=transaction;
             changed();
-            UpgradePlacement.Outcome outcome=UpgradePlacement.replace(transaction,actor,world,material);
+            UpgradePlacement.Outcome outcome = null;
+            try {
+                outcome = UpgradePlacement.replace(transaction,actor,world,material);
+            } finally {
+                if (outcome != UpgradePlacement.Outcome.SUCCESS) TerminalEnergy.refund(terminal, charge);
+            }
             if (outcome!=UpgradePlacement.Outcome.SUCCESS) {
                 if (transaction.oldMatches(world)) {
                     ledger.restoreOwnership(world,px,py,pz,transaction.owned);
@@ -1912,7 +1979,9 @@ final class BuildTask {
         n.setString("owner", owner);
         n.setString("tool", tool);
         n.setString("key", key);
+        n.setBoolean("unlimitedRange", unlimitedRange);
         n.setInteger("dim", dim);
+        if (dimensionName != null) n.setString("dimensionName", dimensionName);
         n.setInteger("x", x);
         n.setInteger("y", y);
         n.setInteger("z", z);
@@ -1991,6 +2060,8 @@ final class BuildTask {
                         ExtendedFacing.byIndex(n.getInteger("facing")),
                         n.getBoolean("existing"));
         t.temporaryHost = t.existing && n.getBoolean("temporaryHost");
+        t.dimensionName = n.hasKey("dimensionName", 8)
+                ? n.getString("dimensionName") : TaskDimension.identify(t.dim, null);
         t.ledger.load(n.getCompoundTag("placements"));
         if (n.hasKey("structureCells", 9)) t.loadStructureCells(n.getTagList("structureCells", 10));
         int[] positions = n.getIntArray("manualHatches");
@@ -1999,6 +2070,7 @@ final class BuildTask {
         t.deleteRequested = n.getBoolean("deleteRequested");
         t.dismantleRequested = n.getBoolean("dismantleRequested");
         t.key = n.getString("key");
+        t.unlimitedRange = n.getBoolean("unlimitedRange");
         t.state = State.valueOf(n.getString("state"));
         t.reason = n.getString("reason");
         NBTTagList scope=n.getTagList("upgradeChannels",8);
@@ -2119,7 +2191,13 @@ final class BuildTask {
         if (n.hasKey("orderFunding")) t.orderFunding.read(n.getTagList("orderFunding", 10));
         else t.orderFunding.addExact(t.orderItems);
         t.errors.read(n.getTagList("errors", 10));
+        // Older read paths could quote the technical ItemBlock for a fluid. Physical escrow remains refundable.
+        t.needed.rows.values().removeIf(e -> StructureFluids.isFluidItem(e.item));
+        t.shortage.rows.values().removeIf(e -> StructureFluids.isFluidItem(e.item));
+        t.errors.rows.values().removeIf(e -> StructureFluids.isFluidItem(e.item));
         t.orderId = n.getString("orderId");
+        t.obsoleteFluidOrder = t.ordering() && !t.received && t.orderItems.rows.values().stream()
+                .anyMatch(e -> StructureFluids.isFluidItem(e.item));
         if (n.hasKey("link")) t.savedLink = n.getCompoundTag("link");
         // An old, unconfirmed list omits higher tiers and same-tier variants. Reinspect before presenting it.
         if (t.upgrading() && !t.upgradeApproved && !n.getBoolean("exactReplacement")

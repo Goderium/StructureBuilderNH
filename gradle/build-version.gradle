@@ -1,0 +1,57 @@
+def identity = new Properties()
+file('gradle.properties').withReader('UTF-8') { identity.load(it) }
+def base = identity.getProperty('modVersion')
+if (providers.gradleProperty('modVersion').get() != base) {
+    throw new GradleException('Set the base modVersion in gradle.properties. Branch builds derive their version from Git.')
+}
+if (!(base ==~ /[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?/) ||
+        !(project.name ==~ /[A-Za-z][A-Za-z0-9_-]*/)) {
+    throw new GradleException('Check modName and modVersion in gradle.properties.')
+}
+
+def git = { String... args ->
+    providers.exec {
+        workingDir rootDir
+        commandLine(['git'] + args.toList())
+    }.standardOutput.asText.get().trim()
+}
+def releaseTag = providers.gradleProperty('releaseTag').orNull
+if (!file('.git').exists()) {
+    if (releaseTag != null) throw new GradleException('A release build requires its Git checkout.')
+    version = "${base}-source"
+    return
+}
+
+def status = git('status', '--porcelain=v2', '--branch', '--untracked-files=normal').readLines()
+def dirty = status.any { !it.startsWith('# ') }
+def unborn = status.contains('# branch.oid (initial)')
+def expectedTag = "v${base}".toString()
+def cleanRelease = !dirty && !unborn && git('tag', '--list', expectedTag, '--points-at', 'HEAD') == expectedTag
+if (releaseTag != null && (releaseTag != expectedTag || !cleanRelease)) {
+    throw new GradleException("A release build requires a clean checkout of ${expectedTag} at HEAD.")
+}
+if (cleanRelease) {
+    version = base
+    return
+}
+
+def currentBranch = status.find { it.startsWith('# branch.head ') }.substring('# branch.head '.length())
+def branch = providers.gradleProperty('buildBranch').orNull ?: currentBranch
+if (branch == '(detached)') branch = providers.environmentVariable('GIT_BRANCH').getOrElse('git')
+// Follow ExampleMod's GTNHGradle GitVersionModule for portable branch identifiers.
+def branchName = branch.replaceFirst('^origin/', '').replaceAll(/[^a-zA-Z0-9-]+/, '-')
+if (unborn) {
+    version = "${base}-${branchName}+unborn" + (dirty ? '-dirty' : '')
+    return
+}
+def description = git('describe', '--tags', '--match', 'v[0-9]*', '--long', '--always', '--abbrev=10', 'HEAD')
+def tagged = description =~ /^.+-(\d+)-g([0-9a-f]+)$/
+def revision = description
+if (tagged.matches()) {
+    if (tagged.group(1) != '0') branchName += '.' + tagged.group(1)
+    revision = tagged.group(2)
+}
+// A base version may already carry SemVer build metadata. Keep a single '+'.
+def parts = base.split(/\+/, 2)
+def metadata = parts.size() == 2 ? parts[1] + '.' : ''
+version = "${parts[0]}-${branchName}+${metadata}${revision}" + (dirty ? '-dirty' : '')
