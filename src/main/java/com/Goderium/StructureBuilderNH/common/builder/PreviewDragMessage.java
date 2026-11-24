@@ -21,7 +21,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * server tick.
  */
 public final class PreviewDragMessage implements IMessage {
-    public static final int PRESS = 0, TAP = 1, DROP = 2, CANCEL = 3;
+    public static final int PRESS = 0, TAP = 1, DROP = 2, CANCEL = 3, SURVEY = 4;
     private static final Map<EntityPlayerMP, Deque<PreviewDragMessage>> pending =
             new ConcurrentHashMap<>();
     private static final Map<EntityPlayerMP, PreviewDragMessage> grips = new HashMap<>();
@@ -69,7 +69,7 @@ public final class PreviewDragMessage implements IMessage {
         b.writeLong(id.getLeastSignificantBits());
         b.writeLong(sequence);
         b.writeInt(revision);
-        if (op == DROP) {
+        if (op == DROP || op == SURVEY) {
             b.writeInt(x);
             b.writeInt(y);
             b.writeInt(z);
@@ -84,7 +84,7 @@ public final class PreviewDragMessage implements IMessage {
         id = new UUID(b.readLong(), b.readLong());
         sequence = b.readLong();
         revision = b.readInt();
-        if (op == DROP) {
+        if (op == DROP || op == SURVEY) {
             x = b.readInt();
             y = b.readInt();
             z = b.readInt();
@@ -97,7 +97,7 @@ public final class PreviewDragMessage implements IMessage {
     public static final class Handler implements IMessageHandler<PreviewDragMessage, IMessage> {
         @Override
         public IMessage onMessage(PreviewDragMessage m, MessageContext ctx) {
-            if (m.op <= CANCEL)
+            if (m.op <= SURVEY)
                 pending.compute(
                         ctx.getServerHandler().playerEntity,
                         (p, q) -> {
@@ -148,6 +148,19 @@ public final class PreviewDragMessage implements IMessage {
         pending.clear();
         grips.clear();
     }
+
+    private PreviewDragMessage survey;
+
+    static PreviewDragMessage survey(EntityPlayerMP p, BuildTask task) {
+        PreviewDragMessage grip = grips.get(p);
+        return grip != null && grip.task == task ? grip.survey : null;
+    }
+
+    int surveyX() { return x; }
+    int surveyY() { return y; }
+    int surveyZ() { return z; }
+    int surveyPose() { return pose; }
+    long surveySequence() { return sequence; }
 
     private boolean valid(EntityPlayerMP p, BuilderTasks store) {
         ItemStack held = p.getHeldItem();
@@ -218,7 +231,15 @@ public final class PreviewDragMessage implements IMessage {
         }
         PreviewDragMessage grip = grips.get(p);
         if (grip == null || grip.sequence != sequence || !id.equals(grip.id)) {
-            if (op != CANCEL) reject(p);
+            if (op != CANCEL && op != SURVEY) reject(p);
+            return;
+        }
+        if (op == SURVEY) {
+            if (grip.valid(p, store) && revision == grip.revision && pose < ExtendedFacing.VALUES.length
+                    && y >= 0 && y < p.worldObj.getHeight()
+                    && grip.withinDropDepth(PreviewAim.eye(p).distanceTo(Vec3.createVectorHelper(x + .5, y + .5, z + .5)),
+                            x == grip.task.x && y == grip.task.y && z == grip.task.z))
+                grip.survey = this;
             return;
         }
         grips.remove(p);

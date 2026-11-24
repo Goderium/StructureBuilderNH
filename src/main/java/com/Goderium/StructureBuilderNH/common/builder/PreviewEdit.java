@@ -198,11 +198,13 @@ public final class PreviewEdit implements IMessage {
                 BuildTask.MaterialSelection optional = shells && cell != null && cell.air && cell.choice != null
                         ? task.selection(x, y, z) : null;
                 boolean shell = shells && cell != null && (!cell.air || optional != null && optional.supported);
-                boolean hatch = cell != null && cell.hatch;
+                int moved = task.movedRolesAt(x, y, z);
+                shell |= shells && (moved & PreviewStream.SHELL) != 0;
+                boolean hatch = cell != null && cell.hatch || (moved & PreviewStream.HATCH) != 0;
                 boolean issue = task.repairableIssue() && task.issue.posX == x && task.issue.posY == y && task.issue.posZ == z;
                 boolean marker = issue || (host || hatch) && (roles || shell);
                 boolean projected = air && (marker || shell) && PreviewStream.visibleTo(task, player);
-                if (projected || owned && !air && task.structureAt(player.worldObj, x, y, z)) {
+                if (projected || owned && !air && (moved != 0 || task.structureAt(player.worldObj, x, y, z))) {
                     result[0] = new Hit(task, x, y, z, owned, projected, marker);
                 }
             }
@@ -242,7 +244,7 @@ public final class PreviewEdit implements IMessage {
         double reach = PreviewAim.dragReach(RebuildConfig.dragMaxDistance);
         List<BuildTask> candidates = new ArrayList<>();
         for (BuildTask task : store.list(player, held)) {
-            if (task.dim == player.dimension && task.movable() && task.plan != null && task.plan.ready
+            if (task.dim == player.dimension && task.movable() && task.dragPoseReady()
                     && (task.previewLayers & (PreviewStream.HATCH | PreviewStream.SHELL)) != 0
                     && PreviewStream.visibleTo(task, player)
                     && eye.squareDistanceTo(task.x + .5, task.y + .5, task.z + .5) <= reach * reach
@@ -303,7 +305,7 @@ public final class PreviewEdit implements IMessage {
 
     public static final class TaskAction implements IMessage {
         UUID id;
-        private static final int DELETE = 0, OPEN_MARKER = 1, OPEN_TASK = 2;
+        private static final int DELETE = 0, OPEN_MARKER = 1, OPEN_TASK = 2, OPEN_MOVED_MARKER = 3, OPEN_MOVED_TASK = 4;
         int action;
         int revision, x, y, z;
 
@@ -315,6 +317,10 @@ public final class PreviewEdit implements IMessage {
 
         public static void openTask(UUID id, ChunkCoordinates at) {
             sendOpen(OPEN_TASK, id, 0, at);
+        }
+
+        public static void openMoved(UUID id, int revision, ChunkCoordinates at, boolean marker) {
+            sendOpen(marker ? OPEN_MOVED_MARKER : OPEN_MOVED_TASK, id, revision, at);
         }
 
         private static void sendOpen(int action, UUID id, int revision, ChunkCoordinates at) {
@@ -346,12 +352,14 @@ public final class PreviewEdit implements IMessage {
             if (player.isDead || !player.playerNetServerHandler.netManager.isChannelOpen()
                     || player.openContainer != player.inventoryContainer || held == null || held.getItem() != BuilderItem.ITEM) return;
             if (action == DELETE) { store.shortcutDelete(player, held, id.toString()); return; }
-            if (action != OPEN_TASK && action != OPEN_MARKER) return;
+            boolean moved = action == OPEN_MOVED_TASK || action == OPEN_MOVED_MARKER;
+            boolean marker = action == OPEN_MARKER || action == OPEN_MOVED_MARKER;
+            if (!moved && !marker && action != OPEN_TASK) return;
             Hit hit = pick(store, player);
             // Opening reads current state. A preceding wheel edit may already have advanced the revision.
-            if (hit == null || !hit.owned || action == OPEN_MARKER && !hit.marker || !hit.task.id.equals(id.toString())
+            if (hit == null || !hit.owned || marker && !hit.marker || moved && hit.task.revision != revision || !hit.task.id.equals(id.toString())
                     || hit.position.posX != x || hit.position.posY != y || hit.position.posZ != z) return;
-            openMarker(store, player, hit.task, action == OPEN_MARKER ? hit.position : null);
+            openMarker(store, player, hit.task, marker ? hit.position : null);
         }
 
         static void openMarker(BuilderTasks store, EntityPlayerMP player, BuildTask task, ChunkCoordinates position) {

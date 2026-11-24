@@ -31,7 +31,6 @@ import com.cleanroommc.modularui.value.IntValue;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.FontRenderer;
 import net.minecraft.client.gui.Gui;
-import net.minecraft.client.gui.GuiScreen;
 import net.minecraft.client.renderer.RenderHelper;
 import net.minecraft.client.renderer.entity.RenderItem;
 import net.minecraft.item.ItemStack;
@@ -79,8 +78,6 @@ public final class TerminalBrowserWidget extends ParentWidget<TerminalBrowserWid
     }
 
     private final TerminalBrowser port;
-    private static TerminalBrowserWidget visibleBrowser;
-    private GuiScreen hostScreen;
     private final Supplier<String> title;
     private final List<Channel> channels = new ArrayList<>();
     private final Channel[] editingRows = new Channel[CHANNEL_ROWS];
@@ -243,7 +240,6 @@ public final class TerminalBrowserWidget extends ParentWidget<TerminalBrowserWid
 
     @Override
     public void close() {
-        hideViewport();
         model.close();
         model = new BrowserRenderer();
         generation = -1;
@@ -267,18 +263,8 @@ public final class TerminalBrowserWidget extends ParentWidget<TerminalBrowserWid
 
     @Override
     public void dispose() {
-        hideViewport();
         model.close();
         super.dispose();
-    }
-
-    private void hideViewport() {
-        if (visibleBrowser == this) visibleBrowser = null;
-        hostScreen = null;
-    }
-
-    static boolean coversWorld(GuiScreen screen) {
-        return screen != null && visibleBrowser != null && visibleBrowser.hostScreen == screen;
     }
 
     private static String tr(String key) {
@@ -357,8 +343,6 @@ public final class TerminalBrowserWidget extends ParentWidget<TerminalBrowserWid
 
     @Override
     public void draw(ModularGuiContext ctx, WidgetThemeEntry<?> theme) {
-        hostScreen = Minecraft.getMinecraft().currentScreen;
-        visibleBrowser = this;
         fullText = "";
         Bounds b = model.bounds();
         key(Control.BACK, false);

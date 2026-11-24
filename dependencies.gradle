@@ -1,15 +1,19 @@
-// Fixed compile-time APIs; GTNH supplies these mods at runtime.
-// Dependencies are downloaded from repositories.gradle, not bundled into this mod.
+def pack = project.elytraModpackVersion
+pack.setGtnhVersion('2.9.0')
+// Elytra v1.1.2 uses this flag to allow reuse of the downloaded release manifest.
+pack.setManifestNoCache(true)
+
 dependencies {
+    // CoFH Core uses a CurseForge file ID; IC2 publishes its dev JAR under a different version scheme.
     compileOnly(rfg.deobf('curse.maven:cofh-core-69162:2388751')) { transitive = false }
     compileOnly('net.industrial-craft:industrialcraft-2:2.2.828-experimental:dev') { transitive = false }
-    compileOnly('com.github.GTNewHorizons:GT5-Unofficial:5.09.54.265:dev') { transitive = false }
-    compileOnly('com.github.GTNewHorizons:Galacticraft:3.4.37-GTNH:dev') { transitive = false }
-    compileOnly('com.github.GTNewHorizons:Applied-Energistics-2-Unofficial:rv3-beta-1095-GTNH:dev') { transitive = false }
-    compileOnly('com.github.GTNewHorizons:Chisel:2.17.34-GTNH:dev') { transitive = false }
-    compileOnly('com.github.GTNewHorizons:StructureLib:1.4.46:dev') { transitive = false }
-    compileOnly('com.github.GTNewHorizons:GTNHLib:0.11.54:dev') { transitive = false }
-    compileOnly('com.github.GTNewHorizons:ModularUI:1.3.4:dev') { transitive = false }
-    compileOnly('com.github.GTNewHorizons:ModularUI2:2.3.92-1.7.10:dev') { transitive = false }
-    compileOnly('io.github.legacymoddingmc:unimixins:0.3.1:dev') { transitive = false }
+    compileOnly(pack.gtnhdev('GT5-Unofficial')) { transitive = false }
+    compileOnly(pack.gtnhdev('Galacticraft')) { transitive = false }
+    compileOnly(pack.gtnhdev('Applied-Energistics-2-Unofficial')) { transitive = false }
+    compileOnly(pack.gtnhdev('Chisel')) { transitive = false }
+    compileOnly(pack.gtnhdev('StructureLib')) { transitive = false }
+    compileOnly(pack.gtnhdev('GTNHLib')) { transitive = false }
+    compileOnly(pack.gtnhdev('ModularUI')) { transitive = false }
+    compileOnly(pack.gtnhdev('ModularUI2')) { transitive = false }
+    compileOnly("io.github.legacymoddingmc:unimixins:${pack['UniMixins']}:dev") { transitive = false }
 }

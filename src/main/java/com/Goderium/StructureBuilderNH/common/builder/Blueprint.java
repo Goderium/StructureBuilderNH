@@ -668,6 +668,15 @@ public final class Blueprint extends GTDummyWorld {
         return section.ordinals[slot(px, py, pz)];
     }
 
+    boolean projectsBlock(int x, int y, int z) {
+        if (this.x == x && this.y == y && this.z == z) return true;
+        Section section = index.get(new ChunkPosition(x >> 4, y >> 4, z >> 4));
+        if (section == null) return false;
+        int slot = slot(x, y, z);
+        return ((section.solid[slot >> 6] | section.hatch[slot >> 6]) & (1L << slot)) != 0
+                && (section.fluidSlots == null || !section.fluidSlots.get(slot));
+    }
+
     Cell cellAt(int px, int py, int pz) {
         Section section = index.get(new ChunkPosition(px >> 4, py >> 4, pz >> 4));
         return section == null ? null : section.cells[slot(px, py, pz)];

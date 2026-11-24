@@ -2,6 +2,8 @@ package com.Goderium.StructureBuilderNH.common.builder;
 
 import appeng.api.config.*;
 
+import com.Goderium.StructureBuilderNH.api.PrepareStructureDismantleEvent;
+
 import com.Goderium.StructureBuilderNH.config.RebuildConfig;
 import com.gtnewhorizon.structurelib.StructureLibAPI;
 import com.gtnewhorizon.structurelib.alignment.IAlignment;
@@ -10,8 +12,12 @@ import com.gtnewhorizon.structurelib.alignment.enumerable.ExtendedFacing;
 import com.gtnewhorizon.structurelib.structure.*;
 
 import gregtech.api.interfaces.tileentity.IGregTechTileEntity;
+import gregtech.api.metatileentity.implementations.MTEHatch;
+import gregtech.common.blocks.ItemMachines;
 
+import net.minecraft.block.Block;
 import net.minecraft.entity.player.EntityPlayerMP;
+import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.nbt.*;
 import net.minecraft.tileentity.TileEntity;
@@ -42,8 +48,57 @@ final class BuildTask {
         REFUND, DISMANTLING, TEARDOWN_PAUSED, DISMANTLED
     }
 
+    private final AnimatedOccupancy animated = new AnimatedOccupancy();
     final PlacementLedger ledger = new PlacementLedger(this);
+    static final int UNDO_PLACEMENTS = 1, DISMANTLE_SITE = 2;
+    private PlacementLedger siteRemoval;
+    private int removalScanCursor;
+    private boolean removalScanComplete;
+    private long nextRestorationCheck;
+
     private Map<Long, BitSet> structureCells;
+    private MovedMarkers movedMarkers;
+    private PreviewPose.Allowed movedAllowed;
+
+    // Keep only occupancy and hatch bits while the native blueprint is read at the new position.
+    private static final class MovedMarkers {
+        final Map<Long, BitSet> members;
+        final Map<Long, long[]> hatches = new HashMap<>();
+        final int x, y, z;
+        final ExtendedFacing sourceFacing;
+        PreviewPose inverse;
+
+        MovedMarkers(BuildTask t, ExtendedFacing next) {
+            members = t.structureCells;
+            x = t.x; y = t.y; z = t.z;
+            sourceFacing = t.facing;
+            inverse = new PreviewPose(next, sourceFacing);
+            for (Blueprint.Section section : t.plan.sections) {
+                for (long word : section.hatch) {
+                    if (word == 0) continue;
+                    hatches.put(PlacementLedger.key(section.x << 4, section.y << 4, section.z << 4), section.hatch);
+                    break;
+                }
+            }
+        }
+
+        int roles(int dx, int dy, int dz) {
+            int sx = x + inverse.xx * dx + inverse.xy * dy + inverse.xz * dz;
+            int sy = y + inverse.yx * dx + inverse.yy * dy + inverse.yz * dz;
+            int sz = z + inverse.zx * dx + inverse.zy * dy + inverse.zz * dz;
+            if (sy < 0 || sy >= 256) return 0;
+            long key = PlacementLedger.key(sx, sy, sz);
+            int slot = Blueprint.slot(sx, sy, sz);
+            BitSet cells = members.get(key);
+            if (cells == null || !cells.get(slot)) return 0;
+            long[] hatch = hatches.get(key);
+            return PreviewStream.SHELL | (hatch != null && (hatch[slot >> 6] & (1L << (slot & 63))) != 0 ? PreviewStream.HATCH : 0);
+        }
+    }
+
+    int movedRolesAt(int px, int py, int pz) {
+        return movedMarkers == null ? 0 : movedMarkers.roles(px - x, py - y, pz - z);
+    }
     private final Set<ChunkCoordinates> manualHatches = new HashSet<>();
     private final ChunkCoordinates lookupHatch = new ChunkCoordinates();
     final TaskChunks workChunks = new TaskChunks();
@@ -74,6 +129,63 @@ final class BuildTask {
     int tier = 1, cursor, total, placed, revision;
     boolean useSurvivalConstruct = RebuildConfig.useSurvivalConstruct;
     int siteRevision = -1, siteInstalled, siteTotal, siteUnknown;
+    boolean siteComplete;
+    private OrdinaryBuildSurvey siteSurvey, checkingSite;
+    private boolean surveyRequested;
+    private long nextSiteSurvey;
+
+    boolean surveysExistingSite() {
+        return existing && target != null && !upgrading() && (state == State.DRAFT || state == State.PREVIEW);
+    }
+
+    boolean hasSiteCount() {
+        return siteRevision == revision && !upgrading() && (state == State.DRAFT || state == State.PREVIEW);
+    }
+
+    boolean awaitingSiteCount() {
+        return surveysExistingSite() && siteRevision != revision && !"unsupported".equals(reason);
+    }
+
+    void requestSiteSurvey() {
+        if (surveysExistingSite()) surveyRequested = true;
+    }
+
+    boolean needsSiteSurvey() {
+        return surveyRequested && surveysExistingSite() && !"unsupported".equals(reason);
+    }
+
+    OrdinaryBuildSurvey completedSiteSurvey() {
+        return siteSurvey != null && siteSurvey.valid(this) ? siteSurvey : null;
+    }
+
+    void inspectSite(World world, long deadline) {
+        if (!needsSiteSurvey() || plan == null || !plan.ready || System.nanoTime() >= deadline) return;
+        long now = world.getTotalWorldTime();
+        if (completedSiteSurvey() != null && checkingSite == null && now < nextSiteSurvey) {
+            surveyRequested = false;
+            return;
+        }
+        if (checkingSite == null || !checkingSite.valid(this)) checkingSite = new OrdinaryBuildSurvey(this);
+        checkingSite.advance(world, deadline, 8192);
+        if (!checkingSite.complete()) return;
+        siteSurvey = checkingSite;
+        checkingSite = null;
+        publishSiteSurvey(siteSurvey);
+        nextSiteSurvey = now + 60;
+        surveyRequested = false;
+    }
+
+    void publishSiteSurvey(OrdinaryBuildSurvey snapshot) {
+        boolean complete = snapshot.totalCells > 0 && snapshot.installedCells == snapshot.totalCells
+                && snapshot.missingCells == 0 && snapshot.blockedCells == 0 && snapshot.unknownCells == 0;
+        if (siteRevision != revision || siteInstalled != snapshot.installedCells || siteTotal != snapshot.totalCells
+                || siteUnknown != snapshot.unknownCells || siteComplete != complete) changed();
+        siteInstalled = snapshot.installedCells;
+        siteTotal = snapshot.totalCells;
+        siteUnknown = snapshot.unknownCells;
+        siteComplete = complete;
+        siteRevision = revision;
+    }
     int manualEditGeneration;
     int previewLayers;
     boolean texturedPreview;
@@ -150,11 +262,35 @@ final class BuildTask {
             result.material = result.host ? target : selection == null ? cell.item : selection.item();
             result.counted = result.material != null && result.material.getItem() != null
                     && (result.host || selection != null || !cell.air);
-            if (world == null || !world.blockExists(result.x, result.y, result.z)) {
+            if (world == null) {
                 result.status = OrdinaryStatus.UNLOADED;
                 return;
             }
-            boolean air = world.isAirBlock(result.x, result.y, result.z);
+            boolean loaded = world.blockExists(result.x, result.y, result.z);
+            boolean air = loaded && world.isAirBlock(result.x, result.y, result.z);
+            // The receiver can account for captured blocks even when their original chunks are unloaded.
+            if ((!loaded || air) && result.counted && !result.host && (selection == null || !selection.conflict)
+                    && animated.supports(plan.controller)) {
+                if (!world.blockExists(x, y, z)) {
+                    result.status = OrdinaryStatus.UNLOADED;
+                    return;
+                }
+                TileEntity host = world.getTileEntity(x, y, z);
+                IGregTechTileEntity gt = host instanceof IGregTechTileEntity ? (IGregTechTileEntity) host : null;
+                if (gt != null && targetHostFacing(gt) == facing) {
+                    OrdinaryStatus status = animated.status(gt.getMetaTileEntity(), this, world, result.x, result.y, result.z);
+                    if (status != null) {
+                        result.status = status;
+                        result.matches = status == OrdinaryStatus.INSTALLED;
+                        if (result.matches) result.installedMaterial = result.material;
+                        return;
+                    }
+                }
+            }
+            if (!loaded) {
+                result.status = OrdinaryStatus.UNLOADED;
+                return;
+            }
             boolean previewFluid = selection == null ? cell.isFluid() : selection.group.isFluid(selection.index);
             if (previewFluid) {
                 // Leave process fluids to the machine or player, and keep empty cells visible in the projection.
@@ -528,7 +664,25 @@ final class BuildTask {
     }
 
     private boolean materialMatches(Blueprint.Cell cell, World world, int px, int py, int pz) {
-        MaterialSelection selection = cell.choice == null ? null : selection(px, py, pz);
+        return materialMatches(cell, world, px, py, pz, px, py, pz, facing);
+    }
+
+    boolean previewObstruction(World world, int sx, int sy, int sz, int px, int py, int pz, ExtendedFacing pose) {
+        if (!world.blockExists(px, py, pz) || world.isAirBlock(px, py, pz)) return false;
+        if (sx == x && sy == y && sz == z) return targetHostFacing(world, px, py, pz) == null;
+        Blueprint.Cell cell = plan.cellAt(sx, sy, sz);
+        if (cell == null || cell.inscribedRitual && world.getBlock(px, py, pz) == cell.block
+                && world.getBlockMetadata(px, py, pz) == 0) return false;
+        try {
+            return !materialMatches(cell, world, sx, sy, sz, px, py, pz, pose);
+        } catch (RuntimeException | LinkageError unknown) {
+            return false;
+        }
+    }
+
+    private boolean materialMatches(Blueprint.Cell cell, World world, int sx, int sy, int sz,
+            int px, int py, int pz, ExtendedFacing pose) {
+        MaterialSelection selection = cell.choice == null ? null : selection(sx, sy, sz);
         if (selection != null && selection.supported) {
             if (selection.conflict) return false;
             if (selection.explicit && selection.group.indexAt(world, px, py, pz) != selection.index) return false;
@@ -536,9 +690,9 @@ final class BuildTask {
         }
         if (!plan.matches(cell, world, px, py, pz)) return false;
         if (cell.hatch && !manualHatches.isEmpty() && !world.isAirBlock(px, py, pz)) {
-            lookupHatch.set(px, py, pz);
+            lookupHatch.set(sx, sy, sz);
             if (manualHatches.contains(lookupHatch))
-                return plan.checkManualHatch(cell, world, px, py, pz, target, facing);
+                return plan.checkManualHatch(cell, world, px, py, pz, target, pose);
         }
         return true;
     }
@@ -594,8 +748,13 @@ final class BuildTask {
     }
 
     void discardCachedPlan() {
+        // Native restoration may have materialized blocks outside the selected preview piece.
+        if (siteRemoval != null && !removalScanComplete) removalScanCursor = 0;
         plan = null;
         invalidateOrdinaryProgress();
+        movedMarkers = null;
+        movedAllowed = null;
+        checkingSite = siteSurvey = null;
         selectionPlan = null;
         selectedMaterials = null;
         materialTotals.clear();
@@ -639,7 +798,12 @@ final class BuildTask {
                 && ledger.count == 0 && !hasReserved() && savedLink == null;
     }
 
+    boolean dragPoseReady() {
+        return movedAllowed != null || plan != null && plan.ready;
+    }
+
     PreviewPose.Allowed allowedPoses() {
+        if (movedAllowed != null) return movedAllowed;
         long low = 0, high = 0;
         IAlignment alignment = plan.controller instanceof IAlignment ? (IAlignment) plan.controller : null;
         for (ForgeDirection direction : ForgeDirection.VALID_DIRECTIONS) {
@@ -655,7 +819,7 @@ final class BuildTask {
     }
 
     boolean movePreview(World world, int px, int py, int pz, ExtendedFacing next) {
-        if (!movable() || plan == null || !plan.ready || world == null || py < 0 || py >= world.getHeight()
+        if (!movable() || !dragPoseReady() || world == null || py < 0 || py >= world.getHeight()
                 || Math.abs((long)px) >= 30000000 || Math.abs((long)pz) >= 30000000 || !world.blockExists(px,py,pz)) return false;
         boolean sameAnchor = x == px && y == py && z == pz;
         // A real host at the source stays anchored. Dropping onto that same host only aligns the projection.
@@ -666,11 +830,15 @@ final class BuildTask {
             if (next == null) return false;
         } else if (next == null || next != facing && !allowedPoses().reachable(facing, next)) return false;
         if (sameAnchor && !attach && next == facing) return true;
+        PreviewPose.Allowed allowed = allowedPoses();
         applyPreviewMove(px, py, pz, next, attach);
+        movedAllowed = allowed;
         return true;
     }
 
     private void applyPreviewMove(int px, int py, int pz, ExtendedFacing next, boolean attach) {
+        MovedMarkers markers = plan != null && plan.ready && structureCells != null ? new MovedMarkers(this, next) : movedMarkers;
+        if (markers != null && markers == movedMarkers) markers.inverse = new PreviewPose(next, markers.sourceFacing);
         if (next != facing) {
             PreviewPose transform=new PreviewPose(facing,next);
             materialCells=transform.rotateSelections(materialCells,true);
@@ -683,6 +851,7 @@ final class BuildTask {
         needed.rows.clear(); shortage.rows.clear(); errors.rows.clear();
         cursor=total=placed=0; siteRevision=-1; detail="";
         resetPlan();
+        movedMarkers = markers;
     }
 
     boolean previewMarkerAt(int px, int py, int pz) {
@@ -761,7 +930,7 @@ final class BuildTask {
                 || !(editable() || state == State.BLOCKED) || savedLink != null) return false;
         if (p.posX == x && p.posY == y && p.posZ == z) return true;
         Blueprint.Cell cell = plan == null || !plan.ready ? null : plan.cellAt(p.posX, p.posY, p.posZ);
-        return cell != null && cell.hatch;
+        return cell != null && cell.hatch || (movedRolesAt(p.posX, p.posY, p.posZ) & PreviewStream.HATCH) != 0;
     }
 
     boolean repairableIssue() {
@@ -985,7 +1154,11 @@ final class BuildTask {
 
     boolean useTexturedWorldPreview() {
         return texturedPreview && (previewLayers & PreviewStream.SHELL) != 0
-                && state != State.QUEUED && state != State.BUILDING && state != State.VERIFYING;
+                && !constructionPreview();
+    }
+
+    boolean constructionPreview() {
+        return state == State.QUEUED || state == State.BUILDING || state == State.VERIFYING;
     }
 
     void setTexturedPreview(boolean textured) {
@@ -1010,6 +1183,10 @@ final class BuildTask {
     }
 
     void prepare(EntityPlayerMP actor, long deadline) {
+        prepare(actor, deadline, null);
+    }
+
+    private void prepare(EntityPlayerMP actor, long deadline, ItemStack removalTool) {
         if (target == null || "unsupported".equals(reason)) return;
         if (plan != null && plan.ready) return;
         int known = observedChannels.size();
@@ -1025,13 +1202,39 @@ final class BuildTask {
                 }
                 if (!channels.hasKey("chisel"))
                     ChannelDataAccessor.setChannelData(trigger, "chisel", 1);
+                boolean survivalSource = useSurvivalConstruct;
+                if (removalTool != null) {
+                    WorldServer world = (WorldServer) actor.worldObj;
+                    if (world.getTotalWorldTime() < nextRestorationCheck) return;
+                    TileEntity host = world.getTileEntity(x, y, z);
+                    if (!(host instanceof IGregTechTileEntity) || !anchorValid(world)
+                            || !PlacementLedger.mayHarvest(actor, world, removalTool, x, y, z)
+                            || world.getTileEntity(x, y, z) != host || !anchorValid(world)) {
+                        stop("harvest", x, y, z);
+                        state = State.TEARDOWN_PAUSED;
+                        return;
+                    }
+                    PrepareStructureDismantleEvent event = new PrepareStructureDismantleEvent(
+                            (IGregTechTileEntity) host, actor, trigger, survivalSource);
+                    boolean ready = ledger.captureDrops(actor, world, () -> DismantleAnimations.prepare(this, world, siteRemoval, event));
+                    if (!ready) {
+                        if (state == State.DISMANTLING && !"unloaded".equals(reason)) reason = "restoreStructure";
+                        nextRestorationCheck = world.getTotalWorldTime() + 10;
+                        changed();
+                        return;
+                    }
+                    survivalSource = event.useSurvivalConstruct;
+                    reason = "";
+                }
                 plan = Blueprint.read(target, trigger, facing, x, y, z, actor, this::initiallyConfirmed,
-                        useSurvivalConstruct);
+                        survivalSource);
             }
             if (!plan.ready) plan.advance(deadline);
             if (plan.ready) {
                 ensureSelections();
                 captureStructureCells();
+                movedMarkers = null;
+                movedAllowed = null;
             }
             if (plan.ready && confirmed == null) {
                 confirmed = new BitSet(plan.size);
@@ -1134,9 +1337,11 @@ final class BuildTask {
 
     private ExtendedFacing targetHostFacing(World world, int px, int py, int pz) {
         TileEntity te = world.getTileEntity(px, py, pz);
-        if (!(te instanceof IGregTechTileEntity)) return null;
-        IGregTechTileEntity gt = (IGregTechTileEntity) te;
-        if (gt.getMetaTileEntity() == null || gt.getMetaTileID() != target.getMetadata()) return null;
+        return te instanceof IGregTechTileEntity ? targetHostFacing((IGregTechTileEntity) te) : null;
+    }
+
+    private ExtendedFacing targetHostFacing(IGregTechTileEntity gt) {
+        if (target == null || gt.getMetaTileEntity() == null || gt.getMetaTileID() != target.getMetadata()) return null;
         ForgeDirection front = gt.getFrontFacing();
         if (front == null || front == ForgeDirection.UNKNOWN) return null;
         ExtendedFacing pose = gt.getMetaTileEntity() instanceof IAlignment
@@ -1144,7 +1349,7 @@ final class BuildTask {
         return pose != null && pose.getDirection() == front ? pose : null;
     }
 
-    private boolean requireChunk(WorldServer world, int px, int py, int pz) {
+    boolean requireChunk(WorldServer world, int px, int py, int pz) {
         if (py < 0 || py >= world.getHeight() || px < -30000000 || px >= 30000000
                 || pz < -30000000 || pz >= 30000000) {
             boolean teardown = state == State.DISMANTLING;
@@ -1514,8 +1719,16 @@ final class BuildTask {
         if (world != null && actor.worldObj == world) retryRefund(actor, world);
     }
 
+    private void discardDismantleDrops() {
+        if (salvage.rows.isEmpty()) return;
+        salvage.rows.clear();
+        revision++;
+        changed();
+    }
+
     void retryRefund(EntityPlayerMP actor, WorldServer world) {
         if (!recoverUpgrade(world)) return;
+        if (dismantleRequested && actor.capabilities.isCreativeMode) discardDismantleDrops();
         returnBackpack(actor);
         if (!upgradeNetwork.isEmpty() && !upgradeNetwork.equals(key)) {
             reason="upgradeNetwork"; changed(); return;
@@ -1585,9 +1798,26 @@ final class BuildTask {
         }
     }
 
-    void requestDismantle(EntityPlayerMP actor, WorldServer world) {
-        if (ledger.count == 0 || state == State.DISMANTLING) return;
-        deleteRequested = false;
+    int removalModes(World world) {
+        if (world == null || world.provider.dimensionId != dim || target == null || deleteRequested
+                || state == State.DISMANTLING) return 0;
+        if (dismantleRequested) return state == State.TEARDOWN_PAUSED
+                ? (siteRemoval == null ? UNDO_PLACEMENTS : DISMANTLE_SITE) : 0;
+        int modes = ledger.count > 0 ? UNDO_PLACEMENTS : 0;
+        if (world.blockExists(x, y, z) && anchorValid(world)) modes |= DISMANTLE_SITE;
+        return modes;
+    }
+
+    void requestDismantle(EntityPlayerMP actor, WorldServer world, int mode) {
+        if ((mode != DISMANTLE_SITE && mode != UNDO_PLACEMENTS) || (removalModes(world) & mode) == 0) return;
+        if (state == State.TEARDOWN_PAUSED) {
+            state = State.DISMANTLING;
+            reason = detail = "";
+            issue = null;
+            changed();
+            return;
+        }
+        if (mode == DISMANTLE_SITE) siteRemoval = new PlacementLedger(this);
         dismantleRequested = true;
         if (state != State.REFUND) cancel(actor, world);
         beginDismantle();
@@ -1598,31 +1828,103 @@ final class BuildTask {
         if (!dismantleRequested || state != State.REFUND || hasReserved() || savedLink != null)
             return;
         state = State.DISMANTLING;
-        total = ledger.count;
+        total = siteRemoval == null ? ledger.count : 0;
         placed = 0;
         reason = detail = "";
         issue = null;
         changed();
     }
 
+    void discardRemovalSite() {
+        if (siteRemoval != null) siteRemoval.discard();
+        siteRemoval = null;
+        removalScanCursor = 0;
+        removalScanComplete = false;
+    }
+
+    // A permissive structure predicate (for example, "any non-air block") does not identify
+    // a block as part of the machine. Require a concrete material, option or accepted hatch.
+    private boolean removableCell(Blueprint.Cell cell, World world, int px, int py, int pz) {
+        Block block = world.getBlock(px, py, pz);
+        if (world.isAirBlock(px, py, pz) || StructureFluids.isFluid(block)
+                || !materialMatches(cell, world, px, py, pz)) return false;
+        TileEntity tile = world.getTileEntity(px, py, pz);
+        if (cell.hatch && tile instanceof IGregTechTileEntity
+                && ((IGregTechTileEntity) tile).getMetaTileEntity() instanceof MTEHatch)
+            return cell.element != null && plan.checkManualHatch(cell, world, px, py, pz, target, facing);
+        if (cell.constraints == null) return identifiesMaterial(cell, world, px, py, pz, block, tile);
+        for (Blueprint.Cell source : cell.constraints)
+            if (identifiesMaterial(source, world, px, py, pz, block, tile)) return true;
+        return false;
+    }
+
+    private static boolean identifiesMaterial(Blueprint.Cell cell, World world, int x, int y, int z,
+            Block block, TileEntity tile) {
+        if (cell.element == StructureUtility.notAir()) return false;
+        if (cell.choice != null) return cell.choice.indexAt(world, x, y, z) >= 0;
+        if (tile instanceof IGregTechTileEntity)
+            return cell.item != null && cell.item.getItem() instanceof ItemMachines
+                    && ((IGregTechTileEntity) tile).getMetaTileID() == cell.item.getMetadata();
+        int meta = world.getBlockMetadata(x, y, z);
+        return block == cell.block && meta == cell.meta || cell.item != null
+                && cell.item.getItem() == Item.getItemFromBlock(block)
+                && cell.item.getMetadata() == block.damageDropped(meta);
+    }
+
+    private void scanRemovalSite(EntityPlayerMP actor, WorldServer world, ItemStack terminal, long deadline) {
+        prepare(actor, deadline, terminal);
+        if (plan == null || !plan.ready) return;
+        while (removalScanCursor < plan.size && System.nanoTime() < deadline) {
+            Blueprint.Cell cell = plan.at(removalScanCursor, xyz);
+            int px = xyz[0], py = xyz[1], pz = xyz[2];
+            if (!requireChunk(world, px, py, pz)) return;
+            if (removalScanCursor == 0 || removableCell(cell, world, px, py, pz))
+                siteRemoval.record(world, px, py, pz);
+            removalScanCursor++;
+        }
+        if (removalScanCursor == plan.size) {
+            total = siteRemoval.count;
+            removalScanComplete = true;
+            discardCachedPlan();
+            changed();
+        }
+    }
+
     int dismantle(EntityPlayerMP actor, WorldServer world, ItemStack blueprint, int budget, long deadline) {
         int used = 0;
-        if (world.getTotalWorldTime() < nextSalvageRetry) return 0;
-        if (key.isEmpty()) key = BuilderTasks.tag(blueprint).getString("network");
+        boolean creative = actor.capabilities.isCreativeMode;
+        if (creative) discardDismantleDrops();
+        else if (world.getTotalWorldTime() < nextSalvageRetry) return 0;
+        if (!creative && key.isEmpty()) key = BuilderTasks.tag(blueprint).getString("network");
         // A wireless access point at the build site can itself be in the unloaded controller chunk.
-        if (!key.isEmpty() && !requireChunk(world, x, y, z)) return 0;
-        Wireless net = Wireless.find(this, world, actor);
-        if ((!actor.capabilities.isCreativeMode || !salvage.rows.isEmpty()) && !returnSalvage(net, world)) return 0;
-        while (ledger.count > 0 && used < budget && System.nanoTime() < deadline) {
-            ChunkCoordinates p = ledger.next();
+        if (!creative && !key.isEmpty() && !requireChunk(world, x, y, z)) return 0;
+        if (siteRemoval != null && (!removalScanComplete || siteRemoval.count > 0)) {
+            if (!requireChunk(world, x, y, z)) return 0;
+            if (!anchorValid(world) || (removalScanCursor > 0 || removalScanComplete) && !siteRemoval.matches(world, x, y, z)) {
+                stop("anchor", x, y, z);
+                state = State.TEARDOWN_PAUSED;
+                return 0;
+            }
+            if (!removalScanComplete) {
+                if (plan == null && !creative
+                        && !returnSalvage(Wireless.find(this, world, actor), world)) return 0;
+                scanRemovalSite(actor, world, blueprint, deadline);
+                return 0;
+            }
+        }
+        PlacementLedger removals = siteRemoval == null ? ledger : siteRemoval;
+        Wireless net = creative ? null : Wireless.find(this, world, actor);
+        if (!creative && !returnSalvage(net, world)) return 0;
+        while (removals.count > 0 && used < budget && System.nanoTime() < deadline) {
+            ChunkCoordinates p = removals.next();
             int x = p.posX, y = p.posY, z = p.posZ;
             if (!requireChunk(world, x, y, z)) break;
-            if (ledger.matches(world, x, y, z)) {
+            if (removals.matches(world, x, y, z)) {
                 double charge = TerminalEnergy.REMOVE.reserve(actor, blueprint);
                 if (charge < 0) { reason = "noEnergy"; changed(); break; }
                 boolean removed = false;
                 try {
-                    removed = ledger.harvest(actor, world, blueprint, x, y, z);
+                    removed = removals.harvest(actor, world, blueprint, x, y, z);
                 } finally {
                     if (!removed) TerminalEnergy.refund(blueprint, charge);
                 }
@@ -1633,21 +1935,22 @@ final class BuildTask {
                     break;
                 }
             }
-            ledger.forget(x, y, z);
+            removals.forget(x, y, z);
             used++;
             reason = "";
-            placed = total - ledger.count;
+            placed = total - removals.count;
             changed();
-            if (!salvage.rows.isEmpty() && !returnSalvage(net, world)) break;
+            if (!creative && !salvage.rows.isEmpty() && !returnSalvage(net, world)) break;
         }
-        if (ledger.count == 0 && salvage.rows.isEmpty()) {
+        if (removals.count == 0 && salvage.rows.isEmpty()) {
             placed = total;
             state = State.DISMANTLED;
             dismantleRequested = false;
             reason = detail = "";
             issue = null;
             releaseUpgradePhaseData();
-            notify(actor, "dismantled");
+            notify(actor, siteRemoval == null ? "undone" : "dismantled");
+            discardRemovalSite();
             changed();
             store.completed(this, actor, world);
         }
@@ -1823,16 +2126,14 @@ final class BuildTask {
                     stop("anchor", px, py, pz);
                     break;
                 }
-            } else if (!materialMatches(c, world, px, py, pz)) {
-                ordinaryCell(cursor, world, ordinaryWork, false);
-                updateOrdinaryProgress(cursor, ordinaryWork);
-                if (!blankRitual && !world.isAirBlock(px, py, pz)) ledger.record(world, px, py, pz);
-                stop("obstruction", px, py, pz);
-                break;
             }
             if (!blankRitual && !world.isAirBlock(px, py, pz)) ledger.record(world, px, py, pz);
             ordinaryCell(cursor, world, ordinaryWork, false);
             updateOrdinaryProgress(cursor, ordinaryWork);
+            if (!ordinaryWork.matches) {
+                stop("obstruction", px, py, pz);
+                break;
+            }
             confirm(cursor, ordinaryWork.status == OrdinaryStatus.INSTALLED);
         }
         changed();
@@ -1964,6 +2265,11 @@ final class BuildTask {
     NBTTagCompound save() {
         NBTTagCompound n = new NBTTagCompound();
         if (ledger.count > 0) n.setTag("placements", ledger.save());
+        if (siteRemoval != null) {
+            n.setBoolean("siteDismantle", true);
+            if (removalScanComplete || siteRemoval.count != 0) n.setTag("removalSite", siteRemoval.save());
+            if (!removalScanComplete) n.setBoolean("removalScanPending", true);
+        }
         if (structureCells != null) n.setTag("structureCells", saveStructureCells());
         if (!manualHatches.isEmpty()) {
             int[] positions = new int[manualHatches.size() * 3];
@@ -1987,6 +2293,14 @@ final class BuildTask {
         n.setInteger("z", z);
         n.setInteger("facing", facing.getIndex());
         n.setBoolean("existing", existing);
+        if (existing && hasSiteCount()) {
+            NBTTagCompound site = new NBTTagCompound();
+            site.setInteger("installed", siteInstalled);
+            site.setInteger("total", siteTotal);
+            site.setInteger("unknown", siteUnknown);
+            site.setBoolean("complete", siteComplete);
+            n.setTag("siteCount", site);
+        }
         if (temporaryHost) n.setBoolean("temporaryHost", true);
         if (upgrading()) {
             NBTTagList scope=new NBTTagList();
@@ -2069,6 +2383,11 @@ final class BuildTask {
             t.manualHatches.add(new ChunkCoordinates(positions[i], positions[i + 1], positions[i + 2]));
         t.deleteRequested = n.getBoolean("deleteRequested");
         t.dismantleRequested = n.getBoolean("dismantleRequested");
+        if (t.dismantleRequested && n.getBoolean("siteDismantle")) {
+            t.siteRemoval = new PlacementLedger(t);
+            t.removalScanComplete = n.hasKey("removalSite", 10) && !n.getBoolean("removalScanPending");
+            if (n.hasKey("removalSite", 10)) t.siteRemoval.load(n.getCompoundTag("removalSite"));
+        }
         t.key = n.getString("key");
         t.unlimitedRange = n.getBoolean("unlimitedRange");
         t.state = State.valueOf(n.getString("state"));
@@ -2158,6 +2477,14 @@ final class BuildTask {
         // that produced those ordinals, including construct-only saves from earlier versions.
         boolean savedSource = n.getBoolean("useSurvivalConstruct");
         if (t.state == State.DRAFT || t.state == State.PREVIEW) {
+            if (t.useSurvivalConstruct == savedSource && t.surveysExistingSite() && n.hasKey("siteCount", 10)) {
+                NBTTagCompound site = n.getCompoundTag("siteCount");
+                t.siteTotal = site.getInteger("total");
+                t.siteInstalled = site.getInteger("installed");
+                t.siteUnknown = site.getInteger("unknown");
+                t.siteComplete = site.getBoolean("complete");
+                t.siteRevision = t.revision;
+            }
             if (t.useSurvivalConstruct != savedSource) {
                 t.structureCells = null;
                 t.confirmed = new BitSet();

@@ -13,6 +13,21 @@ final class FootingMesh {
 
     double area;
 
+    /** Coalesce full block tops before feeding the same contour sweep as partial collision boxes. */
+    static FootingMesh build(List<double[]> rects, int[] fullRows, int x0, int z0, int size) {
+        // The first row and bit correspond to the halo at one block before the tile origin.
+        for (int row = 0; row < fullRows.length; row++) {
+            int z = z0 + row - 1;
+            for (int mask = fullRows[row]; mask != 0;) {
+                int left = Integer.numberOfTrailingZeros(mask);
+                int right = left + Integer.numberOfTrailingZeros(~(mask >>> left));
+                rects.add(new double[] { x0 + left - 1, z, x0 + right - 1, z + 1 });
+                mask &= -1 << right;
+            }
+        }
+        return build(rects, x0, z0, size);
+    }
+
     static FootingMesh build(List<double[]> rects, int x0, int z0, int size) {
         FootingMesh mesh = new FootingMesh();
         if (rects.isEmpty()) return mesh;

@@ -106,11 +106,15 @@ final class SingleCellPlacement {
                 && w.getTileEntity(x, y, z) == oldTile && machine(oldTile) == oldMachine;
     }
 
+    boolean ready() {
+        return host || task.plan != null && task.plan.ready;
+    }
+
     void apply(EntityPlayerMP actor, int shownTicket, boolean remove) {
         if (shownTicket != ticket || remove && (host || !occupied())) return;
         if (!remove && selected == null) { message = "cell.select"; return; }
         if (host && occupied()) { message = "cell.changed"; return; }
-        if (!task.canChangeCell(at) || !reachable(actor)) { message = "cell.unavailable"; return; }
+        if (!ready() || !task.canChangeCell(at) || !reachable(actor)) { message = "cell.unavailable"; return; }
         WorldServer w = (WorldServer) actor.worldObj;
         if (!targetUnchanged(w)) {
             refresh(actor);
@@ -176,7 +180,7 @@ final class SingleCellPlacement {
             WorldHooks.WRITE.set(guard);
             WorldHooks.DISMANTLE_DROPS.set((world, stack) -> {
                 if (world != w) return false;
-                if (guard.harvesting && stack.stackSize > 0) drops.add(stack, stack.stackSize);
+                if (!creative && guard.harvesting && stack.stackSize > 0) drops.add(stack, stack.stackSize);
                 return true;
             });
             try {

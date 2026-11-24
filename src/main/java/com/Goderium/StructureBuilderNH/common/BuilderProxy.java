@@ -7,7 +7,6 @@ public class BuilderProxy {
     public void register() {}
 
     public boolean deleteShortcutKey(int key) { return false; }
-    public int hotbarSlot(int key) { return -1; }
     public void rejectDrag(java.util.UUID task, long sequence) {}
 
     public boolean editPreview(net.minecraft.entity.player.EntityPlayer player) {

@@ -82,6 +82,8 @@ public final class BuilderRenderer extends BuilderProxy {
     private final List<Section> visibleSections = new ArrayList<>();
     private final List<Section> roleTextures = new ArrayList<>();
     private final List<Section> texturedSections = new ArrayList<>(), colorSections = new ArrayList<>();
+    private final List<Section> transitionColors = new ArrayList<>();
+    private static final long COLOR_HANDOFF_NS = 120_000_000L;
     private final List<View> visiblePreviews = new ArrayList<>();
     private final List<View> visibleBounds = new ArrayList<>();
     private final List<ChunkCoordinates> visibleIssues = new ArrayList<>();
@@ -89,14 +91,23 @@ public final class BuilderRenderer extends BuilderProxy {
     private double cameraX, cameraY, cameraZ;
     private World observedWorld;
     private ProjectionOccupancy occupancy;
-    private final PreviewFooting footing = new PreviewFooting();
-    private boolean groundContactHud;
+    private final Map<UUID, PreviewContacts> contactsByTask = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Deque<PreviewContacts> retiredContacts = new ArrayDeque<>();
+    private final List<View> contactViews = new ArrayList<>();
+    private int contactTurn;
+    private int contactFaces;
+    private boolean showConflict;
+    private ExtendedFacing contactFacing;
     private final long[] sampledOccupancy = new long[64];
     private long samplingBudget;
     private int sampledSites;
     private long sampleSequence;
     private Section samplingTurn, nextSamplingTurn;
-    private boolean compiledThisFrame;
+    private final List<View> meshViews = new ArrayList<>();
+    private long lastRenderStart, meshNanosLeft;
+    private int meshSteps;
+    private Section stableShellCandidate;
+    private boolean preferGlassBatch = true;
     private boolean sampledReleasedSite;
     private final List<View> visibleControllers = new ArrayList<>();
     private long compilations;
@@ -108,7 +119,7 @@ public final class BuilderRenderer extends BuilderProxy {
     private View highlightedController;
     private Section highlightedHatch;
     private int highlightedHatchSlot;
-    private final int[] highlightOffset = new int[3], highlightLocal = new int[3];
+    private final int[] highlightOffset = new int[3];
     private String aimedHint, aimedAction;
     private boolean aimedHatch;
     private final PreviewTooltip tooltip = new PreviewTooltip();
@@ -188,13 +199,25 @@ public final class BuilderRenderer extends BuilderProxy {
         boolean pressed = freshDragPress;
         boolean heldLong = longReleasedPress;
         freshDragPress = longReleasedPress = false;
-        if (grip != null) return true;
+        if (grip != null && (!grip.released || grip.regrabPressedAt != 0)) return true;
         boolean sneak = pressed ? (modifiersAtPress & SNEAK_GESTURE) != 0 : previewModifierDown();
         boolean ctrl = pressed ? (modifiersAtPress & (LEFT_CTRL_GESTURE | RIGHT_CTRL_GESTURE)) != 0
                 : GuiScreen.isCtrlKeyDown();
         WorldHit hit = worldHit(player);
-        if (hit == null) return pressed && !sneak && beginGrip(remoteGripHit(player), player, false, heldLong);
-        if (!hit.owned || hit.view.fixedPose != null) return true;
+        boolean near = hit != null;
+        if (!near && pressed && !sneak) hit = remoteGripHit(player);
+        if (hit == null) return false;
+        if (!hit.owned) return true;
+        PreviewGrip moved = renderGrip(hit.view);
+        if (!sneak && hit.host && (moved == null || pressed) && beginGrip(hit, player, near, heldLong)) return true;
+        if (!near) return false;
+        if (moved != null && moved.released && !moved.rejected) {
+            if (!pressed) return true;
+            // The old mesh already occupies the accepted world position while the new sections stream.
+            if (!(sneak && ctrl)) PreviewEdit.TaskAction.openMoved(hit.view.id, moved.revision + 1,
+                    hit.at, hit.marker() && !sneak);
+            return true;
+        }
         if (sneak && !ctrl) {
             PreviewEdit.TaskAction.openTask(hit.view.id, hit.at);
             return true;
@@ -213,25 +236,42 @@ public final class BuilderRenderer extends BuilderProxy {
         }
         if (sneak) return true;
         if (hit.marker()) {
-            if (!beginGrip(hit, player, true, heldLong)) PreviewEdit.TaskAction.open(hit.view.id, hit.view.revision, hit.at);
+            PreviewEdit.TaskAction.open(hit.view.id, hit.view.revision, hit.at);
         } else PreviewEdit.TaskAction.openTask(hit.view.id, hit.at);
         return true;
     }
 
-    private static boolean canGrip(WorldHit hit, EntityPlayer player) {
-        return hit != null && hit.owned && hit.host && hit.view.fixedPose == null
-                && hit.view.pose >= 0 && hit.view.allowed != null && player.worldObj.isAirBlock(hit.at.posX, hit.at.posY, hit.at.posZ);
+    private boolean canGrip(WorldHit hit, EntityPlayer player) {
+        if (hit == null || !hit.owned || !hit.host) return false;
+        View view = views.get(hit.view.id);
+        return view != null && view.pose >= 0 && view.allowed != null
+                && player.worldObj.isAirBlock(hit.at.posX, hit.at.posY, hit.at.posZ);
     }
 
     private boolean beginGrip(WorldHit hit, EntityPlayer player, boolean near, boolean heldLong) {
         if (!canGrip(hit, player)) return false;
-        PreviewGrip g = new PreviewGrip(hit.view.id, ++nextGrip, hit.view.revision, hit.view.tool, hit.at,
-                ExtendedFacing.byIndex(hit.view.pose), hit.view.allowed, hit.view.dragMinDistance,
-                hit.view.dragMaxDistance, near, player, System.nanoTime());
-        g.moving = heldLong;
+        View view = views.get(hit.view.id);
+        PreviewGrip waiting = grip;
+        if (waiting != null && (!waiting.released || waiting.rejected || !waiting.id.equals(view.id))) return false;
+        long now = System.nanoTime();
+        if (waiting != null) {
+            // Remember the gesture until DROP supplies the authoritative anchor and revision.
+            if (dragUseHeld || near && !heldLong) {
+                waiting.regrabPressedAt = now;
+                waiting.regrabNear = near;
+                waiting.regrabTapped = !dragUseHeld;
+            }
+        } else startGrip(view, player, near, now, heldLong);
+        return true;
+    }
+
+    private void startGrip(View view, EntityPlayer player, boolean near, long pressedAt, boolean moving) {
+        PreviewGrip g = new PreviewGrip(view.id, ++nextGrip, view.revision, view.tool, view.controller,
+                ExtendedFacing.byIndex(view.pose), view.allowed, view.dragMinDistance, view.dragMaxDistance, near, player, pressedAt);
+        if (view.previous != null) g.reuseMesh(view.previous.fixedPose);
+        g.moving = moving;
         grip = g;
         PreviewDragMessage.send(PreviewDragMessage.PRESS, g.id, g.sequence, g.revision, null, null);
-        return true;
     }
 
     private static boolean useDown() {
@@ -282,6 +322,10 @@ public final class BuilderRenderer extends BuilderProxy {
                     axisKey = 0;
                     boolean heldLong = dragUseHeld && input.time - dragPressTime >= GRIP_HOLD_NANOS;
                     if (freshDragPress) longReleasedPress = heldLong;
+                    if (g != null && g.regrabPressedAt != 0 && !g.regrabTapped) {
+                        if (g.regrabNear && !heldLong) g.regrabTapped = true;
+                        else g.regrabPressedAt = 0;
+                    }
                     if (g != null && !g.released && !g.inputReleased) {
                         g.inputReleased = true;
                         // A release between client ticks can cross the hold threshold.
@@ -311,19 +355,12 @@ public final class BuilderRenderer extends BuilderProxy {
 
     @Override public void rejectDrag(UUID id,long sequence) {
         PreviewGrip g=grip;
-        if (g!=null && g.id.equals(id) && g.sequence==sequence) g.rejected=true;
+        if (g != null && g.sequence == sequence && g.id.equals(id)) g.rejected = true;
     }
 
     @Override
     public boolean deleteShortcutKey(int key) {
         return key != 0 && key == deleteTask.getKeyCode() && !Keyboard.isRepeatEvent();
-    }
-
-    @Override
-    public int hotbarSlot(int key) {
-        KeyBinding[] keys = Minecraft.getMinecraft().gameSettings.keyBindsHotbar;
-        if (key != 0) for (int i = 0; i < keys.length; i++) if (keys[i].getKeyCode() == key) return i;
-        return -1;
     }
 
     @SubscribeEvent
@@ -357,8 +394,8 @@ public final class BuilderRenderer extends BuilderProxy {
         if (!editContext(player)) return;
         int notches = (int) Math.min(PreviewEdit.MAX_STEPS, Math.max(1, Math.abs((long) event.dwheel) / 120));
         PreviewGrip g = grip;
-        if (g != null && !g.released) {
-            if (g.moving && !g.rejected)
+        if (g != null && (g.regrabPressedAt != 0 || !g.released)) {
+            if (!g.released && g.moving && !g.rejected)
                 dragInputs.add(new DragInput(Mouse.getEventNanoseconds(), 0, false, event.dwheel > 0 ? notches : -notches));
             event.setCanceled(true);
             return;
@@ -394,19 +431,22 @@ public final class BuilderRenderer extends BuilderProxy {
         if (g.released) {
             if (g.rejected || view == null || view.revision != g.revision || player == null
                     || player.dimension != g.dimension || now - g.releasedAt > 15_000_000_000L) grip = null;
+            else if (!context || !sameTerminal(g, player)) g.regrabPressedAt = 0;
             return;
         }
         if (!context || !player.worldObj.isAirBlock(g.origin.posX, g.origin.posY, g.origin.posZ)
-                || player.dimension!=g.dimension || player.inventory.currentItem!=g.slot ||
-                !g.tool.equals(player.getHeldItem().getTagCompound().getString("tool"))) {
+                || !sameTerminal(g, player)) {
             if (!g.released && player!=null && mc.getNetHandler()!=null)
                 PreviewDragMessage.send(PreviewDragMessage.CANCEL,g.id,g.sequence,g.revision,null,null);
             grip=null; return;
         }
         if (view==null || view.revision!=g.revision || view.pose<0) g.rejected=true;
         holdingUse &= !g.inputReleased;
-        if (holdingUse && !g.rejected && now - g.pressedAt >= GRIP_HOLD_NANOS) g.moving = true;
-        if (g.moving && !g.rejected) g.track(player);
+        if (holdingUse && now - g.pressedAt >= GRIP_HOLD_NANOS) g.moving = true;
+        if (g.moving && !g.rejected) {
+            g.track(player);
+            if (holdingUse) g.survey();
+        }
         if (!holdingUse) {
             int op = g.rejected ? PreviewDragMessage.CANCEL : g.moving ? PreviewDragMessage.DROP
                     : g.near ? PreviewDragMessage.TAP : PreviewDragMessage.CANCEL;
@@ -414,6 +454,11 @@ public final class BuilderRenderer extends BuilderProxy {
             g.released=true; g.releasedAt=now;
             if (op!=PreviewDragMessage.DROP || !g.changed() && player.worldObj.isAirBlock(g.at.posX,g.at.posY,g.at.posZ)) grip=null;
         }
+    }
+
+    private static boolean sameTerminal(PreviewGrip g, EntityPlayer player) {
+        return player.dimension == g.dimension && player.inventory.currentItem == g.slot
+                && g.tool.equals(player.getHeldItem().getTagCompound().getString("tool"));
     }
 
     @SubscribeEvent
@@ -498,11 +543,27 @@ public final class BuilderRenderer extends BuilderProxy {
         String[] dotHints;
         final Map<List<String>, HatchInfo[]> labels = new HashMap<>();
         int epoch, revision;
-        boolean editable, textured, locateHatches;
+        boolean editable, textured, locateHatches, construction;
+        final Set<Section> fadingSections = new LinkedHashSet<>();
+
+        void advanceColorHandoff(long now) {
+            if (fadingSections.isEmpty()) return;
+            for (Iterator<Section> it = fadingSections.iterator(); it.hasNext();) {
+                Section section = it.next();
+                long elapsed = now - section.colorStart;
+                if (section.stagedColor != 0 && (!construction || elapsed >= COLOR_HANDOFF_NS)) section.publishStagedColor();
+                if (!construction || elapsed >= 2 * COLOR_HANDOFF_NS) {
+                    section.colorStart = 0;
+                    it.remove();
+                }
+            }
+        }
         final Map<Integer, Assembly> fragments = new HashMap<>();
         long lastCompilation, lastSample;
         View previous;
         Section partialFaces;
+        final Deque<Section> readyMeshes = new ArrayDeque<>();
+        PreviewStream.Packet conflict;
         PreviewGrip fixedPose;
         PreviewGrip acceptedFootingPose;
         boolean moveStreamReady, waitingForSite;
@@ -619,7 +680,8 @@ public final class BuilderRenderer extends BuilderProxy {
         final ProjectionSite site = new ProjectionSite();
         final Section[] near = new Section[6];
         final AxisAlignedBB box;
-        int faces, marks;
+        int faces, marks, stagedColor;
+        long colorStart;
         int faceParts, visibleParts = 1;
         long visiblePartMask = 1;
         WorldPreviewGlass.Mesh glass;
@@ -649,7 +711,23 @@ public final class BuilderRenderer extends BuilderProxy {
             return (owner.layers & PreviewStream.SHELL) != 0 && (faces != 0 ? facesTextured : owner.textured);
         }
 
+        private void discardStagedColor() {
+            if (stagedColor == 0) return;
+            GL11.glDeleteLists(stagedColor, 1);
+            stagedColor = 0;
+        }
+
+        void publishStagedColor() {
+            releaseFaceParts();
+            GL11.glDeleteLists(faces, 1);
+            faces = stagedColor;
+            stagedColor = 0;
+            facesTextured = false;
+            visibleWords = 64;
+        }
+
         void markFacesDirty() {
+            discardStagedColor();
             dirty = true;
             publishedTexture = null;
             // Keep the already visible prefix until a replacement can take over its GL lists.
@@ -724,6 +802,11 @@ public final class BuilderRenderer extends BuilderProxy {
         }
 
         void clearFaces() {
+            if (colorStart != 0) {
+                owner.fadingSections.remove(this);
+                colorStart = 0;
+            }
+            discardStagedColor();
             cancelTexturedBuild();
             publishedTexture = null;
             visibleWords = 64;
@@ -759,6 +842,11 @@ public final class BuilderRenderer extends BuilderProxy {
         private void clearGlass() {
             if (glass != null) glass.release();
             glass = null;
+        }
+
+        boolean canCompactGlass(WorldPreviewGlass.Mesh mesh) {
+            return owner.previous == null && owner.textured && textured && !dirty && !site.dirty
+                    && publishedTexture != null && glass == mesh;
         }
 
         WorldPreviewGlass.Mesh drawableGlass() {
@@ -922,11 +1010,13 @@ public final class BuilderRenderer extends BuilderProxy {
     public void footingChunkChanged(ChunkEvent e) {
         if (e.world == observedWorld && occupancy != null) {
             occupancy.chunkChanged(e.getChunk().xPosition, e.getChunk().zPosition);
-            footing.chunkChanged(e.getChunk().xPosition, e.getChunk().zPosition, e instanceof ChunkEvent.Unload);
+            for (PreviewContacts contacts : contactsByTask.values()) contacts.chunkChanged(e.getChunk().xPosition, e.getChunk().zPosition, e instanceof ChunkEvent.Unload);
         }
     }
 
     private void remove(UUID id) {
+        PreviewContacts contacts = contactsByTask.remove(id);
+        if (contacts != null && !contacts.clear()) retiredContacts.addLast(contacts);
         View view = views.remove(id);
         if (view != null) {
             retireMoveSource(view);
@@ -950,11 +1040,27 @@ public final class BuilderRenderer extends BuilderProxy {
         replacement.layers = old.layers;
         replacement.controller = new ChunkCoordinates(released.at);
         if (p.pose >= 0 && p.pose < ExtendedFacing.VALUES.length) released.orient(ExtendedFacing.VALUES[p.pose]);
-        old.fixedPose = released;
+        replacement.pose = released.facing.getIndex();
+        replacement.allowed = old.allowed;
+        replacement.dragMinDistance = old.dragMinDistance;
+        replacement.dragMaxDistance = old.dragMaxDistance;
+        View source = old.previous == null ? old : old.previous;
+        if (old.previous != null) {
+            old.previous = null;
+            retireSections(old);
+        }
+        source.fixedPose = released;
         replacement.acceptedFootingPose = released;
-        replacement.previous = old;
+        replacement.previous = source;
         views.put(p.id, replacement);
+        applyDragInputs();
         grip = null;
+        EntityPlayer player = Minecraft.getMinecraft().thePlayer;
+        if (released.regrabPressedAt != 0 && editContext(player) && sameTerminal(released, player)
+                && player.worldObj.isAirBlock(released.at.posX, released.at.posY, released.at.posZ)) {
+            if (released.regrabTapped) PreviewEdit.TaskAction.openMoved(p.id, p.revision, released.at, true);
+            else startGrip(replacement, player, released.regrabNear, released.regrabPressedAt, false);
+        }
     }
 
     private void retireMoveSource(View destination) {
@@ -996,6 +1102,7 @@ public final class BuilderRenderer extends BuilderProxy {
     public void tick(TickEvent.ClientTickEvent e) {
         if (e.phase != TickEvent.Phase.END) return;
         hudTick++;
+        if (!retiredContacts.isEmpty() && retiredContacts.peekFirst().clear()) retiredContacts.removeFirst();
         BrowserRenderer.cleanupClosed();
         drainRetiredMoveSections();
         reloadPreviewTextures();
@@ -1067,6 +1174,7 @@ public final class BuilderRenderer extends BuilderProxy {
                     view.acceptedFootingPose = null;
                 if (view.previous != null && (p.epoch != view.epoch || p.revision != view.revision || p.layers != view.previous.layers
                         || p.textured != view.previous.textured)) retireMoveSource(view);
+                view.construction = p.construction;
                 if (p.reset) retireSections(view);
                 if (view.epoch != p.epoch) view.fragments.clear();
                 view.epoch = p.epoch;
@@ -1075,7 +1183,6 @@ public final class BuilderRenderer extends BuilderProxy {
                 view.locateHatches = p.locateHatches;
                 if (view.textured != p.textured) {
                     view.textureSwitch.clear();
-                    footing.refresh(view.footing);
                     for (Section s : view.sections.values()) {
                         s.site.dirty = true;
                         // A color mesh is already the correct placeholder until the palette for
@@ -1103,6 +1210,10 @@ public final class BuilderRenderer extends BuilderProxy {
             }
             View view = views.get(p.id);
             if (view == null || view.dim != p.dim || view.epoch != p.epoch) continue;
+            if (p.type == PreviewStream.CONFLICT) {
+                if (p.revision == view.revision) view.conflict = p.conflict ? p : null;
+                continue;
+            }
             if (p.type == PreviewStream.FOOTING_ROWS) {
                 if (view.revision == p.revision && (view.layers & PreviewStream.BOX) != 0) view.receiveFooting(p);
                 continue;
@@ -1287,6 +1398,12 @@ public final class BuilderRenderer extends BuilderProxy {
         return worldHit(player, false);
     }
 
+    private ChunkCoordinates gripAnchor(View view) {
+        PreviewGrip waiting = grip;
+        return waiting != null && waiting.released && !waiting.rejected && waiting.id.equals(view.id)
+                ? waiting.at : view.controller;
+    }
+
     private WorldHit remoteGripHit(EntityPlayer player) {
         ItemStack held = player.getHeldItem();
         String tool = held.getTagCompound().getString("tool");
@@ -1295,9 +1412,9 @@ public final class BuilderRenderer extends BuilderProxy {
         double reach = 0;
         List<View> candidates = new ArrayList<>();
         for (View view : views.values()) {
-            ChunkCoordinates at = view.controller;
+            ChunkCoordinates at = gripAnchor(view);
             if (view.dim != player.dimension || !tool.equals(view.tool) || at == null || view.pose < 0
-                    || view.allowed == null || view.previous != null || view.fixedPose != null
+                    || view.allowed == null || view.fixedPose != null
                     || !player.worldObj.blockExists(at.posX, at.posY, at.posZ)
                     || !player.worldObj.isAirBlock(at.posX, at.posY, at.posZ)) continue;
             double limit = PreviewAim.dragReach(view.dragMaxDistance);
@@ -1310,7 +1427,7 @@ public final class BuilderRenderer extends BuilderProxy {
         View[] picked = {null};
         ChunkCoordinates at = PreviewAim.first(player, reach, (x, y, z) -> {
             for (View view : candidates) {
-                ChunkCoordinates controller = view.controller;
+                ChunkCoordinates controller = gripAnchor(view);
                 if (controller.posX == x && controller.posY == y && controller.posZ == z
                         && (picked[0] == null || PreviewAim.prefer(true, view.idText, true, picked[0].idText, selected)))
                     picked[0] = view;
@@ -1344,12 +1461,10 @@ public final class BuilderRenderer extends BuilderProxy {
 
     private WorldHit hitAt(View view, World world, int worldX, int worldY, int worldZ, boolean owned, boolean inspect) {
         int x = worldX, y = worldY, z = worldZ;
-        PreviewGrip pose = view.fixedPose;
-        if (pose != null) {
-            highlightOffset[0] = x - pose.at.posX; highlightOffset[1] = y - pose.at.posY; highlightOffset[2] = z - pose.at.posZ;
-            pose.facing.getOffsetABC(highlightOffset, highlightLocal);
-            pose.original.getWorldOffset(highlightLocal, highlightOffset);
-            x = pose.origin.posX + highlightOffset[0]; y = pose.origin.posY + highlightOffset[1]; z = pose.origin.posZ + highlightOffset[2];
+        PreviewGrip pose = renderGrip(view);
+        if (pose != null && pose.released) {
+            pose.sourceCell(x, y, z, highlightOffset);
+            x = highlightOffset[0]; y = highlightOffset[1]; z = highlightOffset[2];
         }
         boolean roles = (view.layers & PreviewStream.HATCH) != 0, shells = (view.layers & PreviewStream.SHELL) != 0;
         boolean issue = view.repairable && view.issue != null && view.issue.posX == x && view.issue.posY == y && view.issue.posZ == z;
@@ -1364,6 +1479,7 @@ public final class BuilderRenderer extends BuilderProxy {
                 && (s.occupied[word] & bit) == 0
                 && (roles && hatch ? (s.outlineOnly() ? s.drawsShellSlot(slot) : s.marks != 0)
                         : shells && structure && s.drawsShellSlot(slot));
+        if (pose != null && pose.released) drawn = roles && (controller || hatch) || shells && structure;
         // An empty material option has no mesh, but its slot remains editable under the crosshair.
         if (shells && owned && view.editable && s != null && (s.optional[word] & bit) != 0) drawn = true;
         boolean air = world.isAirBlock(worldX, worldY, worldZ);
@@ -1472,7 +1588,7 @@ public final class BuilderRenderer extends BuilderProxy {
         if (name.isEmpty()) name = hitName(mc, hit);
         if (name.isEmpty()) name = StatCollector.translateToLocal("structurebuildernh.browser.block");
         if (style.optionCount > 0) name += "  " + (style.option + 1) + "/" + style.optionCount;
-        if (style.conflict) name += " · " + StatCollector.translateToLocal("structurebuildernh.previewConflict");
+        if (style.conflict) name += " \u00b7 " + StatCollector.translateToLocal("structurebuildernh.previewConflict");
         return name;
     }
 
@@ -1484,7 +1600,7 @@ public final class BuilderRenderer extends BuilderProxy {
 
     private static String roleName(String key, String name) {
         String role = StatCollector.translateToLocal("structurebuildernh." + key);
-        return name.isEmpty() || role.equals(name) ? role : role + " · " + name;
+        return name.isEmpty() || role.equals(name) ? role : role + " \u00b7 " + name;
     }
 
     private String hitName(Minecraft mc, WorldHit hit) {
@@ -1539,12 +1655,13 @@ public final class BuilderRenderer extends BuilderProxy {
     @SubscribeEvent
     public void markerLabel(net.minecraftforge.client.event.RenderGameOverlayEvent.Post e) {
         if (e.type != net.minecraftforge.client.event.RenderGameOverlayEvent.ElementType.ALL
-                || aimedMarker == null && !groundContactHud) return;
+                || aimedMarker == null && contactFaces == 0 && !showConflict) return;
         Minecraft mc = Minecraft.getMinecraft();
         if (mc.currentScreen != null || mc.gameSettings.hideGUI) return;
         if (aimedMarker != null) tooltip.draw(mc, e.resolution, aimedMarker, aimedHint, aimedAction, aimedColor, aimedHatch);
-        if (groundContactHud) {
-            String text = StatCollector.translateToLocal("structurebuildernh.groundContact");
+        if (contactFaces != 0 || showConflict) {
+            String text = contactFaces == 0 ? "" : PreviewContacts.label(contactFaces, contactFacing);
+            if (showConflict) text += (text.isEmpty() ? "" : " / ") + StatCollector.translateToLocal("structurebuildernh.structureConflict");
             mc.fontRendererObj.drawStringWithShadow(text, (e.resolution.getScaledWidth() - mc.fontRendererObj.getStringWidth(text)) / 2,
                     e.resolution.getScaledHeight() / 2 - mc.fontRendererObj.FONT_HEIGHT - 12, PreviewFooting.COLOR);
         }
@@ -1557,10 +1674,10 @@ public final class BuilderRenderer extends BuilderProxy {
         reloadPreviewTextures();
         Minecraft mc = Minecraft.getMinecraft();
         Entity eye = mc.renderViewEntity;
-        groundContactHud = false;
-        if (views.isEmpty() || TerminalBrowserWidget.coversWorld(mc.currentScreen) || eye == null) {
+        contactFaces = 0;
+        showConflict = false;
+        if (views.isEmpty() || eye == null) {
             glassPass.clear();
-            footing.clear();
             return;
         }
         observe(eye.worldObj);
@@ -1569,7 +1686,10 @@ public final class BuilderRenderer extends BuilderProxy {
         sampledSites = 0;
         samplingTurn = nextSamplingTurn;
         nextSamplingTurn = null;
-        compiledThisFrame = false;
+        long frameStart = System.nanoTime();
+        meshNanosLeft = Math.max(450_000L, Math.min(2_000_000L, (frameStart - lastRenderStart) / 4));
+        lastRenderStart = frameStart;
+        meshSteps = 0;
         sampledReleasedSite = false;
         double x = eye.lastTickPosX + (eye.posX - eye.lastTickPosX) * e.partialTicks;
         double y = eye.lastTickPosY + (eye.posY - eye.lastTickPosY) * e.partialTicks;
@@ -1587,7 +1707,7 @@ public final class BuilderRenderer extends BuilderProxy {
                         | GL11.GL_LINE_BIT
                         | GL11.GL_POLYGON_BIT);
         GL11.glPushMatrix();
-        boolean sampledFooting = false;
+        contactViews.clear();
         try {
             GL11.glTranslated(-x, -y, -z);
             // World-last callbacks may leave the lightmap or a different texture combiner active.
@@ -1604,29 +1724,25 @@ public final class BuilderRenderer extends BuilderProxy {
             visiblePreviews.clear();
             visibleBounds.clear();
             visibleIssues.clear();
-            View nextView = null;
-            Section nextSection = null;
             ItemStack held = mc.thePlayer == null ? null : mc.thePlayer.getHeldItem();
             boolean terminal = held != null && held.getItem() == BuilderItem.ITEM;
             String selected = terminal && held.hasTagCompound() ? held.getTagCompound().getString("selected") : "";
             String tool = terminal && held.hasTagCompound() ? held.getTagCompound().getString("tool") : "";
             for (View incoming : views.values()) {
+                incoming.advanceColorHandoff(frameStart);
                 if (eye.dimension != incoming.dim) continue;
                 ChunkCoordinates issue = incoming.issue;
                 if (issue != null && camera.isBoxInFrustum(issue.posX - .04, issue.posY - .04, issue.posZ - .04,
                         issue.posX + 1.04, issue.posY + 3.51, issue.posZ + 1.04)) visibleIssues.add(issue);
-                Section warming = null;
+                if (incoming.layers == 0 && incoming.previous == null) continue;
                 View view = incoming;
                 if (incoming.previous != null) {
-                    warming = pendingMoveMesh(incoming, camera);
-                    if (warming == null && !incoming.waitingForSite && incoming.moveStreamReady) {
+                    prepareMoveMeshes(incoming, camera);
+                    if (incoming.readyMeshes.isEmpty() && !incoming.waitingForSite && incoming.moveStreamReady
+                            && (grip == null || !grip.id.equals(incoming.id))) {
                         retireMoveSource(incoming);
                     } else {
                         view = incoming.previous;
-                        if (warming != null && (nextView == null || incoming.lastCompilation < nextView.lastCompilation)) {
-                            nextView = incoming;
-                            nextSection = warming;
-                        }
                     }
                 }
 
@@ -1640,23 +1756,46 @@ public final class BuilderRenderer extends BuilderProxy {
                 }
                 if (view.box == null) continue;
                 visiblePreviews.add(view);
+                PreviewStream.Packet report = incoming.conflict;
+                if (report != null && report.revision == incoming.revision && terminal && tool.equals(view.tool)) {
+                    boolean dragging = moving != null && !moving.released;
+                    if (dragging ? moving == grip && report.sequence == moving.sequence && report.pose == moving.facing.getIndex()
+                            && report.x == moving.at.posX && report.y == moving.at.posY && report.z == moving.at.posZ
+                            : report.sequence == 0 && view.idText.equals(selected)) showConflict = true;
+                }
                 if ((view.layers & PreviewStream.BOX) == 0) continue;
                 visibleBounds.add(view);
-                if (view.idText.equals(selected) && tool.equals(view.tool)) {
-                    sampledFooting = true;
-                    boolean contact = footing.sample(eye.worldObj, occupancy, view.footing, moving,
-                            x, z, mc.gameSettings.renderDistanceChunks, view.acceptedFootingPose);
-                    groundContactHud = contact && moving != null && moving == grip && !moving.released;
-                }
+                if (tool.equals(view.tool) && terminal) contactViews.add(view);
             }
-            if (sampledFooting) footing.writeDepth(camera);
+            if (!contactViews.isEmpty()) {
+                int count = contactViews.size();
+                int first = Math.floorMod(contactTurn++, count);
+                long deadline = System.nanoTime() + 1_250_000L;
+                boolean compiled = false;
+                for (int i = 0; i < count; i++) {
+                    View view = contactViews.get((first + i) % count);
+                    PreviewGrip moving = renderGrip(view);
+                    PreviewContacts contacts = contactsByTask.computeIfAbsent(view.id, ignored -> new PreviewContacts());
+                    contacts.setBuilding(view.construction);
+                    long now = System.nanoTime();
+                    long slice = now + Math.max(0L, deadline - now) / (count - i);
+                    int mask = contacts.sample(eye.worldObj, occupancy, view.footing, moving,
+                            x, y, z, mc.gameSettings.renderDistanceChunks, view.acceptedFootingPose, slice);
+                    if (moving != null && moving == grip && !moving.released) {
+                        contactFaces = mask;
+                        contactFacing = moving.facing;
+                    }
+                }
+                long start = System.nanoTime();
+                for (int i = 0; i < count; i++) {
+                    View view = contactViews.get((first + i) % count);
+                    compiled |= contactsByTask.get(view.id).writeDepth(camera, !compiled);
+                }
+                meshNanosLeft -= System.nanoTime() - start;
+            }
             for (View view : visiblePreviews) {
                 if ((view.layers & (PreviewStream.SHELL | PreviewStream.HATCH)) == 0) continue;
-                Section candidate = drawSections(view, camera);
-                if (candidate != null && (nextView == null || view.lastCompilation < nextView.lastCompilation)) {
-                    nextView = view;
-                    nextSection = candidate;
-                }
+                drawSections(view, camera);
             }
             // Opaque projections establish depth across all tasks before any translucent shell is blended.
             boolean drawSelection = terminal && shouldDrawPick(mc.thePlayer);
@@ -1678,25 +1817,32 @@ public final class BuilderRenderer extends BuilderProxy {
             }
             if (drawSelection && !selectedMarker) drawPick(highlighted, highlightColor);
             drawGlassSections();
+            drawTransitionColors();
             drawBounds();
             drawIssues();
-            if (sampledFooting) footing.drawSurface();
-            if (!compiledThisFrame) {
-                if (nextSection == null || (compilations & 7) == 7) {
-                    Section pending = pendingTextureSwitch(eye.dimension);
-                    if (pending != null) nextSection = pending;
+            for (View view : contactViews) contactsByTask.get(view.id).drawSurface();
+            compileReadyMeshes(eye.dimension);
+            if (meshSteps == 0 && meshNanosLeft > 0) {
+                if ((preferGlassBatch || stableShellCandidate == null) && glassPass.compactNext()) {
+                    preferGlassBatch = false;
+                } else if (stableShellCandidate != null) {
+                    compactStableShell(stableShellCandidate);
+                    preferGlassBatch = true;
                 }
-                if (nextSection != null) compileNext(nextSection);
             }
         } finally {
+            stableShellCandidate = null;
+            for (View view : meshViews) view.readyMeshes.clear();
+            meshViews.clear();
             occlusion.finish();
             roleTextures.clear();
             texturedSections.clear();
             colorSections.clear();
+            transitionColors.clear();
             visiblePreviews.clear();
             visibleBounds.clear();
             visibleIssues.clear();
-            if (!sampledFooting) footing.clear();
+            contactViews.clear();
             GL11.glPopMatrix();
             GL11.glPopAttrib();
         }
@@ -1865,8 +2011,7 @@ public final class BuilderRenderer extends BuilderProxy {
         t.addVertex(x0, y, z1); t.addVertex(x0, y, z0);
     }
 
-    private Section drawSections(View view, Frustrum camera) {
-        Section candidate = null;
+    private void drawSections(View view, Frustrum camera) {
         PreviewGrip moving = renderGrip(view);
         boolean shells = (view.layers & PreviewStream.SHELL) != 0;
         boolean hatches = (view.layers & PreviewStream.HATCH) != 0;
@@ -1880,19 +2025,25 @@ public final class BuilderRenderer extends BuilderProxy {
             Section s = visibleSections.get(i);
             boolean shell = shells && s.hasShell;
             boolean hatch = hatches && s.hasHatches;
-            if (!compiledThisFrame && (view.partialFaces == null || view.partialFaces == s)
+            if (meshSteps == 0 && (view.partialFaces == null || view.partialFaces == s)
                     && (compilations & 1) == 0 && (shell && s.dirty && s.replaceFaces
                     || hatch && s.replaceMarks && s.needsMarkFaces())) compileNext(s);
             if (hatch && !s.outlineOnly() && s.marks != 0) visibleHatches.add(s);
-            if (s.needsMesh(view.layers) && preferMesh(s, candidate)) candidate = s;
+            if (s.needsMesh(view.layers)) queueVisibleMesh(s);
             if (shell && s.drawableFaces() != 0) {
-                if (s.faces != 0 && !s.facesTextured) colorSections.add(s);
+                if (stableShellCandidate == null && view.textured && s.textured && !s.dirty && !s.site.dirty
+                        && moving == null && view.previous == null && s.publishedTexture != null
+                        && s.publishedTexture.canCompact(lastRenderStart)) stableShellCandidate = s;
+                if (s.stagedColor != 0) transitionColors.add(s);
+                if (s.faces != 0 && !s.facesTextured) {
+                    if (s.colorStart == 0) colorSections.add(s);
+                    else transitionColors.add(s);
+                }
                 else if (hatches && (s.hasHatches || s.containsController())) roleTextures.add(s);
                 else texturedSections.add(s);
             }
         }
         visibleSections.clear();
-        return candidate;
     }
 
     private void drawShellSections(List<Section> sections, boolean textured) {
@@ -1941,6 +2092,32 @@ public final class BuilderRenderer extends BuilderProxy {
         GL11.glDisable(GL11.GL_POLYGON_OFFSET_FILL);
     }
 
+    private void drawTransitionColors() {
+        if (transitionColors.isEmpty()) return;
+        GL11.glPushAttrib(GL11.GL_ENABLE_BIT | GL11.GL_DEPTH_BUFFER_BIT | GL11.GL_COLOR_BUFFER_BIT | GL11.GL_POLYGON_BIT);
+        try {
+            GL11.glDisable(GL11.GL_TEXTURE_2D);
+            GL11.glDisable(GL11.GL_ALPHA_TEST);
+            GL11.glEnable(GL11.GL_CULL_FACE);
+            GL11.glCullFace(GL11.GL_BACK);
+            GL11.glEnable(GL11.GL_DEPTH_TEST);
+            GL11.glDepthFunc(GL11.GL_LEQUAL);
+            GL11.glDepthMask(false);
+            GL11.glEnable(GL11.GL_POLYGON_OFFSET_FILL);
+            // Between real blocks (zero offset) and the outgoing texture (1,1).
+            GL11.glPolygonOffset(.5f, .5f);
+            GL11.glEnable(GL11.GL_BLEND);
+            GL11.glBlendFunc(EXTBlendColor.GL_CONSTANT_ALPHA_EXT, EXTBlendColor.GL_ONE_MINUS_CONSTANT_ALPHA_EXT);
+            for (Section s : transitionColors) {
+                float phase = Math.max(0f, (lastRenderStart - s.colorStart) / (float) COLOR_HANDOFF_NS);
+                float alpha = phase < 1f ? phase : 1f - Math.min(1f, phase - 1f) * (1f - SHELL_ALPHA / 255f);
+                GL14.glBlendColor(0, 0, 0, alpha);
+                sectionLists.add(s.stagedColor != 0 ? s.stagedColor : s.faces, renderGrip(s.owner));
+                sectionLists.flush();
+            }
+        } finally { GL11.glPopAttrib(); }
+    }
+
     private void drawGlassSections() {
         for (Section section : texturedSections) {
             if (section.probe == -1) continue;
@@ -1955,26 +2132,27 @@ public final class BuilderRenderer extends BuilderProxy {
         glassPass.draw(cameraX, cameraY, cameraZ);
     }
 
-    /** Warm the destination under the normal one-list-per-frame budget while the old lists stay visible. */
-    private Section pendingMoveMesh(View destination, Frustrum camera) {
+    /** Keep the old lists visible while the destination is warming. */
+    private void prepareMoveMeshes(View destination, Frustrum camera) {
         destination.waitingForSite = false;
-        if (destination.box == null || !camera.isBoundingBoxInFrustum(destination.box)) return null;
-        Section candidate = null;
+        if (destination.box == null || !camera.isBoundingBoxInFrustum(destination.box)) return;
         for (Section s : destination.sections.values()) {
             if (!camera.isBoundingBoxInFrustum(s.box)) continue;
             if (!refreshSite(s, null, false)) {
                 destination.waitingForSite = true;
                 continue;
             }
-            if (s.needsMesh(destination.layers) && preferMesh(s, candidate)) candidate = s;
+            if (s.needsMesh(destination.layers)) queueVisibleMesh(s);
         }
-        return candidate;
     }
 
     private void observe(World world) {
         if (observedWorld == world) return;
-        footing.worldChanged();
-        groundContactHud = false;
+        for (PreviewContacts contacts : contactsByTask.values()) contacts.worldChanged();
+        for (PreviewContacts contacts : retiredContacts) contacts.worldChanged();
+        contactsByTask.clear();
+        retiredContacts.clear();
+        contactFaces = 0;
         if (occupancy != null) occupancy.close();
         observedWorld = world;
         occupancy = world == null ? null : new ProjectionOccupancy(world);
@@ -1991,7 +2169,8 @@ public final class BuilderRenderer extends BuilderProxy {
     private Section pendingTextureSwitch(int dimension) {
         Section candidate = null;
         for (View view : views.values()) {
-            if (view.dim != dimension || view.previous != null || renderGrip(view) != null) continue;
+            if (view.dim != dimension || (view.layers & PreviewStream.SHELL) == 0
+                    || view.previous != null || renderGrip(view) != null) continue;
             Iterator<Section> it = view.textureSwitch.iterator();
             while (it.hasNext()) {
                 Section next = it.next();
@@ -2003,14 +2182,47 @@ public final class BuilderRenderer extends BuilderProxy {
         return candidate != null && refreshSite(candidate, null, false) && candidate.hasShell ? candidate : null;
     }
 
+    private void queueVisibleMesh(Section s) {
+        Deque<Section> queue = s.owner.readyMeshes;
+        if (queue.isEmpty()) meshViews.add(s.owner);
+        if (preferMesh(s, queue.peekFirst())) queue.addFirst(s);
+        else queue.addLast(s);
+    }
+
+    private void compileReadyMeshes(int dimension) {
+        boolean checkedOffscreen = false;
+        while (meshSteps == 0 || meshNanosLeft > 0 && meshSteps < 32) {
+            View oldest = null;
+            for (View v : meshViews) {
+                if (!v.readyMeshes.isEmpty() && (oldest == null || v.lastCompilation < oldest.lastCompilation)) oldest = v;
+            }
+            if (oldest == null || !checkedOffscreen && (compilations & 7) == 7) {
+                checkedOffscreen = true;
+                Section pending = pendingTextureSwitch(dimension);
+                if (pending != null) {
+                    compileNext(pending);
+                    continue;
+                }
+            }
+            if (oldest == null) break;
+            Section s = oldest.readyMeshes.removeFirst();
+            if (!s.needsMesh(oldest.layers)) continue;
+            compileNext(s);
+            // Finish a partial texture before starting another in the same task.
+            if (s.texturedBuild != null && s.dirty) oldest.readyMeshes.addFirst(s);
+        }
+    }
+
     private void compileNext(Section s) {
-        compiledThisFrame = true;
+        long start = System.nanoTime();
+        meshSteps++;
         s.owner.lastCompilation = s.lastCompilation = ++compilations;
         int layers = s.owner.layers;
         boolean roles = (layers & PreviewStream.HATCH) != 0 && s.hasHatches;
         if (s.replaceFaces && s.dirty && s.textured && s.hasShell && (layers & PreviewStream.SHELL) != 0) rebuildFaces(s);
         else if (roles && s.needsMarkFaces()) rebuildMarks(s);
         else if ((layers & PreviewStream.SHELL) != 0 && s.hasShell && s.dirty) rebuildFaces(s);
+        meshNanosLeft -= System.nanoTime() - start;
     }
 
     private boolean refreshSite(Section s, PreviewGrip moving, boolean presenting) {
@@ -2105,18 +2317,26 @@ public final class BuilderRenderer extends BuilderProxy {
             Section previous = s.owner.partialFaces;
             if (previous != null && previous != s && s.publishedTexture == null
                     && !s.owner.textureSwitch.contains(previous)) previous.markFacesDirty();
-            boolean switching = s.owner.textureSwitch.contains(s);
-            long deadline = switching ? System.nanoTime() + 450_000L : 0;
-            for (int step = 0; ; step++) {
-                s.dirty = !compileTexturedStep(s.owner, s);
-                if (!s.dirty || !switching || step == 7 || System.nanoTime() >= deadline) break;
-            }
+            s.dirty = !compileTexturedStep(s);
             if (!s.dirty) s.owner.textureSwitch.remove(s);
             if (s.texturedBuild != null) s.owner.partialFaces = s;
             else if (s.owner.partialFaces == s) s.owner.partialFaces = null;
         }
         else {
             s.cancelTexturedBuild();
+            long now = System.nanoTime();
+            if (s.facesTextured && s.faces != 0 && s.owner.construction
+                    && (s.colorStart != 0 ? now - s.colorStart < COLOR_HANDOFF_NS : s.owner.fadingSections.size() < 8)) {
+                s.stagedColor = compileShell(s.owner, s, 0);
+                if (s.stagedColor != 0) {
+                    if (s.colorStart == 0) {
+                        s.colorStart = System.nanoTime();
+                        s.owner.fadingSections.add(s);
+                    }
+                    s.replaceFaces = s.dirty = false;
+                    return;
+                }
+            }
             s.faces = compileShell(s.owner, s, s.faces);
             s.dirty = s.faces == 0;
             if (!s.dirty) {
@@ -2129,9 +2349,15 @@ public final class BuilderRenderer extends BuilderProxy {
     }
 
     private PreviewGrip renderGrip(View v) {
-        if (v != null && v.fixedPose != null) return v.fixedPose;
-        PreviewGrip g=grip;
-        return g!=null && g.moving && !g.rejected && v!=null && v.revision==g.revision && g.id.equals(v.id) ? g : null;
+        if (v == null) return null;
+        PreviewGrip g = grip;
+        if (g != null && g.moving && !g.rejected && g.id.equals(v.id)) {
+            View current = views.get(v.id);
+            if (current != null && current.revision == g.revision
+                    && (current.previous == null ? current == v : current.previous == v))
+                return g;
+        }
+        return v.fixedPose;
     }
 
     /** Section vertices stay local; their translation is replayed by the GPU for every camera pose. */
@@ -2240,6 +2466,7 @@ public final class BuilderRenderer extends BuilderProxy {
     }
 
     private static final class TexturedBuild {
+        static final int GROUP_SIZE = 16;
         // Keep expensive native/transparent models on the short incremental-build path.
         final int[] ends = new int[64];
         final int parts, head;
@@ -2248,12 +2475,27 @@ public final class BuilderRenderer extends BuilderProxy {
         long repairs, urgent;
         long shellParts;
         int part;
-        WorldPreviewGlass.Collector glassFaces;
+        final WorldPreviewGlass.Collector[] glassFaces = new WorldPreviewGlass.Collector[GROUP_SIZE];
+        int collectingPart, nextGroup;
+        int compactedGroups;
+        long stableAfter;
         WorldPreviewGlass.Mesh glass;
 
         void rememberGlass(int slot, int side) {
-            if (glassFaces == null) glassFaces = new WorldPreviewGlass.Collector();
-            glassFaces.face(slot, side);
+            if (collectingPart < 0) return;
+            while ((slot >> 6) >= ends[collectingPart]) collectingPart++;
+            int i = collectingPart % GROUP_SIZE;
+            if (glassFaces[i] == null) glassFaces[i] = new WorldPreviewGlass.Collector();
+            glassFaces[i].face(slot, side);
+        }
+
+        boolean canCompact(long now) {
+            return nextGroup + 1 < parts && now >= stableAfter;
+        }
+
+        int lastPart(int first) {
+            return (compactedGroups & (1 << (first / GROUP_SIZE))) != 0
+                    ? Math.min(first + GROUP_SIZE, parts) - 1 : first;
         }
 
         TexturedBuild(Section s) {
@@ -2265,6 +2507,7 @@ public final class BuilderRenderer extends BuilderProxy {
                 complex[i + 1] = a.glass || a.fluid != null || a.frame || a.fence;
                 if (complex[i + 1]) complexTypes++;
             }
+            int partSize = complexTypes == 0 ? 512 : 256;
             for (int word = 0; word < s.solid.length; word++) {
                 // Include occupied slots: they can reappear after a real block is removed.
                 long bits = s.solid[word];
@@ -2280,7 +2523,7 @@ public final class BuilderRenderer extends BuilderProxy {
                         }
                     }
                 }
-                if (cells + next > 256) { ends[count++] = word; cells = 0; }
+                if (cells + next > partSize) { ends[count++] = word; cells = 0; }
                 cells += next;
             }
             ends[count++] = s.solid.length;
@@ -2296,17 +2539,21 @@ public final class BuilderRenderer extends BuilderProxy {
 
         void invalidate(PreviewRegion changed, long localWords) {
             access = null;
-            for (int i = 0; i < part; i++) {
-                if (!dependencies[i].intersects(changed)) continue;
-                repairs |= 1L << i;
-                int first = i == 0 ? 0 : ends[i - 1];
-                long words = (-1L << first) & (-1L >>> (64 - ends[i]));
-                if ((localWords & words) != 0) urgent |= 1L << i;
+            for (int i = 0; i < part;) {
+                int last = lastPart(i);
+                if (dependencies[i].intersects(changed)) {
+                    repairs |= 1L << i;
+                    if (last == i) nextGroup = Math.min(nextGroup, i - i % GROUP_SIZE);
+                    int firstWord = i == 0 ? 0 : ends[i - 1];
+                    long words = (-1L << firstWord) & (-1L >>> (64 - ends[last]));
+                    if ((localWords & words) != 0) urgent |= 1L << i;
+                }
+                i = last + 1;
             }
         }
     }
 
-    private static boolean compileTexturedStep(View view, Section s) {
+    private static boolean compileTexturedStep(Section s) {
         TexturedBuild build = s.texturedBuild;
         if (build == null && s.publishedTexture != null && s.publishedTexture.repairs != 0) build = s.publishedTexture;
         if (build == null) {
@@ -2318,34 +2565,7 @@ public final class BuilderRenderer extends BuilderProxy {
             int index = build.repairs != 0 ? Long.numberOfTrailingZeros(build.urgent != 0 ? build.urgent : build.repairs)
                     : build.part;
             if (index >= build.parts) return true;
-            if (build.access == null) build.access = textureAccess(view, s);
-            int firstWord = index == 0 ? 0 : build.ends[index - 1], endWord = build.ends[index];
-            PreviewRegion reads = build.dependencies[index];
-            if (reads == null) build.dependencies[index] = reads = new PreviewRegion();
-            reads.clear();
-            // Face culling also reads the six immediate neighbors without consulting IBlockAccess.
-            for (int word = firstWord; word < endWord; word++) {
-                int y = s.y + (word >> 2), z = s.z + (word & 3) * 4;
-                if (s.solid[word] == 0) continue;
-                reads.include(s.x - 1, y - 1, z - 1);
-                reads.include(s.x + 16, y + 1, z + 4);
-            }
-            build.access.reads = reads;
-            // Submit completed parts directly. A cached parent can capture empty or outdated
-            // child geometry when the renderer emulates legacy display lists.
-            beginSectionList(build.head + index, s);
-            try {
-                build.shellParts &= ~(1L << index);
-                emitTexturedPart(s, build, firstWord, endWord, index);
-            } finally {
-                endSectionList();
-            }
-            if (build.glass == null && build.glassFaces != null && build.glassFaces.size != 0)
-                build.glass = new WorldPreviewGlass.Mesh(s.x, s.y, s.z, view.id);
-            if (build.glass != null && !build.glass.replace(index, s, build.access, build.glassFaces)) {
-                build.glassFaces.size = 0;
-                return false;
-            }
+            if (!compileTextureRange(s, build, index, build.lastPart(index), false)) return false;
             if (s.publishedTexture == build) {
                 s.glass = build.glass;
                 s.visiblePartMask = build.shellParts;
@@ -2356,7 +2576,8 @@ public final class BuilderRenderer extends BuilderProxy {
             if (index == build.part) build.part++;
             if (build.part < build.parts || build.repairs != 0) return false;
             build.access = null;
-            build.glassFaces = null;
+            Arrays.fill(build.glassFaces, null);
+            build.stableAfter = System.nanoTime() + 500_000_000L;
             if (s.publishedTexture == build) return true;
             s.texturedBuild = null;
             s.clearFaces();
@@ -2372,6 +2593,78 @@ public final class BuilderRenderer extends BuilderProxy {
             s.cancelTexturedBuild();
             throw failure;
         }
+    }
+
+    private static void compactStableShell(Section s) {
+        TexturedBuild build = s.publishedTexture;
+        if (build == null || s.dirty || !s.owner.textured) return;
+        while (build.nextGroup + 1 < build.parts) {
+            int first = build.nextGroup;
+            int end = Math.min(first + TexturedBuild.GROUP_SIZE, build.parts);
+            build.nextGroup = end;
+            long members = (-1L << first) & (-1L >>> (64 - end));
+            if ((build.compactedGroups & (1 << (first / TexturedBuild.GROUP_SIZE))) != 0
+                    || Long.bitCount(build.shellParts & members) < 2) continue;
+            try {
+                compileTextureRange(s, build, first, end - 1, true);
+            } finally {
+                build.access = null;
+            }
+            build.compactedGroups |= 1 << (first / TexturedBuild.GROUP_SIZE);
+            build.shellParts &= ~members | (1L << first);
+            s.visiblePartMask = build.shellParts;
+            // Retain the allocated names, but release the fine geometry now held by the first list.
+            for (int i = first + 1; i < end; i++) {
+                GL11.glNewList(build.head + i, GL11.GL_COMPILE);
+                GL11.glEndList();
+                build.dependencies[i] = null;
+            }
+            break;
+        }
+    }
+
+    private static boolean compileTextureRange(Section s, TexturedBuild build, int index, int last, boolean shellOnly) {
+        int firstWord = index == 0 ? 0 : build.ends[index - 1], endWord = build.ends[last];
+        if (build.access == null) build.access = textureAccess(s);
+        PreviewRegion reads = build.dependencies[index];
+        if (reads == null) build.dependencies[index] = reads = new PreviewRegion();
+        if (shellOnly) {
+            // The retained translucent lists may have sampled cells beyond the opaque geometry.
+            for (int i = index + 1; i <= last; i++) {
+                PreviewRegion old = build.dependencies[i];
+                if (!old.empty()) {
+                    reads.include(old.minX, old.minY, old.minZ);
+                    reads.include(old.maxX, old.maxY, old.maxZ);
+                }
+            }
+        } else reads.clear();
+        // Neighbor culling also reads the six immediate neighbors outside IBlockAccess.
+        for (int word = firstWord; word < endWord; word++) {
+            int y = s.y + (word >> 2), z = s.z + (word & 3) * 4;
+            if (s.solid[word] == 0) continue;
+            reads.include(s.x - 1, y - 1, z - 1);
+            reads.include(s.x + 16, y + 1, z + 4);
+        }
+        build.access.reads = reads;
+        build.collectingPart = shellOnly ? -1 : index;
+        for (WorldPreviewGlass.Collector faces : build.glassFaces) if (faces != null) faces.size = 0;
+        beginSectionList(build.head + index, s);
+        try {
+            build.shellParts &= ~(1L << index);
+            emitTexturedPart(s, build, firstWord, endWord, index);
+        } finally {
+            endSectionList();
+        }
+        if (shellOnly) return true;
+        // Translucent cells keep their original sort partitions even after opaque batches are merged.
+        for (int i = index; i <= last; i++) {
+            WorldPreviewGlass.Collector faces = build.glassFaces[i % TexturedBuild.GROUP_SIZE];
+            if (build.glass == null && faces != null && faces.size != 0)
+                build.glass = new WorldPreviewGlass.Mesh(s, s.owner.id);
+            if (build.glass != null && !build.glass.replace(i, i == 0 ? 0 : build.ends[i - 1],
+                    build.ends[i], s, build.access, faces)) return false;
+        }
+        return true;
     }
 
     private static void emitTexturedPart(Section s, TexturedBuild build, int firstWord, int endWord, int index) {
@@ -2438,7 +2731,8 @@ public final class BuilderRenderer extends BuilderProxy {
         }
     }
 
-    private static PreviewBlockAccess textureAccess(View view, Section section) {
+    static PreviewBlockAccess textureAccess(Section section) {
+        View view = section.owner;
         World world = Minecraft.getMinecraft().theWorld;
         Section[] halo = new Section[27];
         for (int dz = -1; dz <= 1; dz++) for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++)

@@ -26,6 +26,22 @@ public final class BuilderTasks extends WorldSavedData {
     final Map<String, Integer> viewers = new HashMap<>();
     private final Map<String, Integer> credits = new HashMap<>();
     private final Map<String, Integer> dispatchTurns = new HashMap<>();
+    private int terminalTurn;
+    private static final long BUILD_NANOS = 10_000_000L, DISMANTLE_NANOS = 3_000_000L;
+
+    private static final class TickBudget {
+        long nanos;
+        int tasks;
+
+        TickBudget(long nanos) {
+            this.nanos = nanos;
+        }
+
+        long nextShare() {
+            return nanos / tasks--;
+        }
+    }
+
     private final Map<Integer, Map<Long, Set<PlacementLedger>>> watched = new HashMap<>();
 
     void watch(int dim, long key, PlacementLedger ledger) {
@@ -47,7 +63,8 @@ public final class BuilderTasks extends WorldSavedData {
         Set<PlacementLedger> candidates = parts == null ? null : parts.get(PlacementLedger.key(x, y, z));
         if (candidates == null) return Collections.emptyList();
         List<PlacementLedger> owners = new ArrayList<>();
-        for (PlacementLedger ledger : candidates) if (ledger.matches(world, x, y, z)) owners.add(ledger);
+        for (PlacementLedger ledger : candidates)
+            if (ledger == ledger.task.ledger && ledger.matches(world, x, y, z)) owners.add(ledger);
         return owners;
     }
 
@@ -170,6 +187,7 @@ public final class BuilderTasks extends WorldSavedData {
         boolean current = selected(player, stack) == t;
         t.deleteRequested = true;
         t.dismantleRequested = false;
+        t.discardRemovalSite();
         if (t.state != BuildTask.State.REFUND) t.cancel(player, world);
         else if (world != null && player.worldObj == world) t.retryRefund(player, world);
         if (t.savedLink == null && !t.hasReserved()) remove(t, player);
@@ -196,6 +214,7 @@ public final class BuilderTasks extends WorldSavedData {
                     && t.state != BuildTask.State.REFUND && t.state != BuildTask.State.DISMANTLED) {
                 if (host != null && !t.existing && p.worldObj instanceof WorldServer)
                     t.attachExisting((WorldServer) p.worldObj);
+                if (host != null) t.requestSiteSurvey();
                 select(stack, t);
                 return;
             }
@@ -219,6 +238,7 @@ public final class BuilderTasks extends WorldSavedData {
             host.getMetaTileEntity().setItemNBT(itemTag);
             if (!itemTag.hasNoTags()) target.setTagCompound(itemTag);
             t.configureTarget(target);
+            t.requestSiteSurvey();
         }
         t.key = tag(stack).getString("network");
         t.unlimitedRange = TerminalCardRecipe.hasRange(stack);
@@ -246,6 +266,7 @@ public final class BuilderTasks extends WorldSavedData {
         viewers.remove(t.id);
         t.workChunks.release();
         t.ledger.discard();
+        t.discardRemovalSite();
         PreviewStream.stop(t, player);
         markDirty();
     }
@@ -384,13 +405,14 @@ public final class BuilderTasks extends WorldSavedData {
             boolean viewed =
                     turn - viewers.getOrDefault(t.id, turn - 2000) < 30
                             || t.previewLayers != 0;
-            if (!work && !viewed) {
+            if (!work && !viewed && !t.needsSiteSurvey()) {
                 if (t.plan != null && turn - viewers.getOrDefault(t.id, turn - 2000) > 600) t.discardCachedPlan();
                 continue;
             }
             if (t.state == BuildTask.State.DONE || t.state == BuildTask.State.REFUND) continue;
             try {
                 if (System.nanoTime() < deadline) t.prepare(player, deadline);
+                if (t.needsSiteSurvey()) t.inspectSite(world, Math.min(deadline, System.nanoTime() + 2_000_000L));
                 if (t.state == BuildTask.State.INSPECTING_UPGRADE) t.inspectUpgrade(player, world, deadline);
                 else if (t.state == BuildTask.State.SCANNING) t.scan(player, world, deadline);
                 else if (t.state == BuildTask.State.VERIFYING) t.verify(player, world, deadline);
@@ -400,35 +422,67 @@ public final class BuilderTasks extends WorldSavedData {
                 failure(t, e);
             }
         }
-        for (Map.Entry<String, List<BuildTask>> e : running.entrySet()) {
-            ItemStack item = tools.get(e.getKey());
-            int rate = BuilderItem.rate(item);
-            int credit = credits.getOrDefault(e.getKey(), 0) + rate;
-            int budget = credit / 20;
-            credits.put(e.getKey(), credit % 20);
-            if (budget == 0) continue;
-            List<BuildTask> r = e.getValue();
-            r.sort(Comparator.comparing(t -> t.id));
-            int first = Math.floorMod(dispatchTurns.getOrDefault(e.getKey(), 0), r.size());
-            Collections.rotate(r, -first);
-            dispatchTurns.put(e.getKey(), (first + 1) % r.size());
-            int remaining = r.size();
-            long buildDeadline = System.nanoTime() + 3_000_000L;
-            for (BuildTask t : r) {
-                int share = (budget + remaining - 1) / remaining--;
-                EntityPlayerMP actor = players.get(t.owner);
+        dispatch(running, tools, players);
+        PreviewStream.tick(active, players, tools);
+    }
+
+    private void dispatch(Map<String, List<BuildTask>> running, Map<String, ItemStack> tools,
+            Map<String, EntityPlayerMP> players) {
+        credits.keySet().retainAll(running.keySet());
+        dispatchTurns.keySet().retainAll(running.keySet());
+        if (running.isEmpty()) return;
+
+        TickBudget installation = new TickBudget(BUILD_NANOS);
+        Map<String, TickBudget> dismantling = new HashMap<>();
+        Map<String, Integer> blockBudgets = new HashMap<>();
+        for (Map.Entry<String, List<BuildTask>> entry : running.entrySet()) {
+            String tool = entry.getKey();
+            int rate = BuilderItem.rate(tools.get(tool));
+            int remainder = rate % 20 + credits.getOrDefault(tool, 0);
+            int blocks = rate / 20 + remainder / 20;
+            credits.put(tool, remainder % 20);
+            if (blocks == 0) continue;
+
+            blockBudgets.put(tool, blocks);
+            for (BuildTask task : entry.getValue()) {
+                if (task.state == BuildTask.State.DISMANTLING)
+                    dismantling.computeIfAbsent(task.owner, key -> new TickBudget(DISMANTLE_NANOS)).tasks++;
+                else installation.tasks++;
+            }
+        }
+        if (blockBudgets.isEmpty()) return;
+        List<String> terminals = new ArrayList<>(blockBudgets.keySet());
+        Collections.sort(terminals);
+        Collections.rotate(terminals, -Math.floorMod(terminalTurn++, terminals.size()));
+        for (String tool : terminals) {
+            List<BuildTask> tasks = running.get(tool);
+            tasks.sort(Comparator.comparing(t -> t.id));
+            int first = Math.floorMod(dispatchTurns.getOrDefault(tool, 0), tasks.size());
+            Collections.rotate(tasks, -first);
+            dispatchTurns.put(tool, (first + 1) % tasks.size());
+            int blocks = blockBudgets.get(tool), remaining = tasks.size();
+            for (BuildTask task : tasks) {
+                int share = (blocks + remaining - 1) / remaining--;
+                boolean remove = task.state == BuildTask.State.DISMANTLING;
+                TickBudget time = remove ? dismantling.get(task.owner) : installation;
+                long slice = time.nextShare();
+                if (share == 0 || slice <= 0) continue;
+                long start = System.nanoTime();
                 try {
-                    WorldServer w = DimensionManager.getWorld(t.dim);
-                    budget -= t.state == BuildTask.State.DISMANTLING
-                            ? t.dismantle(actor,w,item,share,buildDeadline) : t.build(actor,w,item,share,buildDeadline);
+                    EntityPlayerMP actor = players.get(task.owner);
+                    WorldServer world = DimensionManager.getWorld(task.dim);
+                    ItemStack item = tools.get(tool);
+                    long deadline = start + slice;
+                    blocks -= remove ? task.dismantle(actor, world, item, share, deadline)
+                            : task.build(actor, world, item, share, deadline);
                 } catch (RuntimeException ex) {
-                    failure(t, ex);
+                    failure(task, ex);
+                } finally {
+                    // Charge only this pool, including time spent in a placement that overran its deadline.
+                    time.nanos -= System.nanoTime() - start;
                 }
             }
         }
-        credits.keySet().retainAll(running.keySet());
-        dispatchTurns.keySet().retainAll(running.keySet());
-        PreviewStream.tick(active, players, tools);
     }
 
     private void failure(BuildTask t, RuntimeException e) {

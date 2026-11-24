@@ -1,6 +1,7 @@
 package com.Goderium.StructureBuilderNH.client;
 
 import com.Goderium.StructureBuilderNH.common.builder.PreviewPose;
+import com.Goderium.StructureBuilderNH.common.builder.PreviewDragMessage;
 import com.gtnewhorizon.structurelib.alignment.enumerable.ExtendedFacing;
 import com.gtnewhorizon.structurelib.alignment.enumerable.Flip;
 
@@ -27,6 +28,10 @@ final class PreviewGrip {
     final ChunkCoordinates origin, at;
     final ExtendedFacing original;
     private final PreviewPose.Allowed allowed;
+    private ChunkCoordinates meshOrigin;
+    private ExtendedFacing meshFacing;
+    long regrabPressedAt;
+    boolean regrabNear, regrabTapped;
     ExtendedFacing facing;
     boolean moving, released, limited, mirrored, inputReleased;
     volatile boolean rejected;
@@ -37,7 +42,7 @@ final class PreviewGrip {
     private boolean distanceAdjusted;
     private PreviewPose rotation;
     private ForgeDirection pitchAxis;
-    ForgeDirection downwardFace;
+    final int[] sourceFaces = new int[6];
     private final FloatBuffer matrix = BufferUtils.createFloatBuffer(16);
 
     PreviewGrip(
@@ -60,6 +65,8 @@ final class PreviewGrip {
         origin = new ChunkCoordinates(p);
         at = new ChunkCoordinates(p);
         this.original = original;
+        meshOrigin = origin;
+        meshFacing = original;
         this.allowed = allowed;
         this.minDistance = minDistance;
         this.maxDistance = maxDistance;
@@ -109,6 +116,15 @@ final class PreviewGrip {
         limited = false;
     }
 
+    private int surveyX, surveyY, surveyZ, surveyPose = -1;
+
+    void survey() {
+        int orientation = facing.getIndex();
+        if (at.posX == surveyX && at.posY == surveyY && at.posZ == surveyZ && orientation == surveyPose) return;
+        surveyX = at.posX; surveyY = at.posY; surveyZ = at.posZ; surveyPose = orientation;
+        PreviewDragMessage.send(PreviewDragMessage.SURVEY, id, sequence, revision, at, facing);
+    }
+
     int displayDistance() {
         return (int) Math.round(depth);
     }
@@ -129,16 +145,27 @@ final class PreviewGrip {
         }
     }
 
+    void reuseMesh(PreviewGrip previous) {
+        meshOrigin = previous.meshOrigin;
+        meshFacing = previous.meshFacing;
+        orient(facing);
+    }
+
     void orient(ExtendedFacing next) {
         facing = next;
-        rotation = new PreviewPose(original, next);
-        for (ForgeDirection face : ForgeDirection.VALID_DIRECTIONS) {
-            if (rotation.yx * face.offsetX + rotation.yy * face.offsetY + rotation.yz * face.offsetZ == -1) {
-                downwardFace = face;
-                break;
+        rotation = new PreviewPose(meshFacing, next);
+        for (ForgeDirection source : ForgeDirection.VALID_DIRECTIONS) {
+            int x = rotation.xx * source.offsetX + rotation.xy * source.offsetY + rotation.xz * source.offsetZ;
+            int y = rotation.yx * source.offsetX + rotation.yy * source.offsetY + rotation.yz * source.offsetZ;
+            int z = rotation.zx * source.offsetX + rotation.zy * source.offsetY + rotation.zz * source.offsetZ;
+            for (ForgeDirection world : ForgeDirection.VALID_DIRECTIONS) {
+                if (world.offsetX == x && world.offsetY == y && world.offsetZ == z) {
+                    sourceFaces[world.ordinal()] = source.ordinal();
+                    break;
+                }
             }
         }
-        mirrored = reversesWinding(original.getFlip()) != reversesWinding(next.getFlip());
+        mirrored = reversesWinding(meshFacing.getFlip()) != reversesWinding(next.getFlip());
         matrix.clear();
         matrix.put(
                         new float[] {
@@ -171,16 +198,23 @@ final class PreviewGrip {
     }
 
     void worldCell(int x, int y, int z, int[] out) {
-        int dx = x - origin.posX, dy = y - origin.posY, dz = z - origin.posZ;
+        int dx = x - meshOrigin.posX, dy = y - meshOrigin.posY, dz = z - meshOrigin.posZ;
         out[0] = at.posX + rotation.xx * dx + rotation.xy * dy + rotation.xz * dz;
         out[1] = at.posY + rotation.yx * dx + rotation.yy * dy + rotation.yz * dz;
         out[2] = at.posZ + rotation.zx * dx + rotation.zy * dy + rotation.zz * dz;
     }
 
+    void sourceCell(int x, int y, int z, int[] out) {
+        int dx = x - at.posX, dy = y - at.posY, dz = z - at.posZ;
+        out[0] = meshOrigin.posX + rotation.xx * dx + rotation.yx * dy + rotation.zx * dz;
+        out[1] = meshOrigin.posY + rotation.xy * dx + rotation.yy * dy + rotation.zy * dz;
+        out[2] = meshOrigin.posZ + rotation.xz * dx + rotation.yz * dy + rotation.zz * dz;
+    }
+
     void transform() {
         GL11.glTranslated(at.posX + .5, at.posY + .5, at.posZ + .5);
         GL11.glMultMatrix(matrix);
-        GL11.glTranslated(-origin.posX - .5, -origin.posY - .5, -origin.posZ - .5);
+        GL11.glTranslated(-meshOrigin.posX - .5, -meshOrigin.posY - .5, -meshOrigin.posZ - .5);
     }
 
     private double x(double a, double b, double c) {
@@ -196,12 +230,12 @@ final class PreviewGrip {
     }
 
     boolean visible(Frustrum camera, AxisAlignedBB box) {
-        double a = box.minX - origin.posX - .5,
-                b = box.minY - origin.posY - .5,
-                c = box.minZ - origin.posZ - .5;
-        double u = box.maxX - origin.posX - .5,
-                v = box.maxY - origin.posY - .5,
-                w = box.maxZ - origin.posZ - .5;
+        double a = box.minX - meshOrigin.posX - .5,
+                b = box.minY - meshOrigin.posY - .5,
+                c = box.minZ - meshOrigin.posZ - .5;
+        double u = box.maxX - meshOrigin.posX - .5,
+                v = box.maxY - meshOrigin.posY - .5,
+                w = box.maxZ - meshOrigin.posZ - .5;
         double x1 = x(a, b, c),
                 x2 = x(u, v, w),
                 y1 = y(a, b, c),
@@ -218,7 +252,7 @@ final class PreviewGrip {
     }
 
     double distance(double px, double py, double pz, double eyeX, double eyeY, double eyeZ) {
-        double a = px - origin.posX - .5, b = py - origin.posY - .5, c = pz - origin.posZ - .5;
+        double a = px - meshOrigin.posX - .5, b = py - meshOrigin.posY - .5, c = pz - meshOrigin.posZ - .5;
         double dx = x(a, b, c) - eyeX, dy = y(a, b, c) - eyeY, dz = z(a, b, c) - eyeZ;
         return dx * dx + dy * dy + dz * dz;
     }

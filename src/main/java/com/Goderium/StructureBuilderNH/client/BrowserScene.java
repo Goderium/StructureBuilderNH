@@ -91,7 +91,7 @@ final class BrowserScene {
     }
 
     /** At most limit cheap dictionary/cell operations and never past the supplied frame deadline. */
-    void advance(long deadline, int limit) {
+    void advance(long deadline, int limit, boolean needsPlane) {
         int work = 0;
         while (work < limit && System.nanoTime() < deadline) {
             Section old = removing.peekFirst();
@@ -122,7 +122,7 @@ final class BrowserScene {
                 applyingIndex = 0;
             }
             if (applying != null) {
-                if (applyOne()) applying = null;
+                if (applyOne(needsPlane)) applying = null;
                 work++;
                 continue;
             }
@@ -160,6 +160,7 @@ final class BrowserScene {
                 }
                 continue;
             }
+            if (!needsPlane) break;
             List<Section> candidates = planeSections();
             if (planeScheduleCursor < candidates.size()) {
                 Section next = candidates.get(planeScheduleCursor++);
@@ -189,7 +190,7 @@ final class BrowserScene {
         }
     }
 
-    private boolean applyOne() {
+    private boolean applyOne(boolean needsPlane) {
         BrowserPacket p = applying;
         switch (p.type) {
             case BrowserPacket.MATERIALS:
@@ -230,7 +231,8 @@ final class BrowserScene {
                     replacements.addLast(new Replacement(previous, section));
                 }
                 indexing.addLast(section);
-                if (intersects(section, axis, layer)) queuePlane(section);
+                if (intersects(section, axis, layer) && (needsPlane || section.planeIndices[axis] < planeScheduleCursor))
+                    queuePlane(section);
                 return true;
             case BrowserPacket.CHANNELS:
                 channelNames = p.channelNames == null ? new String[0] : p.channelNames;

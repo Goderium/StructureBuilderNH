@@ -44,19 +44,27 @@ final class PreviewFluid {
         return self == other || type != null && StructureFluids.fluid(other) == type;
     }
 
+    double height(BlockPreviewTextures.Appearance a, IBlockAccess access, int x, int y, int z) {
+        double height = a.block instanceof BlockLiquid ? 1 - BlockLiquid.getLiquidHeightPercent(a.meta) : .875;
+        if (access != null) {
+            try {
+                if (matches(a.block, access.getBlock(x, y + (rises ? -1 : 1), z))) return 1;
+                if (a.block instanceof BlockFluidBase) {
+                    float quanta = ((BlockFluidBase) a.block).getQuantaPercentage(access, x, y, z);
+                    if (quanta > 0 && quanta <= 1) return quanta * .875;
+                }
+            } catch (RuntimeException | LinkageError unsupported) { /* Use the static height. */ }
+        }
+        return height;
+    }
+
     void face(RenderBlocks renderer, Tessellator t, BlockPreviewTextures.Appearance a, int side, int slot, int alpha,
-            IBlockAccess access, int x, int y, int z) {
+            IBlockAccess access, int x, int y, int z, double height) {
         int nativeSide = BlockPreviewTextures.nativeSide(side);
         BlockPreviewTextures.Layer layer = a.faces[nativeSide][0];
-        double height = a.block instanceof BlockLiquid ? 1 - BlockLiquid.getLiquidHeightPercent(a.meta) : .875;
         int color = layer.color;
         if (access != null) {
             try {
-                if (matches(a.block, access.getBlock(x, y + (rises ? -1 : 1), z))) height = 1;
-                else if (a.block instanceof BlockFluidBase) {
-                    float quanta = ((BlockFluidBase) a.block).getQuantaPercentage(access, x, y, z);
-                    if (quanta > 0 && quanta <= 1) height = quanta * .875;
-                }
                 int worldColor = a.block.colorMultiplier(access, x, y, z);
                 if ((worldColor & 0xffffff) != 0xffffff) color = worldColor;
             } catch (RuntimeException | LinkageError unsupported) { /* Use the static fluid on a passive block access. */ }

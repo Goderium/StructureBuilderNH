@@ -23,6 +23,7 @@ import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Deque;
 import java.util.Iterator;
@@ -37,7 +38,7 @@ import java.util.UUID;
 public final class BrowserRenderer implements AutoCloseable {
     private static final int BATCH = 256, BATCHES = 4096 / BATCH;
     private static final int PROXY_SECTIONS = 8;
-    private static final int MAX_GEOMETRIES = 768, MAX_LISTS = 8192, PICK_STEPS = 8192;
+    private static final int PROXY_THRESHOLD = 384, PICK_STEPS = 8192;
     private static final int CONSTANT_ALPHA = 0x8003, ONE_MINUS_CONSTANT_ALPHA = 0x8004;
     private static final long FRAME_WINDOW = 16_000_000L, FRAME_BUDGET = 12_000_000L;
     private static final Deque<State> RETIRED = new ArrayDeque<>();
@@ -273,12 +274,15 @@ public final class BrowserRenderer implements AutoCloseable {
         layer = Math.max(state.scene.min(axis), Math.min(state.scene.max(axis), layer));
         boolean newAxis = axis != state.scene.axis;
         boolean changed = axis != state.scene.axis || layer != state.scene.layer;
+        if (!sliced || changed) {
+            state.retirePlane();
+            if (focusKey != null) { state.retireFocus(); focusGeneration++; state.focusCursor = 0; }
+        }
         sliced = true;
         if (changed) {
             state.scene.setSlice(axis, layer);
             state.planeCursor = 0;
             state.planeGeneration++;
-            if (focusKey != null) { focusGeneration++; state.focusCursor = 0; }
             if (newAxis) resetMapCamera();
         }
         mapCamera.x = axis == 0 ? layer + .5 : mapCamera.x;
@@ -287,8 +291,13 @@ public final class BrowserRenderer implements AutoCloseable {
     }
 
     public void clearSlice() {
-        if (sliced && focusKey != null) { focusGeneration++; if (state != null) state.focusCursor = 0; }
+        if (sliced && state != null) {
+            state.retirePlane();
+            state.planeCursor = 0;
+            if (focusKey != null) { state.retireFocus(); focusGeneration++; state.focusCursor = 0; }
+        }
         sliced = false;
+        mapViewport.width = 0;
     }
     public void rotate(double dx, double dy) { cameraTouched = true; camera.rotate(dx, dy); }
     public void zoom(double steps) { cameraTouched = true; camera.zoom(steps); prioritizeCenter(); }
@@ -322,7 +331,6 @@ public final class BrowserRenderer implements AutoCloseable {
         int x = (pick.x + state.scene.originX) >> 4, y = (pick.y + state.scene.originY) >> 4;
         int z = (pick.z + state.scene.originZ) >> 4;
         state.priority = state.scene.sections.get(new ChunkPosition(x, y, z));
-        state.focal = state.priority;
         state.priorityNeighbors.clear();
         for (int dz = -1; dz <= 1; dz++) for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
             if (dx == 0 && dy == 0 && dz == 0) continue;
@@ -338,13 +346,14 @@ public final class BrowserRenderer implements AutoCloseable {
         if (Objects.equals(focusKey, next)) return;
         focusKey = next;
         focusGeneration++;
-        if (state != null) state.focusCursor = 0;
+        if (state != null) { state.retireFocus(); state.focusCursor = 0; }
     }
 
     public void clearFocus() {
         if (focusKey != null) {
             focusKey = null;
             focusGeneration++;
+            if (state != null) state.retireFocus();
         }
     }
 
@@ -439,14 +448,16 @@ public final class BrowserRenderer implements AutoCloseable {
         long deadline = now + FRAME_BUDGET;
         drainRetired(Math.min(deadline, now + 300000L));
         if (state == null) return;
-        state.scene.advance(Math.min(deadline, System.nanoTime() + 4_400_000L), 65536);
+        boolean needsPlane = sliced || mapViewport.width > 0;
+        state.discardOldViews(Math.min(deadline, System.nanoTime() + 300000L));
+        state.scene.advance(Math.min(deadline, System.nanoTime() + 4_400_000L), 65536, needsPlane);
         for (int n = 0; n < 16 && System.nanoTime() < deadline; n++) {
             BrowserScene.Replacement replacement = state.scene.replacements.pollFirst();
             if (replacement == null) break;
             state.replace(replacement);
         }
         while (System.nanoTime() < deadline) {
-            Geometry geometry = nextGeometry();
+            Geometry geometry = nextGeometry(needsPlane);
             if (geometry == null) break;
             geometry.compileBatch();
             if (geometry.finished()) {
@@ -467,7 +478,7 @@ public final class BrowserRenderer implements AutoCloseable {
         }
     }
 
-    private Geometry nextGeometry() {
+    private Geometry nextGeometry(boolean needsPlane) {
         if (state.current != null && state.current.valid()) return state.current;
         state.current = null;
         BrowserScene scene = state.scene;
@@ -499,7 +510,7 @@ public final class BrowserRenderer implements AutoCloseable {
             Geometry geometry = state.get(priority, sliced ? 1 : 0, true);
             if (!geometry.complete) return state.current = geometry;
         }
-        if (sliced || mapViewport.width > 0) {
+        if (needsPlane) {
             List<BrowserScene.Section> plane = scene.planeSections();
             int visited = 0;
             while (state.planeCursor < plane.size() && visited++ < 64) {
@@ -599,8 +610,8 @@ public final class BrowserRenderer implements AutoCloseable {
             boolean changed = revision != owner.renderRevision || token != nextToken;
             if (changed) {
                 coarse.clear(); opaque.clear(); markers.clear(); roles.clear(); transparent.clear();
-                if (mode == 0 && owner.scene.sections.size() > MAX_GEOMETRIES / 2)
-                    for (Proxy proxy : owner.proxies) if (!proxy.dirty && proxy.list != 0) coarse.add(proxy.list);
+                if (mode == 0 && owner.scene.sections.size() > PROXY_THRESHOLD)
+                    for (Proxy proxy : owner.proxies) if (!proxy.dirty && proxy.faces > 0) coarse.add(proxy.list);
                 for (Geometry geometry : owner.geometry.values()) {
                     if (geometry.mode != mode || !geometry.validForDraw()) continue;
                     Geometry drawn = geometry.drawable();
@@ -672,17 +683,18 @@ public final class BrowserRenderer implements AutoCloseable {
             if (!b.contains(x, y, z)) break;
             BrowserScene.Section section = scene.sections.get(new ChunkPosition((x + scene.originX) >> 4,
                     (y + scene.originY) >> 4, (z + scene.originZ) >> 4));
-            BrowserScene.Material material = section == null ? null : scene.at(x, y, z);
+            BrowserScene.Material material = section == null ? null : scene.material(section,
+                    ((x + scene.originX) & 15) | (((z + scene.originZ) & 15) << 4) | (((y + scene.originY) & 15) << 8));
             if (material != null && (!material.data.air || material.data.group >= 0)
                     && (focusKey == null || focusKey.equals(material.key))) return makePick(x, y, z, material);
             double next = Double.POSITIVE_INFINITY;
-            int[] cell = { x, y, z };
             for (int a = 0; a < 3; a++) {
                 double direction = ray[a + 3];
                 if (Math.abs(direction) < 1e-12) continue;
-                int nativeCell = cell[a] + scene.origin(a);
+                int cell = a == 0 ? x : a == 1 ? y : z;
+                int nativeCell = cell + scene.origin(a);
                 double edge = section == null ? (direction > 0 ? (nativeCell >> 4) * 16 + 16
-                        : (nativeCell >> 4) * 16) - scene.origin(a) : cell[a] + (direction > 0 ? 1 : 0);
+                        : (nativeCell >> 4) * 16) - scene.origin(a) : cell + (direction > 0 ? 1 : 0);
                 next = Math.min(next, (edge - ray[a]) / direction);
             }
             if (!Double.isFinite(next)) break;
@@ -788,8 +800,10 @@ public final class BrowserRenderer implements AutoCloseable {
             state.scene = null;
             state.current = null;
             state.priority = null;
-            state.focal = null;
             state.whole.clear();
+            state.planeMeshes.clear();
+            state.focusMeshes.clear();
+            state.oldViews.clear();
             state.priorityNeighbors.clear();
             state.dirtyProxies.clear();
             for (Geometry geometry : state.geometry.values()) geometry.access = null;
@@ -831,13 +845,16 @@ public final class BrowserRenderer implements AutoCloseable {
         final List<Geometry> transparent = new ArrayList<>();
         final Submission[] submissions = { new Submission(0), new Submission(1), new Submission(2) };
         final Deque<BrowserScene.Section> whole = new ArrayDeque<>();
+        Deque<MeshKey> planeMeshes = new ArrayDeque<>(), focusMeshes = new ArrayDeque<>();
+        final Deque<Deque<MeshKey>> oldViews = new ArrayDeque<>();
         final int[] batchFaces = new int[BATCH * 6];
+        final int[] batchSlots = new int[BATCH], batchAir = new int[BATCH];
+        final BrowserScene.Material[] batchMaterials = new BrowserScene.Material[BATCH];
         final Deque<BrowserScene.Section> priorityNeighbors = new ArrayDeque<>();
         final List<Proxy> proxies = new ArrayList<>();
         final Deque<Proxy> dirtyProxies = new ArrayDeque<>();
         Geometry current;
         BrowserScene.Section priority;
-        BrowserScene.Section focal;
         String[] hints;
         int planeCursor, focusCursor, planeGeneration, lists;
         long renderRevision = 1;
@@ -858,21 +875,44 @@ public final class BrowserRenderer implements AutoCloseable {
                 result = next;
             }
             if (result == null && create) {
-                while (geometry.size() >= MAX_GEOMETRIES || lists >= MAX_LISTS - 128) evict();
                 result = new Geometry(this, section, mode, generation);
-                geometry.put(key, result);
+                addMesh(key, result);
             }
             return result;
         }
 
-        void evict() {
-            Iterator<Geometry> iterator = geometry.values().iterator();
-            while (iterator.hasNext()) {
-                Geometry geometry = iterator.next();
-                if (geometry.mode == 0 && geometry.section == focal && this.geometry.size() > 1) continue;
-                geometry.delete();
-                iterator.remove();
-                return;
+        void addMesh(MeshKey key, Geometry mesh) {
+            geometry.put(key, mesh);
+            if (key.mode == 1) planeMeshes.addLast(key);
+            else if (key.mode == 2) focusMeshes.addLast(key);
+        }
+
+        // The entire model stays resident. Only transient slice and focus meshes expire on view changes.
+        void retirePlane() {
+            if (planeMeshes.isEmpty()) return;
+            oldViews.addLast(planeMeshes);
+            planeMeshes = new ArrayDeque<>();
+        }
+
+        void retireFocus() {
+            if (focusMeshes.isEmpty()) return;
+            oldViews.addLast(focusMeshes);
+            focusMeshes = new ArrayDeque<>();
+        }
+
+        void discardOldViews(long deadline) {
+            while (!oldViews.isEmpty() && System.nanoTime() < deadline) {
+                Deque<MeshKey> keys = oldViews.peekFirst();
+                MeshKey key = keys.removeFirst();
+                if (keys.isEmpty()) oldViews.removeFirst();
+                // A quick return to the same slice can reuse a mesh awaiting disposal.
+                if (sliced && key.mode == 1 && key.generation == planeToken()
+                        && scene.sections.get(key.section.key) == key.section) {
+                    planeMeshes.addLast(key);
+                } else {
+                    Geometry mesh = geometry.remove(key);
+                    if (mesh != null) mesh.delete();
+                }
             }
         }
 
@@ -882,7 +922,7 @@ public final class BrowserRenderer implements AutoCloseable {
             for (int mode = 0; mode < 3; mode++) {
                 int generation = mode == 0 ? 0 : mode == 1 ? planeToken() : focusGeneration;
                 Geometry geometry = this.geometry.get(new MeshKey(section, mode, generation));
-                if (geometry != null) {
+                if (geometry != null && !geometry.stale) {
                     geometry.stale = true;
                     if (mode == 0) whole.addLast(section);
                     else if (mode == 1) planeCursor = Math.min(planeCursor, section.planeIndices[scene.axis]);
@@ -894,7 +934,6 @@ public final class BrowserRenderer implements AutoCloseable {
         void replace(BrowserScene.Replacement replacement) {
             renderRevision++;
             if (priority == replacement.oldSection) priority = replacement.newSection;
-            if (focal == replacement.oldSection) focal = replacement.newSection;
             for (int mode = 0; mode < 3; mode++) {
                 int generation = mode == 0 ? 0 : mode == 1 ? planeToken() : focusGeneration;
                 Geometry old = geometry.remove(new MeshKey(replacement.oldSection, mode, generation));
@@ -903,11 +942,14 @@ public final class BrowserRenderer implements AutoCloseable {
                 next.previous = old.drawable();
                 if (next.previous != old) old.deleteOwn();
                 if (mode == 0) replacement.newSection.detailed = next.previous != null;
-                geometry.put(new MeshKey(replacement.newSection, mode, generation), next);
+                addMesh(new MeshKey(replacement.newSection, mode, generation), next);
             }
-            planeCursor = Math.min(planeCursor, replacement.newSection.planeIndices[scene.axis]);
-            focusCursor = Math.min(focusCursor, sliced ? replacement.newSection.planeIndices[scene.axis]
-                    : replacement.newSection.orderIndex);
+            BrowserScene.Section section = replacement.newSection;
+            if (scene.intersects(section, scene.axis, scene.layer)) {
+                planeCursor = Math.min(planeCursor, section.planeIndices[scene.axis]);
+                if (sliced) focusCursor = Math.min(focusCursor, section.planeIndices[scene.axis]);
+            }
+            if (!sliced) focusCursor = Math.min(focusCursor, section.orderIndex);
         }
 
         int planeToken() { return scene.layer * 3 + scene.axis; }
@@ -919,7 +961,7 @@ public final class BrowserRenderer implements AutoCloseable {
         }
     }
 
-    /** Four-block occupancy preserves sparse/concave structure outside the detailed mesh budget. */
+    /** Four-block occupancy shows sparse structures while their full meshes are being built. */
     private static final class Proxy {
         final State owner;
         final int index;
@@ -1002,7 +1044,7 @@ public final class BrowserRenderer implements AutoCloseable {
         final int[] markers = new int[BATCHES];
         BrowserBlockAccess access;
         Geometry previous;
-        int batch;
+        int batch, cursor;
         boolean complete, deleted, stale;
         double distance;
 
@@ -1031,77 +1073,84 @@ public final class BrowserRenderer implements AutoCloseable {
 
         void compileBatch() {
             compiledBatches++;
-            compiledCells += BATCH;
             if (access == null) access = new BrowserBlockAccess(owner.scene, section);
             int[] faces = owner.batchFaces;
             int count = 0;
             int solidRuns = 0, blendedRuns = 0;
             boolean hatches = false;
-            boolean airChoices = false;
-            int begin = batch * BATCH, end = begin + BATCH;
-            for (int index = begin; index < end; index++) {
-                int slot = visitedSlot(index);
+            int airChoices = 0;
+            int cut = 0;
+            if (planeOnly()) {
+                int axis = owner.scene.axis;
+                cut = owner.scene.intersects(section, axis, owner.scene.layer) ? 3 << (axis * 2) : 63;
+            }
+            int begin = cursor, end = planeOnly() ? BATCH : 4096;
+            int cells = 0;
+            // Pack sparse rows into one list without increasing the per-batch material lookup budget.
+            while (cursor < end && cells < BATCH) {
+                int slot = visitedSlot(cursor++);
+                if (section.slots[slot] == 0) continue;
+                int cell = cells++;
                 BrowserScene.Material material = owner.scene.material(section, slot);
-                if (material == null) continue;
+                if (material == null || !inFocus(material)) continue;
                 if (material.data.air) {
-                    airChoices |= material.data.group >= 0;
+                    if (cut != 63 && material.data.group >= 0) {
+                        owner.batchSlots[cell] = slot;
+                        owner.batchMaterials[cell] = material;
+                        owner.batchAir[airChoices++] = cell;
+                    }
                     continue;
                 }
-                if (!inFocus(material)) continue;
                 int x = section.x + (slot & 15), y = section.y + (slot >> 8), z = section.z + (slot >> 4 & 15);
                 BlockPreviewTextures.Appearance current = appearance(material);
                 int firstFace = count;
                 if (current.fence) {
-                    faces[count++] = slot * 8 + ProjectedBlockFaces.MODEL;
+                    faces[count++] = cell * 8 + ProjectedBlockFaces.MODEL;
                 } else for (int side = 0; side < 6; side++) {
-                    BrowserScene.Material neighbor = access.material(x + DX[side], y + DY[side], z + DZ[side]);
-                    boolean adjacent = neighbor != null && !neighbor.data.air && inFocus(neighbor);
-                    if (mode == 1 || mode == 2 && sliced) {
-                        int coordinate = owner.scene.axis == 0 ? x + DX[side] : owner.scene.axis == 1 ? y + DY[side] : z + DZ[side];
-                        adjacent &= coordinate == owner.scene.layer + owner.scene.origin(owner.scene.axis);
-                    }
-                    if (adjacent) {
+                    int nx = x + DX[side], ny = y + DY[side], nz = z + DZ[side];
+                    BrowserScene.Material neighbor = (cut & (1 << side)) == 0 ? access.material(nx, ny, nz) : null;
+                    if (neighbor != null && !neighbor.data.air && inFocus(neighbor)) {
                         BlockPreviewTextures.Appearance next = appearance(neighbor);
                         if (next.browserSolidSurface) continue;
                         if (current.fluid != null || next.fluid != null) {
                             if (BlockPreviewTextures.occludes(next, current)) continue;
                         } else if (current.textured() && current.block != null && !current.frame) {
                             try {
-                                if (!current.block.shouldSideBeRendered(access, x + DX[side], y + DY[side],
-                                        z + DZ[side], BlockPreviewTextures.nativeSide(side))) continue;
+                                if (!current.block.shouldSideBeRendered(access, nx, ny, nz,
+                                        BlockPreviewTextures.nativeSide(side))) continue;
                             } catch (RuntimeException | LinkageError unsupported) { /* Conservative visible face. */ }
                         } else if (BlockPreviewTextures.occludes(next, current)) continue;
                     }
-                    faces[count++] = slot * 8 + side;
+                    faces[count++] = cell * 8 + side;
                 }
                 if (firstFace == count) continue;
+                owner.batchSlots[cell] = slot;
+                owner.batchMaterials[cell] = material;
                 int run = 1 << textureRun(0, current);
                 if (current.translucent && !current.browserSolidSurface) blendedRuns |= run;
                 else solidRuns |= run;
                 hatches |= material.data.hatch;
             }
-            if (count != 0) {
-                if (solidRuns != 0) opaque[batch] = compile(faces, count, 0, solidRuns);
-                if (blendedRuns != 0) glass[batch] = compile(faces, count, 1, blendedRuns);
-                if (hatches) roles[batch] = compile(faces, count, 2, 1);
+            if (count != 0 || airChoices != 0) {
+                try {
+                    if (solidRuns != 0) opaque[batch] = compile(faces, count, 0, solidRuns);
+                    if (blendedRuns != 0) glass[batch] = compile(faces, count, 1, blendedRuns);
+                    if (hatches) roles[batch] = compile(faces, count, 2, 1);
+                    if (airChoices != 0) markers[batch] = compileMarkers(airChoices, markers[batch], cut);
+                } finally {
+                    Arrays.fill(owner.batchMaterials, null);
+                }
             }
-            if (airChoices) markers[batch] = compileMarkers(begin, end, markers[batch]);
+            compiledCells += cursor - begin;
             batch++;
             if (finished()) access = null;
         }
 
         boolean planeOnly() { return mode == 1 || mode == 2 && sliced; }
-        boolean finished() { return batch >= (planeOnly() ? 1 : BATCHES); }
+        boolean finished() { return cursor >= (planeOnly() ? BATCH : 4096); }
         int visitedSlot(int index) {
             return planeOnly() ? BrowserScene.planeSlot(owner.scene.axis,
                     (owner.scene.layer + owner.scene.origin(owner.scene.axis)) & 15, index) : index;
-        }
-
-        private boolean inSlice(int slot) {
-            if (mode != 1 && !(mode == 2 && sliced)) return true;
-            int axis = owner.scene.axis;
-            return section.coordinate(axis) + (axis == 0 ? slot & 15 : axis == 1 ? slot >> 8 : slot >> 4 & 15)
-                    == owner.scene.layer + owner.scene.origin(axis);
         }
 
         private boolean inFocus(BrowserScene.Material material) {
@@ -1144,8 +1193,9 @@ public final class BrowserRenderer implements AutoCloseable {
                     tessellator.startDrawingQuads();
                     tessellator.setBrightness(0xf000f0);
                     for (int i = 0; i < count; i++) {
-                        int slot = faces[i] >> 3, side = faces[i] & 7;
-                        BrowserScene.Material material = owner.scene.material(section, slot);
+                        int cell = faces[i] >> 3, side = faces[i] & 7;
+                        int slot = owner.batchSlots[cell];
+                        BrowserScene.Material material = owner.batchMaterials[cell];
                         BlockPreviewTextures.Appearance appearance = appearance(material);
                         if (textureRun(pass, appearance) != texture) continue;
                         boolean blended = appearance.translucent && !appearance.browserSolidSurface;
@@ -1183,19 +1233,20 @@ public final class BrowserRenderer implements AutoCloseable {
             return appearance.browserSolidSurface ? 2 : 1;
         }
 
-        private int compileMarkers(int begin, int end, int previous) {
+        private int compileMarkers(int count, int previous, int cut) {
             int list = previous;
             boolean open = false;
-            for (int index = begin; index < end; index++) {
-                int slot = visitedSlot(index);
-                BrowserScene.Material material = owner.scene.material(section, slot);
-                if (material == null || !material.data.air || material.data.group < 0 || !inSlice(slot)
-                        || !inFocus(material)) continue;
+            for (int i = 0; i < count; i++) {
+                int cell = owner.batchAir[i];
+                int slot = owner.batchSlots[cell];
+                BrowserScene.Material material = owner.batchMaterials[cell];
                 int x = slot & 15, y = slot >> 8, z = slot >> 4 & 15;
+                int neighbors = 0;
+                for (int side = 0; side < 6; side++)
+                    if ((cut & (1 << side)) == 0 && sameAir(material, x + DX[side], y + DY[side], z + DZ[side]))
+                        neighbors |= 1 << side;
                 for (int a = 0; a < 2; a++) for (int b = 0; b < 2; b++) for (int c = 0; c < 2; c++) {
-                    if (sameAir(material, x + (a == 0 ? -1 : 1), y, z)
-                            || sameAir(material, x, y + (b == 0 ? -1 : 1), z)
-                            || sameAir(material, x, y, z + (c == 0 ? -1 : 1))) continue;
+                    if ((neighbors & ((1 << a) | (1 << (2 + b)) | (1 << (4 + c)))) != 0) continue;
                     if (!open) {
                         if (list == 0) { list = GL11.glGenLists(1); if (list != 0) owner.lists++; }
                         if (list == 0) return 0;
@@ -1221,11 +1272,6 @@ public final class BrowserRenderer implements AutoCloseable {
         }
 
         private boolean sameAir(BrowserScene.Material material, int x, int y, int z) {
-            if (planeOnly()) {
-                int axis = owner.scene.axis;
-                int coordinate = axis == 0 ? section.x + x : axis == 1 ? section.y + y : section.z + z;
-                if (coordinate != owner.scene.layer + owner.scene.origin(axis)) return false;
-            }
             BrowserScene.Material other = access.material(section.x + x, section.y + y, section.z + z);
             return other != null && other.data.air && other.data.group == material.data.group;
         }

@@ -1,5 +1,6 @@
 plugins {
     id 'java'
+    id 'com.github.ElytraServers.elytra-conventions' version 'v1.1.2'
     id 'com.gtnewhorizons.retrofuturagradle' version '2.0.2'
 }
 group = providers.gradleProperty('modGroup').get()

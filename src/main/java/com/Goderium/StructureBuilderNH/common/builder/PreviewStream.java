@@ -40,7 +40,8 @@ import java.nio.charset.StandardCharsets;
 public final class PreviewStream {
     public static final int BOX = 1, SHELL = 2, HATCH = 4;
     public static final int FOOTING_ROWS = 10;
-    public static final int BLOCK_NAME = 11;
+    public static final int BLOCK_NAME = 11, CONFLICT = 12;
+    private PreviewConflict conflictSurvey;
     /** A committed drop. The revision and epoch identify its upcoming replacement projection. */
     public static final int MOVE_ACCEPTED = 8;
     /** All initial geometry for this drop's revision and current epoch has been sent. */
@@ -62,7 +63,7 @@ public final class PreviewStream {
     private int revision = -1, epoch;
     private Long moveSequence;
     private int moveRevision;
-    private boolean lastEditable, lastTextured, lastLocateHatches;
+    private boolean lastEditable, lastTextured, lastLocateHatches, lastConstruction;
     private final Map<MaterialChoice, Integer> roles = new IdentityHashMap<>();
     private final Deque<Packet> outbound = new ArrayDeque<>();
     private int transfer, inFlight = -1;
@@ -257,7 +258,9 @@ public final class PreviewStream {
                 view = null;
             }
             boolean waitingForMovePlan = view != null && view.viewer == p && view.moveSequence != null;
-            if ((task.previewLayers == 0 || task.plan == null && !waitingForMovePlan) && issue == null
+            // Hide a box without discarding its streamed face rows. Removing the task still stops the view.
+            boolean hidden = task.previewLayers == 0 && (view == null || view.footingScan == null);
+            if ((hidden || task.plan == null && !waitingForMovePlan) && issue == null
                     || p == null
                     || p.isDead
                     || p.dimension != task.dim
@@ -273,8 +276,10 @@ public final class PreviewStream {
             if (waitingForMovePlan && task.plan == null) continue;
             boolean held = PreviewDragMessage.holding(p, task);
             if (!held) view.markers(task, issue);
-            if (task.plan != null)
+            if (task.plan != null) {
                 view.send(task, budgets.computeIfAbsent(task.owner, k -> new Budget()), held);
+                view.checkConflict(tasks, held);
+            }
         }
         nameRequests.forEach((player, request) -> {
             if (!nameRequests.remove(player, request)) return;
@@ -286,10 +291,33 @@ public final class PreviewStream {
         });
     }
 
+    private void checkConflict(List<BuildTask> tasks, boolean held) {
+        ItemStack hand = viewer.getHeldItem();
+        PreviewDragMessage proposal = PreviewDragMessage.survey(viewer, task);
+        boolean selected = hand != null && hand.getItem() == BuilderItem.ITEM && hand.hasTagCompound()
+                && task.tool.equals(hand.getTagCompound().getString("tool"))
+                && task.id.equals(hand.getTagCompound().getString("selected"));
+        if (task.previewLayers == 0 || !task.plan.ready || revision != task.revision
+                || !(held ? proposal != null : selected)) {
+            if (conflictSurvey != null && conflictSurvey.reported) NET.sendTo(packet(CONFLICT), viewer);
+            conflictSurvey = null;
+            return;
+        }
+        if (conflictSurvey == null) conflictSurvey = new PreviewConflict();
+        if (conflictSurvey.update(task, viewer.worldObj, proposal, tasks, views.keySet())) {
+            Packet p = packet(CONFLICT);
+            p.sequence = conflictSurvey.sequence;
+            p.x = conflictSurvey.x; p.y = conflictSurvey.y; p.z = conflictSurvey.z;
+            p.pose = conflictSurvey.pose.getIndex();
+            p.conflict = conflictSurvey.reported;
+            NET.sendTo(p, viewer);
+        }
+    }
+
     private void markers(BuildTask task, ChunkCoordinates issue) {
         boolean controller = (task.previewLayers & (HATCH | SHELL)) != 0;
         boolean repairable = issue != null && task.repairableIssue();
-        int pose = controller && task.plan != null && task.plan.ready && task.movable() ? task.facing.getIndex() : -1;
+        int pose = controller && task.dragPoseReady() && task.movable() ? task.facing.getIndex() : -1;
         int dragMinDistance = RebuildConfig.dragMinDistance, dragMaxDistance = RebuildConfig.dragMaxDistance;
         if (lastController == controller && lastRepairable == repairable && Objects.equals(issue, lastIssue)
                 && pose==lastPose && (pose < 0 || lastPoseRevision == task.revision
@@ -346,6 +374,7 @@ public final class PreviewStream {
         Blueprint plan = task.plan;
         boolean editable = task.editable() && plan.ready;
         boolean locateHatches = task.state == BuildTask.State.PREVIEW && (task.previewLayers & HATCH) != 0;
+        boolean construction = task.constructionPreview();
         boolean textured = task.useTexturedWorldPreview();
         boolean reset = sent != plan, modeChanged = lastTextured != textured;
         boolean contentChanged = revision != task.revision;
@@ -353,12 +382,10 @@ public final class PreviewStream {
         if (held && (refresh || lastLayers != task.previewLayers)) return;
         PreviewFooting oldFooting = footingScan;
         boolean hasBox = (task.previewLayers & BOX) != 0 && plan.ready;
-        if (!hasBox || footingScan != null && (footingScan.plan != plan || footingScan.solidityRevision != plan.solidityRevision))
+        if (footingScan != null && (footingScan.plan != plan || footingScan.solidityRevision != plan.solidityRevision))
             footingScan = null;
-        // Only the held terminal's selected task draws contacts, even if many other boxes are visible.
         ItemStack hand = hasBox ? viewer.getHeldItem() : null;
         boolean showFooting = hand != null && hand.getItem() == BuilderItem.ITEM && hand.hasTagCompound()
-                && task.id.equals(hand.getTagCompound().getString("selected"))
                 && task.tool.equals(hand.getTagCompound().getString("tool"));
         if (showFooting) {
             if (footingScan == null) footingScan = new PreviewFooting(plan);
@@ -372,7 +399,7 @@ public final class PreviewStream {
         }
         int ambiguous = plan.ready ? plan.ambiguousHatchDots() : 0;
         if (refresh || lastLayers != task.previewLayers || !plan.bounds.equals(bounds) || footingChanged
-                || lastEditable != editable || lastAmbiguousDots != ambiguous || lastLocateHatches != locateHatches) {
+                || lastConstruction != construction || lastEditable != editable || lastAmbiguousDots != ambiguous || lastLocateHatches != locateHatches) {
             if (refresh) {
                 if (!reset && inFlight >= 0) {
                     if (inFlightProgress) changedSections.add(inFlight);
@@ -421,6 +448,7 @@ public final class PreviewStream {
             Packet pkt = packet(1);
             pkt.reset = reset;
             pkt.editable = editable;
+            pkt.construction = construction;
             pkt.locateHatches = locateHatches;
             pkt.tool = task.tool;
             pkt.layers = task.previewLayers;
@@ -434,6 +462,7 @@ public final class PreviewStream {
             sent = plan;
             lastLayers = task.previewLayers;
             lastEditable = editable;
+            lastConstruction = construction;
             lastLocateHatches = locateHatches;
             lastTextured = textured;
             lastAmbiguousDots = ambiguous;
@@ -747,7 +776,7 @@ public final class PreviewStream {
         public int dragMinDistance = RebuildConfig.DEFAULT_DRAG_MIN_DISTANCE, dragMaxDistance = PreviewAim.USE_REACH;
         public PreviewPose.Allowed allowed;
         public HatchTypes hatchTypes;
-        public boolean reset, editable, textured, locateHatches;
+        public boolean reset, editable, textured, locateHatches, construction;
         public String tool;
         public Bounds bounds;
         public boolean footingReset, footingFirst, footingLast;
@@ -767,6 +796,7 @@ public final class PreviewStream {
         public byte[] payload;
         private int wireBytes;
         public ChunkCoordinates issue;
+        public boolean conflict;
 
         public void toBytes(ByteBuf b) {
             b.writeByte(type);
@@ -776,6 +806,11 @@ public final class PreviewStream {
             b.writeInt(dim);
             b.writeInt(epoch);
             b.writeInt(revision);
+            if (type == CONFLICT) {
+                b.writeLong(sequence);
+                b.writeInt(x); b.writeInt(y); b.writeInt(z); b.writeByte(pose); b.writeBoolean(conflict);
+                return;
+            }
             if (type == BLOCK_NAME) {
                 b.writeInt(x); b.writeInt(y); b.writeInt(z);
                 b.writeInt(nameBlock); b.writeInt(nameMeta); b.writeInt(nameItem); b.writeInt(nameDamage);
@@ -826,7 +861,7 @@ public final class PreviewStream {
                 return;
             }
             if (type == 1) {
-                b.writeByte((layers & 7) | (footingReset ? 32 : 0) | (locateHatches ? 64 : 0) | (textured ? 128 : 0));
+                b.writeByte((layers & 7) | (construction ? 8 : 0) | (footingReset ? 32 : 0) | (locateHatches ? 64 : 0) | (textured ? 128 : 0));
                 b.writeBoolean(reset);
                 b.writeBoolean(editable);
                 ByteBufUtils.writeUTF8String(b, tool);
@@ -1007,6 +1042,11 @@ public final class PreviewStream {
             dim = b.readInt();
             epoch = b.readInt();
             revision = b.readInt();
+            if (type == CONFLICT) {
+                sequence = b.readLong();
+                x = b.readInt(); y = b.readInt(); z = b.readInt(); pose = b.readByte(); conflict = b.readBoolean();
+                return;
+            }
             if (type == BLOCK_NAME) {
                 x = b.readInt(); y = b.readInt(); z = b.readInt();
                 nameBlock = b.readInt(); nameMeta = b.readInt(); nameItem = b.readInt(); nameDamage = b.readInt();
@@ -1069,6 +1109,7 @@ public final class PreviewStream {
             if (type == 1) {
                 int flags = b.readUnsignedByte();
                 layers = flags & 7;
+                construction = (flags & 8) != 0;
                 locateHatches = (flags & 64) != 0;
                 textured = (flags & 128) != 0;
                 reset = b.readBoolean();

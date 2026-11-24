@@ -8,6 +8,7 @@ import appeng.tile.networking.TileWireless;
 import com.google.common.base.Optional;
 
 import com.Goderium.StructureBuilderNH.StructureBuilderNH;
+import com.Goderium.StructureBuilderNH.config.RebuildConfig;
 
 import com.cleanroommc.modularui.api.IGuiHolder;
 import com.cleanroommc.modularui.factory.*;
@@ -37,7 +38,6 @@ import java.util.List;
 
 public final class BuilderItem extends AEBasePoweredItem
         implements IGuiHolder<PlayerInventoryGuiData>, INetworkEncodable {
-    static final int MAX_RATE = 16_384;
     public static final BuilderItem ITEM = new BuilderItem();
     static final Item RECEIPT =
             new Item() {
@@ -77,13 +77,12 @@ public final class BuilderItem extends AEBasePoweredItem
     }
 
     static int rate(ItemStack s) {
-        return s.hasTagCompound() && s.getTagCompound().hasKey("rate")
-                ? clampRate(s.getTagCompound().getInteger("rate"))
-                : 256;
+        return clampRate(s != null && s.hasTagCompound() && s.getTagCompound().hasKey("rate")
+                ? s.getTagCompound().getInteger("rate") : 256);
     }
 
     static int clampRate(int rate) {
-        return Math.max(1, Math.min(MAX_RATE, rate));
+        return Math.max(1, Math.min(RebuildConfig.maxBuildRate, rate));
     }
 
     private static ExtendedFacing facingPlayer(EntityPlayer p) {

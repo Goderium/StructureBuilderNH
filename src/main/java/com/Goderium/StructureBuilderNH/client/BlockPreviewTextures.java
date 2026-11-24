@@ -45,7 +45,7 @@ final class BlockPreviewTextures {
         @Override
         protected boolean removeEldestEntry(Map.Entry<Long, Appearance> eldest) { return size() > 4096; }
     };
-    private static final RenderBlocks RENDERER = renderer();
+    static final RenderBlocks RENDERER = renderer();
     private static final PreviewLayerAccess LAYER_ACCESS = new PreviewLayerAccess();
 
     private static RenderBlocks renderer() {
@@ -298,7 +298,8 @@ final class BlockPreviewTextures {
     static void face(Tessellator tessellator, Appearance appearance, int side, int slot, int alpha,
             IBlockAccess access, int worldX, int worldY, int worldZ) {
         if (appearance.fluid != null) {
-            appearance.fluid.face(RENDERER, tessellator, appearance, side, slot, alpha, access, worldX, worldY, worldZ);
+            appearance.fluid.face(RENDERER, tessellator, appearance, side, slot, alpha, access, worldX, worldY, worldZ,
+                    appearance.fluid.height(appearance, access, worldX, worldY, worldZ));
             return;
         }
         faceLayers(tessellator, appearance, side, slot, alpha, access, worldX, worldY, worldZ, 0,

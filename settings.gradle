@@ -1,5 +1,9 @@
 pluginManagement {
     repositories {
+        exclusiveContent {
+            forRepository { maven { url = 'https://jitpack.io' } }
+            filter { includeGroup 'com.github.ElytraServers.elytra-conventions' }
+        }
         maven { url = 'https://nexus.gtnewhorizons.com/repository/public/' }
         gradlePluginPortal()
         mavenCentral()

@@ -12,6 +12,8 @@ public final class RebuildConfig {
     public static boolean enabled = true, protectTileEntities = false;
     private static final int DEFAULT_REBUILD_VOLUME = 4000000;
     public static int maxRebuildVolume = DEFAULT_REBUILD_VOLUME;
+    private static final int DEFAULT_MAX_BUILD_RATE = 1_048_576;
+    public static int maxBuildRate = DEFAULT_MAX_BUILD_RATE;
     public static boolean terminalEnergyEnabled = true;
     public static int placeEU = 4, removeEU = 8;
     public static boolean useSurvivalConstruct = true;
@@ -38,6 +40,8 @@ public final class RebuildConfig {
             "Charge the wireless structure terminal for survival construction and dismantling");
         placeEU = cfg.getInt("placeEU", "terminalEnergy", 4, 0, Integer.MAX_VALUE, "EU per block placed");
         removeEU = cfg.getInt("removeEU", "terminalEnergy", 8, 0, Integer.MAX_VALUE, "EU per block removed");
+        maxBuildRate = cfg.getInt("maxBuildRate", "terminal", DEFAULT_MAX_BUILD_RATE, 1, Integer.MAX_VALUE,
+            "Maximum blocks per second shared by a wireless terminal's construction and dismantling tasks");
         useSurvivalConstruct = cfg.getBoolean("useSurvivalConstruct", "terminal", true,
             "Select the wireless terminal's native structure source. True uses survivalConstruct, as in the GT NEI preview. False uses construct with the marked controller's saved state. The machine defines how each source interprets the main channel");
         dragMaxDistance = cfg.getInt("dragMaxDistance", "terminal", DEFAULT_DRAG_MAX_DISTANCE,

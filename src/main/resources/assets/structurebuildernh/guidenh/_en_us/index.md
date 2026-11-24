@@ -23,7 +23,7 @@ Sneak defaults to Shift.
 
 ## Move a controller preview
 
-Hold right-click for 0.3 seconds to grab a movable preview, including distant controllers. Move or turn to reposition it and release right-click to confirm.
+Hold right-click for 0.3 seconds to grab a movable preview, including distant controllers. Move or turn to reposition it and release right-click to confirm. You can immediately hold right-click again to grab it.
 
 - **Hold right-click + scroll** adjusts distance by one block per notch.
 - **Right-click → Sneak + scroll** turns horizontally in 90° steps.
@@ -35,4 +35,5 @@ Keep right-click held and then press the modifier. The first modifier wins until
 
 - In **Browse model**, left-click blocks, left-drag to rotate, and scroll to zoom. In **Section**, use the axis button and layer slider, and left-drag the right-hand view to pan.
 - Select a block and choose **Show in section**. Scroll or click a channel value to edit it. Tap right-click or press **Esc** to go back.
-- In **Single block replacement**, hover over the marker slot and press a hotbar key to choose a block. Press **Enter** to place or replace, or **Esc** to go back.
+- In the **Task list**, click a task row to open it. To clear the list, click **Delete all tasks** in the lower right, check the count, then click again to confirm. Placed blocks stay in the world. Pending material refunds continue.
+- Click **Dismantle** to remove matching structure blocks on site, or **Shift-click** to undo only this task's placements. Click again to confirm. You can release Shift before confirming.

@@ -3,6 +3,7 @@ package com.Goderium.StructureBuilderNH.common.builder;
 import static com.cleanroommc.modularui.network.NetworkUtils.readStringSafe;
 import static com.cleanroommc.modularui.network.NetworkUtils.writeStringSafe;
 
+import com.Goderium.StructureBuilderNH.config.RebuildConfig;
 import com.cleanroommc.modularui.api.drawable.IKey;
 import com.cleanroommc.modularui.api.drawable.IDrawable;
 import com.cleanroommc.modularui.api.widget.IWidget;
@@ -69,6 +70,8 @@ final class BuilderGui {
     private static final int UPGRADE = 512, HAS_REPLACEMENTS = 2048;
     private static final int SITE_COUNTS = 4096, PARTIAL_BUILD = 8192, CHECKING_SITE = 16384;
     private static final int TEXTURED_PREVIEW = 1 << 15;
+    private static final int AWAITING_SITE = 1 << 18;
+    private static final int SITE_COMPLETE = 1 << 17;
     private static final int REPAIR_CELL = 1 << 16;
     private static final int LOCKED_MARKER = 128;
     private static final int CELL_SLOT_X = 13, CELL_SLOT_Y = 78, BAG_X = EDGE, BAG_Y = 152;
@@ -77,14 +80,6 @@ final class BuilderGui {
     final ModularPanel panel = new ModularPanel("wireless_builder") {
         @Override
         public boolean onKeyPressed(char c, int key) {
-            if (onCellPage() && !getContext().isFocused()) {
-                if (key == org.lwjgl.input.Keyboard.KEY_ESCAPE) { sendAction("back"); return true; }
-                if (cellSlotHovered() && pickHotbar(key)) return true;
-                if (key == org.lwjgl.input.Keyboard.KEY_RETURN || key == org.lwjgl.input.Keyboard.KEY_NUMPADENTER) {
-                    if (!org.lwjgl.input.Keyboard.isRepeatEvent()) confirmCell(false);
-                    return true;
-                }
-            }
             if (!getContext().isFocused()
                     && com.Goderium.StructureBuilderNH.StructureBuilderNH.proxy.deleteShortcutKey(key)) {
                 String id = BuilderTasks.shortcutTarget(tool());
@@ -95,7 +90,6 @@ final class BuilderGui {
         }
         @Override
         public boolean onMousePressed(int button) {
-            if (onCellPage() && cellSlotHovered() && pickHotbar(button - 100)) return true;
             if (onCellPage() && (button == 0 || button == 1)) {
                 int slot = bagSlot(getContext().getAbsMouseX() - getArea().x, getContext().getAbsMouseY() - getArea().y);
                 if (slot >= 0 && data.getPlayer().inventory.getItemStack() == null) {
@@ -123,7 +117,8 @@ final class BuilderGui {
     private final Map<String, String> sentProgress = new HashMap<>();
     private final Map<String, TerminalLocation> sentLocations = new HashMap<>();
     private final Map<String, QueueLine> lines = new HashMap<>();
-    private boolean queueLayoutDirty;
+    private boolean queueLayoutDirty, hasDeletableTasks;
+    private final Set<BuildTask> pendingDeletes = new HashSet<>();
     private OrdinaryBuildSurvey checkingSite, site, sentSite;
     private int nextSiteCheck;
     private final Map<ItemId, SiteRow> siteRows = new HashMap<>();
@@ -162,13 +157,6 @@ final class BuilderGui {
         return dy >= 58 && dy < 76 ? dx / 18 : -1;
     }
 
-    private boolean pickHotbar(int key) {
-        int index = com.Goderium.StructureBuilderNH.StructureBuilderNH.proxy.hotbarSlot(key);
-        if (index < 0) return false;
-        selectCellSlot(index);
-        return true;
-    }
-
     private void selectCellSlot(int index) {
         sync.callSyncedAction("cellSelect", b -> b.writeByte(index));
     }
@@ -185,7 +173,19 @@ final class BuilderGui {
         TerminalLocation.Columns columns;
         String phase = "", progress = "";
         int placed, total;
-        boolean canDismantle, confirmDismantle, surveyed;
+        boolean canDismantle, surveyed;
+        int removalModes, pendingRemoval;
+
+        int removalAction() {
+            if (pendingRemoval != 0) return pendingRemoval;
+            return net.minecraft.client.gui.GuiScreen.isShiftKeyDown() ? BuildTask.UNDO_PLACEMENTS : BuildTask.DISMANTLE_SITE;
+        }
+
+        String removalLabel() {
+            if (pendingRemoval == BuildTask.UNDO_PLACEMENTS) return tr("confirmUndo");
+            if (pendingRemoval == BuildTask.DISMANTLE_SITE) return tr("confirmDismantle");
+            return tr(removalAction() == BuildTask.UNDO_PLACEMENTS ? "undo" : "dismantle");
+        }
         final ParentWidget<?> entry = new ParentWidget<>().size(ROW_WIDTH, HEIGHT).marginBottom(2);
         final ParentWidget<?> actions = new ParentWidget<>().size(ACTION_WIDTH, BUTTON_H)
                 .left(TASK_BODY + 4).verticalCenter();
@@ -201,6 +201,12 @@ final class BuilderGui {
             this.name = name;
             machine = renderer.line(name);
             count = IKey.dynamic(() -> progress).color(INK).shadow(false).alignment(Alignment.CenterRight);
+        }
+
+        String removalHint() {
+            if (removalModes == BuildTask.UNDO_PLACEMENTS) return tr("undoOnlyHint");
+            if (removalModes == BuildTask.DISMANTLE_SITE) return tr("siteOnlyHint");
+            return tr("dismantleHint");
         }
 
         void layout(boolean dismantle) {
@@ -398,6 +404,13 @@ final class BuilderGui {
         });
         IntSyncValue autoRemove = new IntSyncValue(() -> server() && BuilderTasks.get().autoRemove(player()) ? 1 : 0);
         sync.syncValue("autoRemove", autoRemove);
+        IntSyncValue deleteCount = integer("deleteCount", () -> hasDeletableTasks ? pendingDeletes.size() : -1);
+        sync.registerSyncedAction("deleteAll", false, true, b -> {
+            if (deleteAll(b.readBoolean())) {
+                update();
+                sendRows();
+            }
+        });
         sync.registerSyncedAction(
                 "act",
                 false,
@@ -428,14 +441,13 @@ final class BuilderGui {
                 true,
                 b -> {
                     String id = readStringSafe(b);
-                    boolean dismantle = b.readBoolean();
+                    int action = b.readUnsignedByte();
                     if (page != Page.TASKS || tool() == null) return;
                     for (BuildTask t : BuilderTasks.get().list(player(), tool())) {
                         if (!t.id.equals(id)) continue;
                         WorldServer world = DimensionManager.getWorld(t.dim);
-                        if (dismantle) {
-                            if (world == player().worldObj) t.requestDismantle(player(), world);
-                        } else delete(t, world);
+                        if (action == 0) delete(t, world);
+                        else if (world == player().worldObj) t.requestDismantle(player(), world, action);
                         previous = "";
                         sendRows();
                         break;
@@ -496,7 +508,8 @@ final class BuilderGui {
                 if (!why.equals(message)) message += ": " + why;
             }
             if (in(phase, "DRAFT", "PREVIEW") && (flags.getIntValue() & UPGRADE) == 0) {
-                if ((flags.getIntValue() & CHECKING_SITE) != 0) message = tr("checkingSite");
+                if ((flags.getIntValue() & SITE_COMPLETE) != 0) message = tr("state.SITE_COMPLETE");
+                if ((flags.getIntValue() & (CHECKING_SITE | AWAITING_SITE)) != 0) message = tr("checkingSite");
                 if (unknownAtSite.getIntValue() > 0) message += "  " + quantity("siteUnverified", unknownAtSite.getIntValue());
                 if (blockedAtSite.getIntValue() > 0) message += "  " + quantity("siteBlocked", blockedAtSite.getIntValue());
             }
@@ -520,6 +533,8 @@ final class BuilderGui {
                                                 | (task.hasReserved() ? 8 : 0)
                                                 | (task.upgrading() ? UPGRADE : 0)
                                                 | (task.upgradeCount > 0 ? HAS_REPLACEMENTS : 0)
+                                                | (builtOnSite() ? SITE_COMPLETE : 0)
+                                                | (task.awaitingSiteCount() ? AWAITING_SITE : 0)
                                                 | (site != null ? SITE_COUNTS : 0)
                                                 | (site == null && checkingSite != null ? CHECKING_SITE : 0)
                                                 | (site != null && site.installedCells > 0 && site.installedCells < site.totalCells
@@ -528,9 +543,10 @@ final class BuilderGui {
                                                 | (task.repairableIssue() ? REPAIR_CELL : 0)
                                                 | (task.previewLayers << 4));
         sync.syncValue("flags", flags);
+        IntSyncValue maxRate = integer("maxRate", () -> RebuildConfig.maxBuildRate);
         IntSyncValue rate =
                 new IntSyncValue(
-                                () -> tool() == null ? 256 : BuilderItem.rate(tool()),
+                                () -> BuilderItem.rate(tool()),
                                 v -> {
                                     if (server() && tool() != null)
                                         BuilderTasks.tag(tool())
@@ -561,7 +577,7 @@ final class BuilderGui {
                 () -> in(phase, "DONE", "REFUND", "DISMANTLING", "DISMANTLED", "TEARDOWN_PAUSED");
         label(
                 main,
-                () -> tr(in(phase, "DISMANTLING") ? "salvage"
+                () -> tr(in(phase, "DISMANTLING") ? (data.getPlayer().capabilities.isCreativeMode ? "removalProgress" : "salvage")
                         : in(phase, "REFUND") || in(phase, "DONE") && (flags.getIntValue() & 8) != 0 ? "leftovers"
                         : (flags.getIntValue() & UPGRADE) != 0 ? "replacementList"
                         : (flags.getIntValue() & SITE_COUNTS) != 0 ? "installedTotal" : "materials"),
@@ -605,7 +621,7 @@ final class BuilderGui {
         main.child(
                 new TextFieldWidget()
                         .value(rate)
-                        .numbersInt(1, BuilderItem.MAX_RATE)
+                        .numbersInt(() -> 1, maxRate::getIntValue)
                         .pos(178, 169)
                         .size(129, 16)
                         .setEnabledIf(w -> !settled.getAsBoolean()));
@@ -629,7 +645,7 @@ final class BuilderGui {
                         true)
                 .setEnabledIf(
                         w ->
-                                target.getValue() != null
+                                target.getValue() != null && (flags.getIntValue() & (SITE_COMPLETE | AWAITING_SITE)) == 0
                                         && in(
                                                 phase, "DRAFT", "PREVIEW", "BLOCKED", "READY",
                                                 "MISSING", "UPGRADE_REVIEW"));
@@ -679,6 +695,13 @@ final class BuilderGui {
         list(tasks, jobs, EDGE, 44, LIST_WIDTH, 4 * (QueueLine.HEIGHT + 2));
         checkbox(tasks, EDGE, FOOTER_Y, 178, "autoRemove", () -> autoRemove.getIntValue() != 0)
                 .tooltip(t -> t.addLine(IKey.str(tr("autoRemoveHelp"))));
+        control(tasks, 191, FOOTER_Y, 116,
+                () -> deleteCount.getIntValue() > 0
+                        ? StatCollector.translateToLocalFormatted("structurebuildernh.confirmDeleteAll", deleteCount.getIntValue())
+                        : tr("deleteAll"),
+                () -> sync.callSyncedAction("deleteAll", b -> b.writeBoolean(deleteCount.getIntValue() > 0)), false)
+                .setEnabledIf(w -> deleteCount.getIntValue() >= 0)
+                .tooltip(t -> t.addLine(IKey.str(tr("deleteHint"))));
         return panel;
     }
 
@@ -742,6 +765,7 @@ final class BuilderGui {
                 .getter(() -> cell == null ? null : cell.selected).adapter(ByteBufAdapters.ITEM_STACK)
                 .copy(ItemStack::copy).nullable().build();
         IntSyncValue mode = new IntSyncValue(() -> cell == null ? 0 : (cell.host ? 1 : 0) | (cell.occupied() ? 2 : 0));
+        IntSyncValue ready = integer("cellReady", () -> cell != null && cell.ready() ? 1 : 0);
         cellTicket = new IntSyncValue(() -> cell == null ? 0 : cell.ticket);
         sync.syncValue("cellSlot", selected);
         sync.syncValue("cellMode", mode);
@@ -795,9 +819,9 @@ final class BuilderGui {
         singleLine(group, () -> result.getStringValue().isEmpty() ? "" : tr(result.getStringValue()),
                 EDGE, 115, LIST_WIDTH, 16, ACCENT);
         control(group, 178, FOOTER_Y, 59, () -> tr("cell.remove"), () -> confirmCell(true), false)
-                .setEnabledIf(w -> mode.getIntValue() == 2);
+                .setEnabledIf(w -> mode.getIntValue() == 2 && ready.getIntValue() != 0);
         control(group, 241, FOOTER_Y, 66, () -> tr((mode.getIntValue() & 2) == 0 ? "cell.place" : "cell.replace"),
-                () -> confirmCell(false), true);
+                () -> confirmCell(false), true).setEnabledIf(w -> ready.getIntValue() != 0);
     }
 
     private boolean cellActive() {
@@ -875,7 +899,7 @@ final class BuilderGui {
                     task.setTexturedPreview(action.equals("previewTextured"));
                 return;
             case "go":
-                if (page != Page.MAIN) return;
+                if (page != Page.MAIN || builtOnSite() || task.awaitingSiteCount()) return;
                 if (task.state == BuildTask.State.UPGRADE_REVIEW && task.upgradeCount == 0) {
                     if (world != null && player().worldObj == world) task.continueOrdinaryBuild(player(), world);
                     break;
@@ -927,20 +951,37 @@ final class BuilderGui {
         sendRows();
     }
 
+    private boolean deleteAll(boolean confirm) {
+        ItemStack terminal = tool();
+        if (page != Page.TASKS || terminal == null || terminal.getItem() != BuilderItem.ITEM) return false;
+        List<BuildTask> owned = BuilderTasks.get().list(player(), terminal);
+        owned.removeIf(t -> t.deleteRequested);
+        if (!confirm) {
+            if (pendingDeletes.isEmpty()) pendingDeletes.addAll(owned);
+            return false;
+        }
+        // Recheck ownership and exclude tasks created since the count was shown.
+        owned.retainAll(pendingDeletes);
+        pendingDeletes.clear();
+        for (BuildTask t : owned) delete(t, DimensionManager.getWorld(t.dim));
+        return !owned.isEmpty();
+    }
+
     private void delete(BuildTask t, WorldServer world) {
         t.store.delete(t, player(), tool(), world);
     }
 
-    private void queueAction(String id, boolean dismantle) {
+    private void queueAction(String id, int action) {
         sync.callSyncedAction(
                 "queueAction",
                 b -> {
                     writeStringSafe(b, id);
-                    b.writeBoolean(dismantle);
+                    b.writeByte(action);
                 });
     }
 
     private void show(Page next) {
+        pendingDeletes.clear();
         if (page == Page.CELL && next != Page.CELL) cell = null;
         if (page == Page.BROWSER && next != Page.BROWSER) browser.leave();
         page = next;
@@ -985,6 +1026,7 @@ final class BuilderGui {
                 || task.state == BuildTask.State.QUEUED;
         if (site != null && (!live || task.total == 0))
             return site.installedCells + " / " + site.totalCells + (site.unknownCells > 0 ? " *" : "");
+        if (task.hasSiteCount()) return task.siteInstalled + " / " + task.siteTotal + (task.siteUnknown > 0 ? " *" : "");
         if (task.total > 0) return task.placed + " / " + task.total;
         return task.plan != null && task.plan.ready ? dimensions() : "";
     }
@@ -993,12 +1035,22 @@ final class BuilderGui {
         return StatCollector.translateToLocalFormatted("structurebuildernh." + key, String.format(Locale.ROOT, "%,d", count));
     }
 
+    private boolean builtOnSite() {
+        return task != null && task.hasSiteCount() && task.siteComplete;
+    }
+
     private void surveyBuildSite() {
         if (page != Page.MAIN || task == null || task.plan == null || !task.plan.ready || task.upgrading()
                 || player().dimension != task.dim || task.state == BuildTask.State.REFUND
                 || task.state == BuildTask.State.DONE || task.state == BuildTask.State.DISMANTLED
                 || task.state == BuildTask.State.DISMANTLING || task.state == BuildTask.State.TEARDOWN_PAUSED) {
             checkingSite = site = null;
+            return;
+        }
+        if (task.surveysExistingSite()) {
+            task.requestSiteSurvey();
+            checkingSite = null;
+            site = task.completedSiteSurvey();
             return;
         }
         if (site != null && !site.valid(task)) site = null;
@@ -1012,10 +1064,7 @@ final class BuilderGui {
             site = checkingSite;
             checkingSite = null;
             if (task.state == BuildTask.State.DRAFT || task.state == BuildTask.State.PREVIEW) {
-                task.siteInstalled = site.installedCells;
-                task.siteTotal = site.totalCells;
-                task.siteUnknown = site.unknownCells;
-                task.siteRevision = task.revision;
+                task.publishSiteSurvey(site);
             }
             // Allow edits by other players to appear while the material list is open.
             nextSiteCheck = now + 60;
@@ -1358,7 +1407,12 @@ final class BuilderGui {
         if (page == Page.TASKS) {
             List<BuildTask> tasks = BuilderTasks.get().list(player(), tool());
             StringBuilder membership = new StringBuilder("queue");
-            for (BuildTask t : tasks) membership.append('|').append(t.id);
+            hasDeletableTasks = false;
+            for (BuildTask t : tasks) {
+                membership.append('|').append(t.id);
+                if (!t.deleteRequested) hasDeletableTasks = true;
+            }
+            pendingDeletes.removeIf(t -> t.deleteRequested || t.store.jobs.get(t.id) != t);
             if (!previous.contentEquals(membership)) {
                 previous = membership.toString();
                 sentProgress.clear();
@@ -1366,8 +1420,11 @@ final class BuilderGui {
                 sync.callSyncedAction("rows", b -> b.writeByte(0));
             }
             for (BuildTask t : tasks) {
-                boolean surveyed = t.siteRevision == t.revision
-                        && (t.state == BuildTask.State.DRAFT || t.state == BuildTask.State.PREVIEW);
+                boolean surveyed = t.hasSiteCount();
+                boolean checking = t.awaitingSiteCount() && t.dim == player().dimension;
+                if (checking) t.requestSiteSurvey();
+                int modes = t.removalModes(player().worldObj);
+                boolean complete = surveyed && t.siteComplete;
                 int installed = surveyed ? t.siteInstalled : t.placed;
                 int total = surveyed ? t.siteTotal : t.total;
                 int unknown = surveyed ? t.siteUnknown : 0;
@@ -1384,7 +1441,7 @@ final class BuilderGui {
                                 + "/"
                                 + t.previewLayers
                                 + "/"
-                                + (t.ledger.count > 0);
+                                + modes + "/" + complete + "/" + checking;
                 String last = sentProgress.put(t.id, progress);
                 TerminalLocation old = sentLocations.get(t.id);
                 boolean moved = old == null || !old.matches(t.dim, t.dimensionName(), t.x, t.y, t.z);
@@ -1405,13 +1462,11 @@ final class BuilderGui {
                                                     && !t.hasReserved()
                                                     && t.savedLink == null
                                             ? "REFUNDED"
-                                            : t.state.name());
+                                            : complete ? "SITE_COMPLETE" : checking ? "CHECKING_SITE" : t.state.name());
                             b.writeVarIntToBuffer(installed);
                             b.writeVarIntToBuffer(total);
                             b.writeBoolean(t.previewLayers != 0 && t.state != BuildTask.State.PREVIEW);
-                            b.writeBoolean(t.dim == player().dimension && t.ledger.count > 0
-                                    && t.state != BuildTask.State.DISMANTLING && !t.deleteRequested
-                                    && (!t.dismantleRequested || t.state == BuildTask.State.TEARDOWN_PAUSED));
+                            b.writeByte(modes);
                             b.writeBoolean(t.upgrading());
                             b.writeBoolean(surveyed);
                             if (surveyed) b.writeVarIntToBuffer(unknown);
@@ -1672,18 +1727,20 @@ final class BuilderGui {
             if (type == 2 || b.readBoolean()) {
                 TerminalLocation position = TerminalLocation.read(b);
                 if (row != null) {
+                    row.pendingRemoval = 0;
                     row.position = position;
                     queueLayoutDirty = true;
                 }
             }
             String state = readStringSafe(b);
             int placed = b.readVarIntFromBuffer(), total = b.readVarIntFromBuffer();
-            boolean preview = b.readBoolean(), canDismantle = b.readBoolean();
+            boolean preview = b.readBoolean();
+            int modes = b.readUnsignedByte();
             boolean upgrade = b.readBoolean();
             boolean surveyed = b.readBoolean();
             boolean partial = surveyed && b.readVarIntFromBuffer() > 0;
             String phase = tr(upgrade && state.equals("DONE") ? "upgradeDone"
-                    : upgrade && state.equals("BUILDING") ? "upgrading" : "state." + state);
+                    : upgrade && state.equals("BUILDING") ? "upgrading" : state.equals("CHECKING_SITE") ? "checkingSite" : "state." + state);
             if (upgrade && !state.equals("DONE") && !state.equals("BUILDING")
                     && !state.equals("INSPECTING_UPGRADE") && !state.equals("UPGRADE_REVIEW"))
                 phase = tr("upgradeTask") + " | " + phase;
@@ -1693,8 +1750,9 @@ final class BuilderGui {
             row.total = total;
             row.surveyed = surveyed;
             row.progress = total == 0 ? "" : placed + " / " + total + (partial ? " *" : "");
-            if (!canDismantle) row.confirmDismantle = false;
-            row.layout(canDismantle);
+            row.removalModes = modes;
+            if ((modes & row.pendingRemoval) == 0) row.pendingRemoval = 0;
+            row.layout(modes != 0);
             if (type == 2) {
                 row.entry.child(row.body
                         .background(fill(jobs.getChildren().size() % 2 == 0 ? STRIPE : SURFACE))
@@ -1706,13 +1764,18 @@ final class BuilderGui {
                             return true;
                         }));
                 row.entry.child(row.actions);
-                control(row.actions, 0, 0, ACTION_WIDTH, () -> tr("delete"), () -> queueAction(id, false), false)
+                control(row.actions, 0, 0, ACTION_WIDTH, () -> tr("delete"), () -> queueAction(id, 0), false)
                         .tooltip(t -> t.addLine(IKey.str(tr("deleteHint"))));
-                control(row.actions, 0, BUTTON_H + 2, ACTION_WIDTH, () -> tr(row.confirmDismantle ? "confirm" : "dismantle"), () -> {
-                    if (row.confirmDismantle) queueAction(id, true);
-                    row.confirmDismantle = !row.confirmDismantle;
+                control(row.actions, 0, BUTTON_H + 2, ACTION_WIDTH, row::removalLabel, () -> {
+                    int action = row.removalAction();
+                    if ((row.removalModes & action) == 0) return;
+                    if (row.pendingRemoval == 0) row.pendingRemoval = action;
+                    else {
+                        row.pendingRemoval = 0;
+                        queueAction(id, action);
+                    }
                 }, false).setEnabledIf(w -> row.canDismantle)
-                        .tooltip(t -> t.addLine(IKey.str(tr("dismantleHint"))));
+                        .tooltip(t -> t.addLine(IKey.dynamic(row::removalHint)));
                 jobs.child(row.entry);
             }
             return;

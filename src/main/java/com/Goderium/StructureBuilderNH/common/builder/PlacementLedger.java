@@ -17,6 +17,7 @@ import net.minecraftforge.event.world.BlockEvent;
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.util.*;
+import java.util.function.BooleanSupplier;
 
 /**
  * Only successful writes by this task become removable. Coordinates use world sections, not plan
@@ -132,7 +133,7 @@ final class PlacementLedger {
         count = 0;
     }
 
-    boolean harvest(EntityPlayerMP actor, WorldServer world, ItemStack blueprint, int x, int y, int z) {
+    static boolean mayHarvest(EntityPlayerMP actor, WorldServer world, ItemStack blueprint, int x, int y, int z) {
         Block block = world.getBlock(x, y, z);
         int meta = world.getBlockMetadata(x, y, z);
         boolean creative = actor.capabilities.isCreativeMode;
@@ -141,16 +142,28 @@ final class PlacementLedger {
                 || (!creative && block.getBlockHardness(world, x, y, z) < 0)) return false;
         // The blueprint breaks this block on behalf of its owner. Protection handlers can veto it.
         BlockEvent.BreakEvent event = new BlockEvent.BreakEvent(x, y, z, world, block, meta, actor);
-        if (MinecraftForge.EVENT_BUS.post(event) || !matches(world, x, y, z)) return false;
+        return !MinecraftForge.EVENT_BUS.post(event);
+    }
+
+    boolean harvest(EntityPlayerMP actor, WorldServer world, ItemStack blueprint, int x, int y, int z) {
+        Block block = world.getBlock(x, y, z);
+        int meta = world.getBlockMetadata(x, y, z);
+        if (!mayHarvest(actor, world, blueprint, x, y, z) || !matches(world, x, y, z)) return false;
+        return captureDrops(actor, world, () -> harvestBlock(actor, world, x, y, z, block, meta));
+    }
+
+    boolean captureDrops(EntityPlayerMP actor, WorldServer world, BooleanSupplier operation) {
         WorldHooks.ItemDropSink previous = WorldHooks.DISMANTLE_DROPS.get();
         WorldHooks.DISMANTLE_DROPS.set((source, stack) -> {
             if (source != world) return previous != null && previous.accept(source, stack);
+            // Some tile entities emit their contents even when vanilla skips creative harvest drops.
+            if (actor.capabilities.isCreativeMode) return true;
             task.salvage.add(stack, stack.stackSize);
             task.changed();
             return true;
         });
         try {
-            return harvestBlock(actor, world, x, y, z, block, meta);
+            return operation.getAsBoolean();
         } finally {
             if (previous == null) WorldHooks.DISMANTLE_DROPS.remove();
             else WorldHooks.DISMANTLE_DROPS.set(previous);
