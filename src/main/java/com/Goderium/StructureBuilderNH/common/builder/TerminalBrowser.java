@@ -26,7 +26,7 @@ import net.minecraft.network.PacketBuffer;
 /** One browser per open terminal container. Its preview edits never mutate a task until adopted. */
 public final class TerminalBrowser {
     interface ApplyChannels {
-        void apply(int tier, NBTTagCompound levels, Set<String> targets, boolean share);
+        void apply(int tier, NBTTagCompound levels, Set<String> targets, Set<String> excluded, boolean share);
     }
 
     public interface Display {
@@ -79,7 +79,17 @@ public final class TerminalBrowser {
                 if (!definitions.containsKey(key)) return;
                 targets.add(key);
             }
-            adopt.apply(tier, (NBTTagCompound) levels.copy(), targets, share);
+            Set<String> excluded = new LinkedHashSet<>();
+            if (p.isReadable()) {
+                int exclusions = p.readVarIntFromBuffer();
+                if (exclusions < 0 || exclusions > definitions.size()) return;
+                for (int i = 0; i < exclusions; i++) {
+                    String key = readStringSafe(p);
+                    if (!definitions.containsKey(key)) return;
+                    excluded.add(key);
+                }
+            }
+            adopt.apply(tier, (NBTTagCompound) levels.copy(), targets, excluded, share);
             if (source.tier == tier && source.channels.equals(levels)) taskRevision = source.revision;
             sendProfile();
         });
@@ -109,12 +119,14 @@ public final class TerminalBrowser {
         sync.callSyncedAction("browserChannels", p -> { p.writeLong(generation); p.writeBoolean(visible); });
     }
 
-    public void adopt(long generation, Set<String> targets, boolean share) {
+    public void adopt(long generation, Set<String> targets, Set<String> excluded, boolean share) {
         sync.callSyncedAction("browserAdopt", p -> {
             p.writeLong(generation);
             p.writeBoolean(share);
             p.writeVarIntToBuffer(targets.size());
             for (String key : targets) writeStringSafe(p, key);
+            p.writeVarIntToBuffer(excluded.size());
+            for (String key : excluded) writeStringSafe(p, key);
         });
     }
 

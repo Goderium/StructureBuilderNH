@@ -873,6 +873,7 @@ final class BuilderGui {
                 return;
             case "browser":
                 if (page == Page.MAIN && task.target != null) {
+                    if (!task.existing && world == player().worldObj) task.attachExisting(world);
                     browser.open(player(), task, channels);
                     show(Page.BROWSER);
                 }
@@ -990,12 +991,12 @@ final class BuilderGui {
         sendRows();
     }
 
-    private void commitChannels(int tier, NBTTagCompound next, Set<String> specified, boolean share) {
+    private void commitChannels(int tier, NBTTagCompound next, Set<String> specified, Set<String> excluded, boolean share) {
         if (page != Page.BROWSER || task == null || !task.canConfigureChannels()
                 || task.existing && (task.plan == null || !task.plan.ready)) return;
         boolean changed = !task.usesConfiguredSource() || task.tier != tier || !task.channels.equals(next);
         if (!share && task.existing && task.plan != null && task.plan.ready) {
-            specified.retainAll(task.plan.upgradeChannels());
+            task.resolveReplacementChannels(tier, next, specified, excluded);
         } else specified.clear();
         if (!specified.isEmpty()) {
             if (!task.setUpgradeChannels(specified)) return;

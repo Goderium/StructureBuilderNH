@@ -82,6 +82,7 @@ public final class TerminalBrowserWidget extends ParentWidget<TerminalBrowserWid
     private final List<Channel> channels = new ArrayList<>();
     private final Channel[] editingRows = new Channel[CHANNEL_ROWS];
     private final Set<String> replacementTargets = new LinkedHashSet<>();
+    private final Set<String> excludedTargets = new LinkedHashSet<>();
     private boolean scopeEdited;
     private final RenderItem icons = new RenderItem();
     private BrowserRenderer model = new BrowserRenderer();
@@ -131,7 +132,11 @@ public final class TerminalBrowserWidget extends ParentWidget<TerminalBrowserWid
                         getContext().removeFocus();
                         Channel c = channelAt(row);
                         if (c == null || !c.upgrade || !writable) return false;
-                        if (!replacementTargets.remove(c.key)) replacementTargets.add(c.key);
+                        if (replacementTargets.remove(c.key)) excludedTargets.add(c.key);
+                        else {
+                            replacementTargets.add(c.key);
+                            excludedTargets.remove(c.key);
+                        }
                         scopeEdited = true;
                         return true;
                     }).setEnabledIf(w -> writable && channelAt(row) != null && channelAt(row).upgrade));
@@ -140,6 +145,7 @@ public final class TerminalBrowserWidget extends ParentWidget<TerminalBrowserWid
 
     private void selectTarget(Channel channel) {
         replacementTargets.add(channel.key);
+        excludedTargets.remove(channel.key);
         scopeEdited = true;
     }
 
@@ -210,6 +216,7 @@ public final class TerminalBrowserWidget extends ParentWidget<TerminalBrowserWid
             }
         }
         replacementTargets.removeAll(old.keySet());
+        excludedTargets.removeAll(old.keySet());
     }
 
     private Channel channel(Map<String, Channel> old, String key, int value, int min, int max, int ack) {
@@ -253,6 +260,7 @@ public final class TerminalBrowserWidget extends ParentWidget<TerminalBrowserWid
         channels.clear();
         java.util.Arrays.fill(editingRows, null);
         replacementTargets.clear();
+        excludedTargets.clear();
         scopeEdited = false;
         isolated = dual = hatches = writable = dirty = false;
         axis = 1;
@@ -704,7 +712,8 @@ public final class TerminalBrowserWidget extends ParentWidget<TerminalBrowserWid
             boolean share = inside(CHANNEL_SIDE + 2, ACTION_Y, 60, BUTTON);
             boolean apply = inside(CHANNEL_SIDE + 64, ACTION_Y, RIGHT - CHANNEL_SIDE - 66, BUTTON);
             if (share || apply && canApply()) {
-                port.adopt(generation, new LinkedHashSet<>(replacementTargets), share);
+                port.adopt(generation, new LinkedHashSet<>(replacementTargets), new LinkedHashSet<>(excludedTargets), share);
+                excludedTargets.clear();
                 scopeEdited = false;
             }
         } else if (drawer == Drawer.MATERIALS) {

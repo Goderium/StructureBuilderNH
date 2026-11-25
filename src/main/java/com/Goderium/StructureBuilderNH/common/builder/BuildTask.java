@@ -970,7 +970,8 @@ final class BuildTask {
     boolean canConfigureChannels() {
         return !hasReserved() && savedLink == null && !ordering()
                 && (state == State.DRAFT || state == State.PREVIEW || state == State.MISSING
-                    || state == State.UPGRADE_REVIEW || state == State.BLOCKED && upgrading() && !upgradeApproved);
+                    || state == State.UPGRADE_REVIEW || state == State.BLOCKED && !upgradeApproved
+                            && (upgrading() || existing && "obstruction".equals(reason)));
     }
 
     boolean usesConfiguredSource() {
@@ -1003,6 +1004,17 @@ final class BuildTask {
             ledger.forget(x, y, z);
             changed();
         }
+    }
+
+    void resolveReplacementChannels(int nextTier, NBTTagCompound next, Set<String> selected, Set<String> excluded) {
+        Set<String> supported = plan.upgradeChannels();
+        selected.retainAll(supported);
+        for (String channel : supported) {
+            int before = channels.getInteger(channel);
+            int after = next.getInteger(channel);
+            if ((before > 0 ? before : tier) != (after > 0 ? after : nextTier)) selected.add(channel);
+        }
+        selected.removeAll(excluded);
     }
 
     /** Call before writing new tier/channel values, while the old ready plan can validate the selected scope. */
