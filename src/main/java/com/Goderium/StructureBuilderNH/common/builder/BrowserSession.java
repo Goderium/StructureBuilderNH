@@ -4,7 +4,6 @@ import com.gtnewhorizon.structurelib.StructureLibAPI;
 import com.gtnewhorizon.structurelib.alignment.enumerable.ExtendedFacing;
 import com.gtnewhorizon.structurelib.util.MiscUtils;
 import com.Goderium.StructureBuilderNH.util.Bounds;
-import com.Goderium.StructureBuilderNH.config.RebuildConfig;
 import gregtech.api.GregTechAPI;
 import gregtech.common.blocks.BlockDecorativeFrame;
 import gregtech.common.blocks.BlockFrameBox;
@@ -83,6 +82,7 @@ public final class BrowserSession implements AutoCloseable {
     private int sharedIdle;
     private long sharedWalks;
     private String configKey;
+    private boolean mainChannelEdited;
     private UUID cacheKey;
     private boolean cacheChecked, clientCached;
     private int cacheWait, cacheSourceRevision;
@@ -130,9 +130,14 @@ public final class BrowserSession implements AutoCloseable {
 
     /** Preview-only configuration; the caller separately validates any eventual task changes. */
     public void configure(int tier, NBTTagCompound channels) {
+        configure(tier, channels, tier != this.tier || mainChannelEdited);
+    }
+
+    void configure(int tier, NBTTagCompound channels, boolean mainChannelEdited) {
         if (closed) return;
         int nextTier = normalizedTier(tier);
         NBTTagCompound next = normalize(channels);
+        this.mainChannelEdited = mainChannelEdited;
         String nextKey = key(nextTier, next);
         if (nextKey.equals(configKey)) return;
         remember();
@@ -274,8 +279,7 @@ public final class BrowserSession implements AutoCloseable {
 
     private UUID cacheKey() {
         if (source == null) return null;
-        String value = source.id + ":" + source.revision + ":" + facing.getIndex() + ":"
-                + RebuildConfig.useSurvivalConstruct + ":" + configKey;
+        String value = source.id + ":" + source.revision + ":" + facing.getIndex() + ":" + configKey;
         return UUID.nameUUIDFromBytes(value.getBytes(StandardCharsets.UTF_8));
     }
 
@@ -295,7 +299,7 @@ public final class BrowserSession implements AutoCloseable {
                 try {
                     boolean actual = usesActualShape(tier);
                     plan = Blueprint.read(target, trigger, facing,
-                            0, 0, 0, player, ignored -> false, actual || RebuildConfig.useSurvivalConstruct, actual);
+                            0, 0, 0, player, ignored -> false, actual);
                 } finally { ChannelProbe.end(); }
             }
         }
@@ -304,8 +308,9 @@ public final class BrowserSession implements AutoCloseable {
     }
 
     private boolean matchesSource() {
-        return source.facing == facing && source.usesConfiguredSource() && Materials.equal(target, source.target)
-                && source.tier == tier && key(source.tier, normalize(source.channels)).equals(configKey);
+        return source.facing == facing && source.prefersSurvivalSource() && Materials.equal(target, source.target)
+                && source.tier == tier && source.plan.mainChannel == tier && source.readActualStructure == usesActualShape(tier)
+                && key(source.tier, normalize(source.channels)).equals(configKey);
     }
 
     private boolean activeSource() {
@@ -584,7 +589,8 @@ public final class BrowserSession implements AutoCloseable {
     }
 
     private boolean usesActualShape(int tier) {
-        return source != null && source.readActualStructure && tier == source.tier;
+        // An explicit main-channel edit asks for that blueprint even if its number equals the site value.
+        return !mainChannelEdited && source != null && source.readActualStructure && tier == source.tier;
     }
 
     private String key(int tier, NBTTagCompound channels) {

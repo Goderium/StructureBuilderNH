@@ -109,19 +109,7 @@ final class MaterialChoice {
         if (e == null) return false;
         if (e == StructureUtility.isAir() || e == StructureUtility.notAir()) return anyMeta;
         if (e instanceof IStructureElementChain) {
-            // A custom chain can override the native predicate or enumerate unrelated outputs.
-            try {
-                Class<?> type = e.getClass();
-                if (type.getMethod("check", Object.class, World.class, int.class, int.class, int.class)
-                                .getDeclaringClass() != IStructureElementChain.class
-                        || type.getMethod("couldBeValid", Object.class, World.class, int.class, int.class, int.class,
-                                        ItemStack.class).getDeclaringClass() != IStructureElementChain.class
-                        || type.getMethod("getBlocksToPlace", Object.class, World.class, int.class, int.class, int.class,
-                                        ItemStack.class, AutoPlaceEnvironment.class)
-                                .getDeclaringClass() != IStructureElementChain.class) return false;
-            } catch (NoSuchMethodException ignored) {
-                return false;
-            }
+            if (!nativeChain((IStructureElementChain<?>) e)) return false;
             for (IStructureElement<?> child : ((IStructureElementChain<?>) e).fallbacks())
                 if (!nativeElement(child, anyMeta)) return false;
             return true;
@@ -132,6 +120,22 @@ final class MaterialChoice {
         String name = method.getName();
         return name.equals("ofBlock") || name.equals("ofBlocksFlat") || name.equals("ofBlocksMap")
                 || anyMeta && name.equals("ofBlockAnyMeta");
+    }
+
+    // Custom chains may override the native predicate or enumerate unrelated outputs.
+    static boolean nativeChain(IStructureElementChain<?> chain) {
+        Class<?> type = chain.getClass();
+        try {
+            return type.getMethod("check", Object.class, World.class, int.class, int.class, int.class)
+                            .getDeclaringClass() == IStructureElementChain.class
+                    && type.getMethod("couldBeValid", Object.class, World.class, int.class, int.class, int.class,
+                                    ItemStack.class).getDeclaringClass() == IStructureElementChain.class
+                    && type.getMethod("getBlocksToPlace", Object.class, World.class, int.class, int.class, int.class,
+                                    ItemStack.class, AutoPlaceEnvironment.class)
+                            .getDeclaringClass() == IStructureElementChain.class;
+        } catch (NoSuchMethodException ignored) {
+            return false;
+        }
     }
 
     static final class NativeMaterial {
@@ -207,9 +211,20 @@ final class MaterialChoice {
             items.removeIf(s -> Materials.equal(s, cell.item));
             items.add(0, cell.item);
         }
-        String key = cell.role;
-        MaterialChoice group = new MaterialChoice(key, cell.piece, cell.symbol, items, air,
-                air && !cell.isFluid() ? items.size() : 0, x, y, z, cell);
+        int defaultIndex = 0;
+        if (air && !cell.isFluid()) {
+            defaultIndex = items.size();
+            // Keep saved option indices stable while following the block sampled from native construction.
+            for (int i = 0; i < items.size(); i++) {
+                ItemStack option = items.get(i);
+                if (Block.getBlockFromItem(option.getItem()) == cell.block
+                        && option.getItem().getMetadata(option.getMetadata()) == cell.meta) {
+                    defaultIndex = i;
+                    break;
+                }
+            }
+        }
+        MaterialChoice group = new MaterialChoice(cell.role, cell.piece, cell.symbol, items, air, defaultIndex, x, y, z, cell);
         StringBuilder legacy = new StringBuilder().append(x-plan.x).append(',').append(y-plan.y).append(',').append(z-plan.z);
         for (ItemStack item : items) if (item != null) legacy.append('/').append(Item.itemRegistry.getNameForObject(item.getItem()))
                 .append('@').append(item.getMetadata());
@@ -232,11 +247,12 @@ final class MaterialChoice {
         return -1;
     }
 
-    int[] allocation(NBTTagCompound selections) {
+    int[] allocation(NBTTagCompound selections, boolean useNativeOptionalDefaults) {
         int[] quantities = selections.getIntArray(key).clone();
         if (quantities.length != optionCount()) quantities = new int[optionCount()];
         if (!selections.hasKey(key)) {
-            quantities[defaultIndex] = count;
+            int preferred = allowsAir && sampledFluid == null && !useNativeOptionalDefaults ? items.size() : defaultIndex;
+            quantities[preferred] = count;
             return quantities;
         }
         int left = count;

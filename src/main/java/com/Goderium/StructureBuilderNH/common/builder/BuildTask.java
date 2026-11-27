@@ -4,7 +4,6 @@ import appeng.api.config.*;
 
 import com.Goderium.StructureBuilderNH.api.PrepareStructureDismantleEvent;
 
-import com.Goderium.StructureBuilderNH.config.RebuildConfig;
 import com.gtnewhorizon.structurelib.StructureLibAPI;
 import com.gtnewhorizon.structurelib.alignment.IAlignment;
 import com.gtnewhorizon.structurelib.alignment.constructable.*;
@@ -131,12 +130,15 @@ final class BuildTask {
     ItemStack target;
     int tier = 1, cursor, total, placed, revision;
     boolean readActualStructure;
+    private boolean useNativeOptionalDefaults = true;
     SiteAdjustment adjustment;
-    boolean useSurvivalConstruct = RebuildConfig.useSurvivalConstruct;
+    private boolean legacyConstructOnly;
     int siteRevision = -1, siteInstalled, siteTotal, siteUnknown;
     boolean siteComplete;
     private OrdinaryBuildSurvey siteSurvey, checkingSite;
     private boolean surveyRequested;
+    private boolean siteTierPending;
+    private SiteTierSearch siteTierSearch;
     private long nextSiteSurvey;
 
     boolean surveysExistingSite() {
@@ -164,7 +166,7 @@ final class BuildTask {
     }
 
     void inspectSite(World world, long deadline) {
-        if (!needsSiteSurvey() || plan == null || !plan.ready || System.nanoTime() >= deadline) return;
+        if (checkingSiteTier() || !needsSiteSurvey() || plan == null || !plan.ready || System.nanoTime() >= deadline) return;
         long now = world.getTotalWorldTime();
         if (completedSiteSurvey() != null && checkingSite == null && now < nextSiteSurvey) {
             surveyRequested = false;
@@ -511,7 +513,7 @@ final class BuildTask {
             MaterialChoice group = entry.getKey();
             List<MaterialSelection> cells = entry.getValue();
             group.count = cells.size();
-            int[] remaining = group.allocation(materialSelections);
+            int[] remaining = group.allocation(materialSelections, useNativeOptionalDefaults && !(existing && readActualStructure));
             int groupIndex = materialGroups.hasKey(group.key) ? group.optionIndex(materialGroups.getString(group.key)) : -1;
             boolean hasLocal = !materialCells.hasNoTags();
             for (MaterialSelection selection : cells) {
@@ -776,6 +778,7 @@ final class BuildTask {
         // Native restoration may have materialized blocks outside the selected preview piece.
         if (siteRemoval != null && !removalScanComplete) removalScanCursor = 0;
         plan = null;
+        siteTierSearch = null;
         invalidateOrdinaryProgress();
         movedMarkers = null;
         movedAllowed = null;
@@ -785,6 +788,10 @@ final class BuildTask {
         materialTotals.clear();
         ordinaryWork.cell = null;
         ordinaryWork.material = ordinaryWork.installedMaterial = null;
+    }
+
+    boolean hasCachedPlan() {
+        return plan != null || siteTierSearch != null;
     }
 
     void resetPlan() {
@@ -818,9 +825,15 @@ final class BuildTask {
     }
 
     boolean canCompletePreviewMove() {
-        return state == State.PREVIEW && (previewLayers & (PreviewStream.SHELL | PreviewStream.HATCH)) != 0
+        return (state == State.PREVIEW || canMoveAfterObstruction())
+                && (previewLayers & (PreviewStream.SHELL | PreviewStream.HATCH)) != 0
                 && (!existing || temporaryHost) && target != null && !deleteRequested && !dismantleRequested && !upgrading()
                 && ledger.count == 0 && !hasReserved() && savedLink == null;
+    }
+
+    private boolean canMoveAfterObstruction() {
+        return state == State.BLOCKED && adjustment == null && ("obstruction".equals(reason)
+                || "anchor".equals(reason) || "height".equals(reason) || "outsideWorld".equals(reason));
     }
 
     boolean dragPoseReady() {
@@ -856,6 +869,10 @@ final class BuildTask {
         } else if (next == null || next != facing && !allowedPoses().reachable(facing, next)) return false;
         if (sameAnchor && !attach && next == facing) return true;
         PreviewPose.Allowed allowed = allowedPoses();
+        state = State.PREVIEW;
+        checkMaterialsOnly = false;
+        useNativeOptionalDefaults = true;
+        legacyConstructOnly = false;
         applyPreviewMove(px, py, pz, next, attach);
         if (attach) refreshSiteTier(world);
         movedAllowed = allowed;
@@ -1003,8 +1020,8 @@ final class BuildTask {
                             && (upgrading() || existing && "obstruction".equals(reason)));
     }
 
-    boolean usesConfiguredSource() {
-        return useSurvivalConstruct == RebuildConfig.useSurvivalConstruct;
+    boolean prefersSurvivalSource() {
+        return !legacyConstructOnly;
     }
 
     boolean keepsUpgradeBinding() { return !upgradeNetwork.isEmpty(); }
@@ -1033,7 +1050,8 @@ final class BuildTask {
     }
 
     void releaseMissingTemporaryHost(World world) {
-        if (temporaryHost && editable() && world.blockExists(x, y, z) && world.isAirBlock(x, y, z)) {
+        if (temporaryHost && (editable() || canCompletePreviewMove())
+                && world.blockExists(x, y, z) && world.isAirBlock(x, y, z)) {
             existing = temporaryHost = false;
             ledger.forget(x, y, z);
             changed();
@@ -1052,6 +1070,7 @@ final class BuildTask {
 
     private void useSiteDefaults() {
         readActualStructure = true;
+        siteTierPending = true;
         tier = 1;
         channels = new NBTTagCompound();
         pendingDefaults = new NBTTagCompound();
@@ -1063,10 +1082,39 @@ final class BuildTask {
         if (!(host instanceof IGregTechTileEntity) || ((IGregTechTileEntity) host).getMetaTileID() != target.getMetadata()) return;
         IMetaTileEntity controller = ((IGregTechTileEntity) host).getMetaTileEntity();
         int actualTier = readMainChannel(controller);
+        siteTierPending = actualTier <= 0 && !animated.supports(controller);
+        if (siteTierPending) {
+            checkingSite = siteSurvey = null;
+            siteRevision = -1;
+            requestSiteSurvey();
+        }
         if (actualTier > 0 && actualTier != tier) {
             tier = actualTier;
             resetPlan();
         }
+    }
+
+    boolean checkingSiteTier() {
+        return siteTierPending && readActualStructure && surveysExistingSite();
+    }
+
+    private boolean resolveSiteBlueprint(EntityPlayerMP actor, long deadline, boolean dismantling) {
+        SiteTierSearch search = siteTierSearch;
+        Blueprint found = search.advance(actor, deadline);
+        if (found == null) return false;
+        siteTierSearch = null;
+        if (!dismantling) {
+            siteTierPending = false;
+            if (tier != search.tier() || plan != null && plan != found) {
+                resetPlan();
+                tier = search.tier();
+            }
+            siteRevision = -1;
+            requestSiteSurvey();
+        }
+        observedChannels.addAll(search.channels());
+        plan = found;
+        return true;
     }
 
     static int readMainChannel(IMetaTileEntity controller) {
@@ -1085,10 +1133,7 @@ final class BuildTask {
         if (adjustment == null) adjustment = new SiteAdjustment(this);
         changedChannels.retainAll(plan.upgradeChannels());
         adjustment.selectChannels(changedChannels);
-        if (tier != nextTier) {
-            readActualStructure = false;
-            adjustment.targetShapeChanged = true;
-        }
+        if (tier != nextTier) readActualStructure = false;
         tier = nextTier;
         channels = next;
         pendingDefaults = new NBTTagCompound();
@@ -1107,7 +1152,7 @@ final class BuildTask {
         if (!selected.isEmpty() && (!existing || plan == null || !plan.ready
                 || !plan.upgradeChannels().containsAll(selected))) return false;
         upgradeChannels.clear(); upgradeChannels.addAll(selected);
-        useSurvivalConstruct = RebuildConfig.useSurvivalConstruct;
+        legacyConstructOnly = false;
         upgradeReview.clear(); releaseUpgradePhaseData();
         upgradeCount = 0; upgradeApproved = false; upgradeNetwork = "";
         needed.rows.clear(); shortage.rows.clear(); errors.rows.clear(); funding.clear();
@@ -1231,7 +1276,8 @@ final class BuildTask {
     }
 
     void resetDraft() {
-        useSurvivalConstruct = RebuildConfig.useSurvivalConstruct;
+        legacyConstructOnly = false;
+        useNativeOptionalDefaults = true;
         state = previewLayers == 0 ? State.DRAFT : State.PREVIEW;
         resetPlan();
     }
@@ -1311,15 +1357,28 @@ final class BuildTask {
 
     private void prepare(EntityPlayerMP actor, long deadline, ItemStack removalTool) {
         if (target == null || "unsupported".equals(reason)) return;
-        if (plan != null && plan.ready) return;
+        boolean dismantling = removalTool != null;
+        if (!dismantling && checkingSiteTier() && siteTierSearch == null) refreshSiteTier(actor.worldObj);
+        if (!dismantling && checkingSiteTier()) {
+            if (siteTierSearch == null) {
+                // Recheck from the first layout so a physically removed extension can also lower the result.
+                ItemStack base = structureTrigger(target, 1, channels);
+                Blueprint prior = plan != null && plan.mainChannel == 1 ? plan : null;
+                siteTierSearch = new SiteTierSearch(this, base, prior, observedChannels);
+            }
+            if (!resolveSiteBlueprint(actor, deadline, false)) return;
+        } else if (dismantling && siteTierSearch != null) {
+            if (!resolveSiteBlueprint(actor, deadline, true)) return;
+        } else if (plan != null && plan.ready) return;
         int known = observedChannels.size();
         ChannelProbe.begin(observedChannels);
         try {
             if (plan == null) {
-                ItemStack trigger = structureTrigger(target, tier, channels);
-                boolean survivalSource = readActualStructure || useSurvivalConstruct
-                        && (adjustment == null || !adjustment.targetShapeChanged);
-                if (removalTool != null) {
+                ItemStack trigger = dismantling && adjustment != null ? adjustment.sourceTrigger()
+                        : structureTrigger(target, tier, channels);
+                boolean survivalSource = prefersSurvivalSource();
+                boolean actual = readActualStructure;
+                if (dismantling) {
                     WorldServer world = (WorldServer) actor.worldObj;
                     if (world.getTotalWorldTime() < nextRestorationCheck) return;
                     TileEntity host = world.getTileEntity(x, y, z);
@@ -1330,8 +1389,12 @@ final class BuildTask {
                         state = State.TEARDOWN_PAUSED;
                         return;
                     }
+                    IMetaTileEntity controller = ((IGregTechTileEntity) host).getMetaTileEntity();
+                    int nativeTier = readMainChannel(controller);
+                    if (nativeTier > 0) trigger.stackSize = nativeTier;
+                    ItemStack original = trigger.copy();
                     PrepareStructureDismantleEvent event = new PrepareStructureDismantleEvent(
-                            (IGregTechTileEntity) host, actor, trigger, survivalSource);
+                            (IGregTechTileEntity) host, actor, trigger, true);
                     boolean ready = ledger.captureDrops(actor, world, () -> DismantleAnimations.prepare(this, world, siteRemoval, event));
                     if (!ready) {
                         if (state == State.DISMANTLING && !"unloaded".equals(reason)) reason = "restoreStructure";
@@ -1341,9 +1404,15 @@ final class BuildTask {
                     }
                     survivalSource = event.useSurvivalConstruct;
                     reason = "";
+                    actual = survivalSource && ItemStack.areItemStacksEqual(trigger, original) && !animated.supports(controller);
+                    if (actual && nativeTier <= 0) {
+                        if (readActualStructure || adjustment != null) trigger.stackSize = 1;
+                        siteTierSearch = new SiteTierSearch(this, trigger, null, observedChannels);
+                        return;
+                    }
                 }
                 plan = Blueprint.read(target, trigger, facing, x, y, z, actor, this::initiallyConfirmed,
-                        survivalSource, readActualStructure && removalTool == null);
+                        survivalSource, actual);
             }
             if (!plan.ready) plan.advance(deadline);
             if (plan.ready) {
@@ -1389,7 +1458,7 @@ final class BuildTask {
     }
 
     private void start(boolean checkOnly) {
-        if (state == State.SCANNING) return;
+        if (state == State.SCANNING || checkingSiteTier()) return;
         checkMaterialsOnly = checkOnly;
         if (upgrading()) {
             if (state == State.UPGRADE_REVIEW) { startUpgrade(); return; }
@@ -1980,16 +2049,27 @@ final class BuildTask {
     // a block as part of the machine. Require a concrete material, option or accepted hatch.
     private boolean removableCell(Blueprint.Cell cell, World world, int px, int py, int pz) {
         Block block = world.getBlock(px, py, pz);
-        if (world.isAirBlock(px, py, pz) || StructureFluids.isFluid(block)
-                || !materialMatches(cell, world, px, py, pz)) return false;
+        if (world.isAirBlock(px, py, pz) || StructureFluids.isFluid(block)) return false;
         TileEntity tile = world.getTileEntity(px, py, pz);
         if (cell.hatch && tile instanceof IGregTechTileEntity
                 && ((IGregTechTileEntity) tile).getMetaTileEntity() instanceof MTEHatch)
-            return cell.element != null && plan.checkManualHatch(cell, world, px, py, pz, target, facing);
-        if (cell.constraints == null) return identifiesMaterial(cell, world, px, py, pz, block, tile);
-        for (Blueprint.Cell source : cell.constraints)
-            if (identifiesMaterial(source, world, px, py, pz, block, tile)) return true;
-        return false;
+            return cell.element != null && plan.matches(cell, world, px, py, pz)
+                    && plan.checkManualHatch(cell, world, px, py, pz, target, facing);
+        return identifiesSiteBlock(plan, cell, world, px, py, pz);
+    }
+
+    static boolean identifiesSiteBlock(Blueprint plan, Blueprint.Cell cell, World world, int x, int y, int z) {
+        if (plan.matches(cell, world, x, y, z)) {
+            Block block = world.getBlock(x, y, z);
+            TileEntity tile = world.getTileEntity(x, y, z);
+            if (cell.constraints == null && identifiesMaterial(cell, world, x, y, z, block, tile)) return true;
+            if (cell.constraints != null)
+                for (Blueprint.Cell source : cell.constraints)
+                    if (identifiesMaterial(source, world, x, y, z, block, tile)) return true;
+        }
+        if (plan.identifiesOptionalSiteMaterial(cell, world, x, y, z)) return true;
+        String channel = plan.upgradeChannel(cell);
+        return !channel.isEmpty() && plan.upgrade(cell, world, x, y, z, Collections.singleton(channel)).sourceValue > 0;
     }
 
     private static boolean identifiesMaterial(Blueprint.Cell cell, World world, int x, int y, int z,
@@ -2629,7 +2709,8 @@ final class BuildTask {
         if (checkMaterialsOnly && state == State.SCANNING) n.setBoolean("checkMaterialsOnly", true);
         n.setBoolean("received", received);
         n.setInteger("tier", tier);
-        n.setBoolean("useSurvivalConstruct", useSurvivalConstruct);
+        n.setBoolean("useSurvivalConstruct", prefersSurvivalSource());
+        n.setBoolean("useNativeOptionalDefaults", useNativeOptionalDefaults);
         if (readActualStructure) n.setBoolean("readActualStructure", true);
         if (adjustment != null) n.setTag("siteAdjustment", adjustment.save());
         n.setByte("previewLayers", (byte) previewLayers);
@@ -2778,6 +2859,7 @@ final class BuildTask {
         NBTTagCompound adjustmentTag = n.getCompoundTag("siteAdjustment");
         boolean legacyClear = n.getByte("clearMode") > 0;
         t.adjustment = SiteAdjustment.load(t, adjustmentTag, !legacyClear);
+        t.siteTierPending = t.readActualStructure && t.surveysExistingSite();
         if (!t.upgrading() && t.adjustment == null && t.upgradeRecovery != null) {
             t.state = State.REFUND;
             t.reason = "upgradeRollback";
@@ -2793,9 +2875,13 @@ final class BuildTask {
         }
         // Queued builds and reservations address cells by ordinal. Resume with the source
         // that produced those ordinals, including construct-only saves from earlier versions.
-        boolean savedSource = n.getBoolean("useSurvivalConstruct");
+        boolean savedSurvival = t.readActualStructure || n.getBoolean("useSurvivalConstruct")
+                && !adjustmentTag.getBoolean("targetShapeChanged");
+        // Already quoted or running tasks must keep the choices used by their saved material bill.
+        t.useNativeOptionalDefaults = n.hasKey("useNativeOptionalDefaults") ? n.getBoolean("useNativeOptionalDefaults")
+                : t.state == State.DRAFT || t.state == State.PREVIEW;
         if (t.state == State.DRAFT || t.state == State.PREVIEW) {
-            if (t.useSurvivalConstruct == savedSource && t.surveysExistingSite() && n.hasKey("siteCount", 10)) {
+            if (savedSurvival && !t.siteTierPending && t.surveysExistingSite() && n.hasKey("siteCount", 10)) {
                 NBTTagCompound site = n.getCompoundTag("siteCount");
                 t.siteTotal = site.getInteger("total");
                 t.siteInstalled = site.getInteger("installed");
@@ -2803,7 +2889,7 @@ final class BuildTask {
                 t.siteComplete = site.getBoolean("complete");
                 t.siteRevision = t.revision;
             }
-            if (t.useSurvivalConstruct != savedSource) {
+            if (!savedSurvival) {
                 t.structureCells = null;
                 t.confirmed = new BitSet();
                 t.pending.clear();
@@ -2813,7 +2899,7 @@ final class BuildTask {
                 t.issue = null;
             }
         } else {
-            t.useSurvivalConstruct = savedSource;
+            t.legacyConstructOnly = !savedSurvival;
         }
         t.needed.read(n.getTagList("needed", 10));
         t.held.read(n.getTagList("held", 10));

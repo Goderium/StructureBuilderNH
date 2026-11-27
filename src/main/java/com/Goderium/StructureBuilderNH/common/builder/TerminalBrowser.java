@@ -48,7 +48,7 @@ public final class TerminalBrowser {
     private BrowserSession session;
     private NBTTagCompound levels, openingLevels;
     private int tier, taskRevision, known, observed, debounce, appliedEdit;
-    private boolean wasWritable, wasSitePending, channelDrawer, localSite;
+    private boolean wasWritable, wasSitePending, channelDrawer, localSite, waitingForSiteTier, mainChannelEdited;
     private ChannelSurvey survey, completedSurvey;
     private long generation;
 
@@ -131,6 +131,7 @@ public final class TerminalBrowser {
         close();
         source = task;
         localSite = player.dimension == task.dim;
+        waitingForSiteTier = localSite && task.checkingSiteTier();
         openedTarget = task.target.copy();
         taskRevision = task.revision;
         levels = (NBTTagCompound) task.channels.copy();
@@ -147,9 +148,21 @@ public final class TerminalBrowser {
     boolean tick(BuildTask task, Collection<IChannelDefinition> channels, EntityPlayerMP player) {
         if (session == null || task == null || task != source || !Materials.equal(openedTarget, task.target)) return false;
         localSite = player.dimension == task.dim;
+        if (localSite && task.checkingSiteTier()) {
+            if (!waitingForSiteTier) {
+                waitingForSiteTier = true;
+                profile(channels);
+            }
+            return true;
+        }
+        if (waitingForSiteTier) {
+            boolean drawerOpen = channelDrawer;
+            open(player, task, channels);
+            channelDrawer = drawerOpen;
+        }
         if (debounce > 0) {
             if (--debounce > 0) return true;
-            session.configure(tier, (NBTTagCompound) levels.copy());
+            session.configure(tier, (NBTTagCompound) levels.copy(), mainChannelEdited);
         }
         if (survey != null && survey.plan != task.plan) survey = null;
         boolean newSurvey = false;
@@ -160,7 +173,7 @@ public final class TerminalBrowser {
             if (newSurvey) {
                 completedSurvey = survey;
                 adoptSiteLevels();
-                session.configure(tier, levels);
+                session.configure(tier, levels, mainChannelEdited);
             }
         }
         // A local installed structure can reveal the native channel levels after its blueprint is captured.
@@ -253,12 +266,13 @@ public final class TerminalBrowser {
     }
 
     private boolean writable() {
-        return source.revision == taskRevision && source.canConfigureChannels()
+        return !waitingForSiteTier && source.revision == taskRevision && source.canConfigureChannels()
                 && (!source.existing || source.plan != null && source.plan.ready
                         && (source.plan.upgradeChannels().isEmpty() || hasCurrentSurvey()));
     }
 
     private boolean siteValuesPending() {
+        if (waitingForSiteTier) return true;
         if (!localSite || !source.existing || completedSurvey != null || session.closed()
                 || "unsupported".equals(source.reason)) return false;
         if (source.plan != null && source.plan.ready) return !source.plan.upgradeChannels().isEmpty();
@@ -278,7 +292,8 @@ public final class TerminalBrowser {
         if (key.isEmpty()) {
             int next = Math.max(1, Math.min(4096, value));
             appliedEdit = sequence;
-            if (tier == next) { sendProfile(); return; }
+            if (tier == next && mainChannelEdited) { sendProfile(); return; }
+            mainChannelEdited = true;
             tier = next;
         } else {
             IChannelDefinition d = definitions.get(key);
@@ -309,7 +324,7 @@ public final class TerminalBrowser {
         definitions.clear();
         observedMaximums = Collections.emptyMap();
         debounce = 0;
-        channelDrawer = localSite = false;
+        channelDrawer = localSite = waitingForSiteTier = mainChannelEdited = false;
         survey = completedSurvey = null;
     }
 }

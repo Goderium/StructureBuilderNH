@@ -1027,7 +1027,7 @@ final class BuilderGui {
             task.store.channelMemory.remember(task, tier, next, channels);
             return;
         }
-        boolean changed = !task.usesConfiguredSource() || task.tier != tier || !task.channels.equals(next);
+        boolean changed = !task.prefersSurvivalSource() || task.tier != tier || !task.channels.equals(next);
         if (task.existing && !task.upgrading()) {
             if (tier != task.tier || !specified.isEmpty()) task.applySiteChannels(tier, next, specified);
             return;

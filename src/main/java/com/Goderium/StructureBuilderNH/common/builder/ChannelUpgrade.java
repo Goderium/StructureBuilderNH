@@ -3,6 +3,7 @@ package com.Goderium.StructureBuilderNH.common.builder;
 import com.gtnewhorizon.structurelib.alignment.constructable.ChannelDataAccessor;
 import com.gtnewhorizon.structurelib.structure.IChannelDefinition;
 import com.gtnewhorizon.structurelib.structure.IStructureElement;
+import com.gtnewhorizon.structurelib.structure.IStructureElementChain;
 import com.gtnewhorizon.structurelib.structure.StructureUtility;
 
 import gregtech.api.enums.HeatingCoilLevel;
@@ -118,6 +119,7 @@ final class ChannelUpgrade {
     private final Map<String, Integer> readOnlyMaximums = Collections.unmodifiableMap(maximums);
     private final Set<String> unknownRanges = new TreeSet<>();
     private final Map<Blueprint.Cell, Profile> profiles = new IdentityHashMap<>();
+    private final Map<Blueprint.Cell, Profile> optionalSiteProfiles = new IdentityHashMap<>();
     private final Set<Blueprint.Cell> rejected = Collections.newSetFromMap(new IdentityHashMap<>());
     private final Map<String, Integer> active = new LinkedHashMap<>();
     private Set<String> channels = Collections.emptySet();
@@ -170,6 +172,21 @@ final class ChannelUpgrade {
         return new Result(Kind.REPLACE, profile, source, block, meta);
     }
 
+    boolean identifiesOptionalSiteMaterial(Blueprint.Cell cell, World world, int x, int y, int z) {
+        if (cell.choice == null || !cell.choice.allowsAir || cell.constraints != null
+                || !(cell.element instanceof IStructureElementChain)) return false;
+        Block block = world.getBlock(x, y, z);
+        int meta = world.getBlockMetadata(x, y, z);
+        if (block == Blocks.air || block.hasTileEntity(meta) || world.getTileEntity(x, y, z) != null) return false;
+        if (!optionalSiteProfiles.containsKey(cell)) {
+            IStructureElementChain<?> chain = (IStructureElementChain<?>) cell.element;
+            Proof proof = MaterialChoice.nativeChain(chain) ? plan.optionalTieredBranch(cell, chain) : null;
+            optionalSiteProfiles.put(cell, proof == null ? null : sample(cell, proof, x, y, z));
+        }
+        Profile profile = optionalSiteProfiles.get(cell);
+        return profile != null && profile.find(block, meta) != null;
+    }
+
     /** Called as the normal deadline-bounded blueprint walk records a position, never by a GUI query. */
     void record(Blueprint.Cell old, Blueprint.Cell cell, int x, int y, int z) {
         Profile previous = profiles.get(old);
@@ -203,7 +220,8 @@ final class ChannelUpgrade {
             int value = Math.max(1, Math.min(proof.maximum,
                     ChannelDataAccessor.getChannelData(pieceTrigger, proof.channel)));
             Material target = plan.sampleUpgrade(cell, pieceTrigger.copy(), x, y, z, proof.allowsAir);
-            if (target == null || !target.same(cell.block, cell.meta) || !Materials.equal(target.item, cell.item))
+            ItemStack expected = cell.choice == null ? cell.item : cell.choice.optionItem(cell.choice.defaultIndex);
+            if (target == null || !target.same(cell.block, cell.meta) || !Materials.equal(target.item, expected))
                 return null;
             if ("glass".equals(proof.channel)) {
                 value = GlassTier.getGlassChannelValue(target.block, target.meta);

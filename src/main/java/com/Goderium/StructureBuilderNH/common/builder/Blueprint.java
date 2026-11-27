@@ -61,12 +61,14 @@ public final class Blueprint extends GTDummyWorld {
     private final Map<String, Integer> pieceScopes = new HashMap<>();
     final Materials bill = new Materials();
     final ItemStack trigger;
+    final int mainChannel;
     final int x, y, z;
     final IMetaTileEntity controller;
     final AutoPlaceEnvironment env;
     private final IntPredicate initiallyConfirmed;
     Bounds bounds;
     int size;
+    long shapeEntries, shapeFingerprint;
     private int[] positions = new int[1024];
     private int sx, sy, sz;
     private Block sample = Blocks.air;
@@ -177,8 +179,8 @@ public final class Blueprint extends GTDummyWorld {
     }
 
     static Blueprint read(ItemStack target, ItemStack trigger, ExtendedFacing facing, int x, int y, int z,
-            EntityPlayer actor, IntPredicate initiallyConfirmed, boolean useSurvivalConstruct) {
-        return read(target, trigger, facing, x, y, z, actor, initiallyConfirmed, useSurvivalConstruct, false);
+            EntityPlayer actor, IntPredicate initiallyConfirmed, boolean actual) {
+        return read(target, trigger, facing, x, y, z, actor, initiallyConfirmed, true, actual);
     }
 
     static Blueprint read(ItemStack target, ItemStack trigger, ExtendedFacing facing, int x, int y, int z,
@@ -208,6 +210,7 @@ public final class Blueprint extends GTDummyWorld {
         this.y = y;
         this.z = z;
         this.trigger = trigger;
+        mainChannel = trigger.stackSize;
         bounds = Bounds.point(x, y, z);
         env =
                 AutoPlaceEnvironment.fromLegacy(
@@ -272,6 +275,9 @@ public final class Blueprint extends GTDummyWorld {
 
     private <T> void capture(IStructureElement<T>[] elements, ExtendedFacing facing, int px, int py, int pz,
             int a, int b, int c, IStructureWalker<T> walker, Object context, ItemStack pieceTrigger) {
+        shapeEntries += elements.length;
+        long piece = Objects.hash(System.identityHashCode(elements), facing, px, py, pz, a, b, c);
+        shapeFingerprint = 31 * shapeFingerprint + piece;
         try {
             bounds = bounds.union(ShapeRegistry.bounds(elements, facing, px, py, pz, a, b, c));
         } catch (IllegalStateException unknown) {
@@ -702,6 +708,21 @@ public final class Blueprint extends GTDummyWorld {
 
     ChannelUpgrade.Result upgrade(Cell cell, World world, int px, int py, int pz, Set<String> enabled) {
         return upgrades.inspect(cell, world, px, py, pz, enabled);
+    }
+
+    boolean identifiesOptionalSiteMaterial(Cell cell, World world, int x, int y, int z) {
+        return upgrades.identifiesOptionalSiteMaterial(cell, world, x, y, z);
+    }
+
+    ChannelUpgrade.Proof optionalTieredBranch(Cell cell, IStructureElementChain<?> chain) {
+        IStructureElement<?> solid = null;
+        boolean air = false;
+        for (IStructureElement<?> child : chain.fallbacks()) {
+            if (child == StructureUtility.isAir()) air = true;
+            else if (solid != null) return null;
+            else solid = child;
+        }
+        return air && solid != null ? ChannelUpgrade.prove(solid, cell.inputs.context, cell.inputs.trigger) : null;
     }
 
     /** Native writes stay in this private world's one sampling slot and are restored before returning. */

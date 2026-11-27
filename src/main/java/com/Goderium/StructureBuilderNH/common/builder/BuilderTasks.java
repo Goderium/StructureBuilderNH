@@ -369,7 +369,7 @@ public final class BuilderTasks extends WorldSavedData {
                 }
             }
             if (!present) {
-                if (t.plan != null && turn - viewers.getOrDefault(t.id, turn - 2000) > 600) t.discardCachedPlan();
+                if (t.hasCachedPlan() && turn - viewers.getOrDefault(t.id, turn - 2000) > 600) t.discardCachedPlan();
                 if (t.state == BuildTask.State.QUEUED || t.state == BuildTask.State.BUILDING)
                     t.reason = player == null ? "offline" : "tool";
                 continue;
@@ -410,7 +410,7 @@ public final class BuilderTasks extends WorldSavedData {
                     turn - viewers.getOrDefault(t.id, turn - 2000) < 30
                             || t.previewLayers != 0;
             if (!work && !viewed && !t.needsSiteSurvey()) {
-                if (t.plan != null && turn - viewers.getOrDefault(t.id, turn - 2000) > 600) t.discardCachedPlan();
+                if (t.hasCachedPlan() && turn - viewers.getOrDefault(t.id, turn - 2000) > 600) t.discardCachedPlan();
                 continue;
             }
             if (t.state == BuildTask.State.DONE || t.state == BuildTask.State.REFUND) continue;

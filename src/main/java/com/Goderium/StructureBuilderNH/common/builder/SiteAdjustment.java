@@ -37,12 +37,12 @@ final class SiteAdjustment {
     final PlacementLedger clearing;
     ChunkCoordinates blocker;
     String obstruction;
-    boolean ready, approved, targetShapeChanged;
+    boolean ready, approved;
     int additionsCount, replacementCount, removalCount, completedClears;
     long reviewedAt;
 
     SiteAdjustment(BuildTask task) {
-        this(task, task.tier, task.channels, task.readActualStructure, task.useSurvivalConstruct);
+        this(task, task.tier, task.channels, task.readActualStructure, task.prefersSurvivalSource());
         source = task.plan;
     }
 
@@ -82,6 +82,10 @@ final class SiteAdjustment {
         return task.plan.upgrade(cell, world, x, y, z, exact);
     }
 
+    ItemStack sourceTrigger() {
+        return BuildTask.structureTrigger(task.target, sourceTier, sourceChannels);
+    }
+
     void advance(EntityPlayerMP actor, WorldServer world, long deadline) {
         if (approved || task.plan == null || !task.plan.ready || System.nanoTime() >= deadline) return;
         if (reviewed != task.plan || reviewedRevision != task.revision
@@ -93,8 +97,7 @@ final class SiteAdjustment {
         if (ready) return;
 
         if (sourceTier > 0 && source == null) {
-            ItemStack trigger = BuildTask.structureTrigger(task.target, sourceTier, sourceChannels);
-            source = Blueprint.read(task.target, trigger, task.facing, task.x, task.y, task.z, actor, i -> false,
+            source = Blueprint.read(task.target, sourceTrigger(), task.facing, task.x, task.y, task.z, actor, i -> false,
                     sourceActual || sourceSurvival, sourceActual);
         }
         if (source != null && !source.ready) {
@@ -160,7 +163,7 @@ final class SiteAdjustment {
 
     private void inspectRemoval(WorldServer world, int x, int y, int z, Blueprint.Cell old) {
         if (x == task.x && y == task.y && z == task.z || old.isFluid()
-                || old.air && !old.hatch && source.upgradeChannel(old).isEmpty()) return;
+                || old.air && !old.hatch && old.choice == null && source.upgradeChannel(old).isEmpty()) return;
         if (!world.blockExists(x, y, z)) {
             block(x, y, z, "obstruction");
             return;
@@ -174,6 +177,7 @@ final class SiteAdjustment {
 
     private boolean ownedSource(WorldServer world, int x, int y, int z, Blueprint.Cell old) {
         if (old == null || old.isFluid()) return false;
+        if (old.choice != null) return BuildTask.identifiesSiteBlock(source, old, world, x, y, z);
         if ((!old.air || old.hatch) && source.matches(old, world, x, y, z)) return true;
         String channel = source.upgradeChannel(old);
         return !channel.isEmpty() && source.upgrade(old, world, x, y, z, Collections.singleton(channel)).sourceValue > 0;
@@ -219,7 +223,6 @@ final class SiteAdjustment {
         n.setTag("sourceChannels", sourceChannels);
         n.setBoolean("sourceActual", sourceActual);
         n.setBoolean("sourceSurvival", sourceSurvival);
-        n.setBoolean("targetShapeChanged", targetShapeChanged);
         NBTTagCompound selected = new NBTTagCompound();
         for (String channel : exact) selected.setBoolean(channel, true);
         n.setTag("exact", selected);
@@ -243,7 +246,6 @@ final class SiteAdjustment {
         SiteAdjustment result = new SiteAdjustment(task, sourceTier, n.getCompoundTag("sourceChannels"),
                 n.getBoolean("sourceActual"), n.getBoolean("sourceSurvival"));
         for (Object key : MiscUtils.getTagKeys(n.getCompoundTag("exact"))) result.exact.add((String) key);
-        result.targetShapeChanged = n.getBoolean("targetShapeChanged");
         result.approved = resumeExecution && n.getBoolean("approved");
         if (result.approved) {
             result.ready = true;

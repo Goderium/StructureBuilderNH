@@ -16,7 +16,6 @@ public final class RebuildConfig {
     public static int maxBuildRate = DEFAULT_MAX_BUILD_RATE;
     public static boolean terminalEnergyEnabled = true;
     public static int placeEU = 4, removeEU = 8;
-    public static boolean useSurvivalConstruct = true;
     public static final int DEFAULT_DRAG_MIN_DISTANCE = 1, DEFAULT_DRAG_MAX_DISTANCE = 64;
     // Keep the longest diagonal drag ray within the vanilla block tracer's 200 steps.
     private static final int MAX_DRAG_DISTANCE = 100;
@@ -42,8 +41,8 @@ public final class RebuildConfig {
         removeEU = cfg.getInt("removeEU", "terminalEnergy", 8, 0, Integer.MAX_VALUE, "EU per block removed");
         maxBuildRate = cfg.getInt("maxBuildRate", "terminal", DEFAULT_MAX_BUILD_RATE, 1, Integer.MAX_VALUE,
             "Maximum blocks per second shared by a wireless terminal's construction and dismantling tasks");
-        useSurvivalConstruct = cfg.getBoolean("useSurvivalConstruct", "terminal", true,
-            "Select the wireless terminal's native structure source. True uses survivalConstruct, as in the GT NEI preview. False uses construct with the marked controller's saved state. The machine defines how each source interprets the main channel");
+        if (cfg.hasKey("terminal", "useSurvivalConstruct"))
+            cfg.getCategory("terminal").remove("useSurvivalConstruct");
         dragMaxDistance = cfg.getInt("dragMaxDistance", "terminal", DEFAULT_DRAG_MAX_DISTANCE,
             DEFAULT_DRAG_MIN_DISTANCE, MAX_DRAG_DISTANCE, "Maximum wireless terminal preview drag depth in blocks (1 to 100)");
         dragMinDistance = cfg.getInt("dragMinDistance", "terminal", DEFAULT_DRAG_MIN_DISTANCE,
