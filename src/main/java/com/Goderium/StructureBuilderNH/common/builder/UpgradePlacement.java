@@ -13,6 +13,9 @@ import net.minecraft.nbt.NBTTagCompound;
 import net.minecraft.world.World;
 import net.minecraft.world.WorldServer;
 import net.minecraftforge.common.MinecraftForge;
+import net.minecraftforge.common.util.BlockSnapshot;
+import net.minecraftforge.common.util.ForgeDirection;
+import net.minecraftforge.event.ForgeEventFactory;
 import net.minecraftforge.event.world.BlockEvent;
 
 import java.lang.reflect.Method;
@@ -115,9 +118,7 @@ final class UpgradePlacement {
         public Boolean setBlock(
                 World source, int x, int y, int z, Block block, int meta, int flags) {
             if (source != world || x != cell.x || y != cell.y || z != cell.z) return false;
-            if (phase == 1
-                    && (block == Blocks.air
-                            || block == cell.targetBlock && meta == cell.targetMeta)) return null;
+            if (phase == 1 && block == cell.targetBlock && meta == cell.targetMeta) return null;
             if (phase == 2 && block == cell.oldBlock && meta == cell.oldMeta) return null;
             return false;
         }
@@ -145,6 +146,16 @@ final class UpgradePlacement {
                 && simplePlacer(result.target.getItem());
     }
 
+    static Recovery prepare(WorldServer world, int x, int y, int z, ItemStack material, boolean owned) {
+        if (material == null || material.hasTagCompound() || !simplePlacer(material.getItem())) return null;
+        Block old = world.getBlock(x, y, z), next = Block.getBlockFromItem(material.getItem());
+        int oldMeta = world.getBlockMetadata(x, y, z), nextMeta = material.getItem().getMetadata(material.getMetadata());
+        if (old == Blocks.air || next == null || next == Blocks.air || nextMeta < 0 || nextMeta > 15
+                || old.hasTileEntity(oldMeta) || next.hasTileEntity(nextMeta) || world.getTileEntity(x, y, z) != null)
+            return null;
+        return new Recovery(x, y, z, old, oldMeta, next, nextMeta, owned);
+    }
+
     private static boolean simplePlacer(Item item) {
         if (!(item instanceof ItemBlock)) return false;
         return PLACERS.computeIfAbsent(
@@ -170,7 +181,8 @@ final class UpgradePlacement {
 
     static Outcome replace(
             Recovery cell, EntityPlayerMP actor, WorldServer world, ItemStack material) {
-        if (WorldHooks.WRITE.get() != null
+        if (WorldHooks.WRITE.get() != null || world.captureBlockSnapshots || world.restoringBlockSnapshots
+                || !world.capturedBlockSnapshots.isEmpty()
                 || !cell.oldMatches(world)
                 || cell.oldBlock.getBlockHardness(world, cell.x, cell.y, cell.z) < 0
                 || !world.canMineBlock(actor, cell.x, cell.y, cell.z)
@@ -192,18 +204,25 @@ final class UpgradePlacement {
                             cell.x, cell.y, cell.z, world, cell.oldBlock, cell.oldMeta, actor);
             if (MinecraftForge.EVENT_BUS.post(event) || !cell.oldMatches(world))
                 return Outcome.DENIED;
-            scope.phase = 1;
-            if (!world.setBlock(cell.x, cell.y, cell.z, Blocks.air, 0, 2)
-                    || !world.isAirBlock(cell.x, cell.y, cell.z)) return rollback(scope, world);
             ItemStack unit = material.copy();
             unit.stackSize = 1;
-            // This is the same public Forge-aware placement path as ordinary construction.
-            if (unit.tryPlaceItemIntoWorld(actor, world, cell.x, cell.y, cell.z, 1, .5f, .5f, .5f)
-                    && cell.targetMatches(world)) {
-                world.markBlockForUpdate(cell.x, cell.y, cell.z);
-                return Outcome.SUCCESS;
+            BlockSnapshot before = BlockSnapshot.getBlockSnapshot(world, cell.x, cell.y, cell.z, 3);
+            scope.phase = 1;
+            boolean placed;
+            // Use ItemBlock's native write at this exact coordinate. Delay physics until it is committed.
+            world.captureBlockSnapshots = true;
+            try {
+                placed = ((ItemBlock) unit.getItem()).placeBlockAt(unit, actor, world, cell.x, cell.y, cell.z,
+                        ForgeDirection.UP.ordinal(), .5f, .5f, .5f, cell.targetMeta);
+            } finally {
+                world.captureBlockSnapshots = false;
+                world.capturedBlockSnapshots.clear();
             }
-            return rollback(scope, world);
+            scope.phase = 0;
+            if (!placed || !cell.targetMatches(world)) return rollback(scope, world);
+            if (ForgeEventFactory.onPlayerBlockPlace(actor, before, ForgeDirection.UP).isCanceled())
+                return rollback(scope, world) == Outcome.FAILED ? Outcome.DENIED : Outcome.RECOVERY;
+            return cell.targetMatches(world) ? Outcome.SUCCESS : rollback(scope, world);
         } catch (RuntimeException | LinkageError failure) {
             return rollback(scope, world);
         } finally {
@@ -211,6 +230,10 @@ final class UpgradePlacement {
             if (previousDrops == null) WorldHooks.DISMANTLE_DROPS.remove();
             else WorldHooks.DISMANTLE_DROPS.set(previousDrops);
         }
+    }
+
+    static void notifyReplacement(Recovery cell, WorldServer world) {
+        world.markAndNotifyBlock(cell.x, cell.y, cell.z, null, cell.oldBlock, cell.targetBlock, 3);
     }
 
     private static Outcome rollback(Scope scope, WorldServer world) {

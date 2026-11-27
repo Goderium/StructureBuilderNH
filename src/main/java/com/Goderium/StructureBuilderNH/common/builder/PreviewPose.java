@@ -1,6 +1,8 @@
 package com.Goderium.StructureBuilderNH.common.builder;
 
+import com.gtnewhorizon.structurelib.alignment.IAlignment;
 import com.gtnewhorizon.structurelib.alignment.enumerable.ExtendedFacing;
+import gregtech.api.interfaces.metatileentity.IMetaTileEntity;
 
 import net.minecraft.nbt.NBTBase;
 import net.minecraft.nbt.NBTTagCompound;
@@ -77,6 +79,27 @@ public final class PreviewPose {
         zx = basis[0][2];
         zy = basis[1][2];
         zz = basis[2][2];
+    }
+
+    private static boolean supports(IMetaTileEntity controller, ExtendedFacing pose) {
+        return pose != null && controller.isFacingValid(pose.getDirection())
+                && (controller instanceof IAlignment ? ((IAlignment) controller).isNewExtendedFacingValid(pose)
+                        : pose == ExtendedFacing.of(pose.getDirection()));
+    }
+
+    static ExtendedFacing initialFacing(IMetaTileEntity controller, ExtendedFacing preferred) {
+        try {
+            if (controller == null || supports(controller, preferred)) return preferred;
+            for (ExtendedFacing pose : ExtendedFacing.FOR_FACING.get(preferred.getDirection()))
+                if (pose.getFlip().isNotFlipped() && supports(controller, pose)) return pose;
+            for (ExtendedFacing pose : ExtendedFacing.VALUES)
+                if (pose.getFlip().isNotFlipped() && supports(controller, pose)) return pose;
+            for (ExtendedFacing pose : ExtendedFacing.VALUES)
+                if (supports(controller, pose)) return pose;
+        } catch (RuntimeException | LinkageError unavailable) {
+            // Some prototypes can only check their orientation once attached to a tile entity.
+        }
+        return preferred;
     }
 
     public static ExtendedFacing rotate(ExtendedFacing from, ForgeDirection axis, int steps) {

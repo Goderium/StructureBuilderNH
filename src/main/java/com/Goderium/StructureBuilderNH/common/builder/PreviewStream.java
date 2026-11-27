@@ -373,7 +373,7 @@ public final class PreviewStream {
     private void send(BuildTask task, Budget budget, boolean held) {
         Blueprint plan = task.plan;
         boolean editable = task.editable() && plan.ready;
-        boolean locateHatches = task.state == BuildTask.State.PREVIEW && (task.previewLayers & HATCH) != 0;
+        boolean locateHatches = task.existing;
         boolean construction = task.constructionPreview();
         boolean textured = task.useTexturedWorldPreview();
         boolean reset = sent != plan, modeChanged = lastTextured != textured;

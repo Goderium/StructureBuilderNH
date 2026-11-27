@@ -4,9 +4,11 @@ import com.Goderium.StructureBuilderNH.common.builder.BrowserPacket;
 import com.Goderium.StructureBuilderNH.util.Bounds;
 import gregtech.api.util.GTUtility.ItemId;
 import net.minecraft.world.ChunkPosition;
+import net.minecraftforge.common.util.ForgeDirection;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
@@ -18,8 +20,10 @@ import java.util.UUID;
 /** Compact CPU model, independent of the world and GL. All cell traversal is resumable. */
 final class BrowserScene {
     static final int MAX_QUEUED_PACKETS = 128;
-    final UUID id;
-    final int revision, originX, originY, originZ, controllerMeta, tier;
+    UUID id, cacheKey;
+    int revision;
+    final int originX, originY, originZ, controllerMeta, tier;
+    final ForgeDirection front;
     int ambiguousDots, labelVersion;
     Bounds bounds;
     final String name;
@@ -42,8 +46,8 @@ final class BrowserScene {
     int axis = 1, layer, sliceGeneration;
     long rowsVersion, planeVersion;
     boolean ready, closed;
-    private BrowserPacket applying;
-    private int applyingIndex;
+    private BrowserPacket applying, packed;
+    private int applyingIndex, packedOffset, packedRemaining;
     private int planeScheduleCursor;
 
     @SuppressWarnings("unchecked")
@@ -54,6 +58,7 @@ final class BrowserScene {
         originY = header.originY;
         originZ = header.originZ;
         controllerMeta = header.projection.controllerMeta;
+        front = header.facing.getDirection();
         tier = header.tier;
         ambiguousDots = header.projection.ambiguousDots;
         Bounds b = header.projection.bounds;
@@ -92,8 +97,8 @@ final class BrowserScene {
 
     /** At most limit cheap dictionary/cell operations and never past the supplied frame deadline. */
     void advance(long deadline, int limit, boolean needsPlane) {
-        int work = 0;
-        while (work < limit && System.nanoTime() < deadline) {
+        int work = 0, packetsSinceSection = 0;
+        while (!closed && work < limit && System.nanoTime() < deadline) {
             Section old = removing.peekFirst();
             if (old != null) {
                 if (old.removing == null) old.removing = old.counts.entrySet().iterator();
@@ -117,16 +122,22 @@ final class BrowserScene {
                 removing.removeFirst();
                 continue;
             }
-            if (applying == null) {
-                applying = incoming.pollFirst();
-                applyingIndex = 0;
-            }
-            if (applying != null) {
-                if (applyOne(needsPlane)) applying = null;
-                work++;
-                continue;
-            }
             Section section = indexing.peekFirst();
+            // Interleave a renderable section with incoming packets, while draining a nearly full queue first.
+            if (section == null || packetsSinceSection < 4 || incoming.size() >= MAX_QUEUED_PACKETS / 2) {
+                if (applying == null) {
+                    applying = nextPacket();
+                    applyingIndex = 0;
+                }
+                if (applying != null) {
+                    if (applyOne(needsPlane)) {
+                        applying = null;
+                        packetsSinceSection++;
+                    }
+                    work++;
+                    continue;
+                }
+            }
             if (section != null) {
                 if (sections.get(section.key) != section) {
                     indexing.removeFirst();
@@ -154,6 +165,7 @@ final class BrowserScene {
                 work += 64;
                 if (section.cursor == 4096) {
                     indexing.removeFirst();
+                    packetsSinceSection = 0;
                     indexedSections++;
                     section.complete = true;
                     indexed.addLast(section);
@@ -190,6 +202,32 @@ final class BrowserScene {
         }
     }
 
+    private BrowserPacket nextPacket() {
+        if (packed == null) {
+            BrowserPacket next = incoming.pollFirst();
+            if (next == null || next.type != BrowserPacket.BATCH) return next;
+            packed = next;
+            packedOffset = 0;
+            packedRemaining = next.batchMembers;
+        }
+        try {
+            int length = packed.memberLength(packedOffset);
+            BrowserPacket next = packed.readMember(packedOffset, length);
+            packedOffset += 2 + length;
+            if (--packedRemaining == 0) {
+                if (packedOffset != packed.payload.length) throw new IllegalArgumentException("Trailing browser batch bytes");
+                packed = null;
+            }
+            return next;
+        } catch (RuntimeException malformed) {
+            error = "Invalid browser batch";
+            closed = true;
+            incoming.clear();
+            packed = null;
+            return null;
+        }
+    }
+
     private boolean applyOne(boolean needsPlane) {
         BrowserPacket p = applying;
         switch (p.type) {
@@ -209,7 +247,10 @@ final class BrowserScene {
                 return true;
             case BrowserPacket.SECTION:
                 Section section = new Section(p);
-                Section previous = sections.put(section.key, section);
+                Section previous = sections.get(section.key);
+                if (previous != null && Arrays.equals(previous.ids, section.ids)
+                        && Arrays.equals(previous.slots, section.slots)) return true;
+                sections.put(section.key, section);
                 if (previous == null) {
                     section.orderIndex = order.size();
                     order.add(section);
@@ -237,8 +278,11 @@ final class BrowserScene {
             case BrowserPacket.CHANNELS:
                 channelNames = p.channelNames == null ? new String[0] : p.channelNames;
                 return true;
-            case BrowserPacket.PROGRESS:
             case BrowserPacket.DONE:
+                cacheKey = p.cacheKey;
+                progress(p);
+                return true;
+            case BrowserPacket.PROGRESS:
                 progress(p);
                 return true;
             case BrowserPacket.ERROR:
@@ -259,9 +303,26 @@ final class BrowserScene {
     }
 
     boolean complete() {
-        return !closed && error.isEmpty() && ready && incoming.isEmpty() && applying == null && indexing.isEmpty()
+        return !closed && error.isEmpty() && ready && incoming.isEmpty() && packed == null && applying == null && indexing.isEmpty()
                 && removing.isEmpty()
                 && sections.size() >= totalSections;
+    }
+
+    void rebind(BrowserPacket offer) {
+        id = offer.id;
+        revision = offer.revision;
+        indexed.clear();
+        setSlice(1, 0);
+    }
+
+    long estimatedCacheBytes() {
+        long bytes = 1024L + materials.size() * 512L + rows.size() * 192L;
+        for (Section s : order) {
+            bytes += 512L + 2L * s.slots.length + 4L * s.ids.length + 8L * s.solid.length
+                    + 224L * (s.counts.size() + s.planeCounts.size());
+        }
+        for (BrowserPacket.Group group : groups.values()) bytes += 256L + group.options.length * 192L;
+        return bytes;
     }
 
     boolean planeComplete() {
@@ -391,7 +452,7 @@ final class BrowserScene {
         java.util.Iterator<Map.Entry<Object, Row>> removing;
         java.util.Iterator<Map.Entry<Object, Row>> planeRemoving;
         final int[] planeIndices = new int[3];
-        int orderIndex, neighborhoodVersion;
+        int orderIndex, neighborhoodVersion, seamVersion;
         long coarseMask;
         boolean detailed;
         int cursor, recorded, planeCursor, planeGeneration = -1;

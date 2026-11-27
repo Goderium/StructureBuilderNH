@@ -10,6 +10,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.StringJoiner;
 import java.util.function.Supplier;
+import java.util.regex.Pattern;
 
 import org.lwjgl.input.Keyboard;
 import org.lwjgl.input.Mouse;
@@ -20,12 +21,10 @@ import com.Goderium.StructureBuilderNH.common.builder.TerminalBrowser;
 import com.Goderium.StructureBuilderNH.util.Bounds;
 import com.cleanroommc.modularui.api.UpOrDown;
 import com.cleanroommc.modularui.api.drawable.IKey;
-import com.cleanroommc.modularui.drawable.GuiTextures;
 import com.cleanroommc.modularui.api.widget.Interactable;
 import com.cleanroommc.modularui.screen.viewport.ModularGuiContext;
 import com.cleanroommc.modularui.theme.WidgetThemeEntry;
 import com.cleanroommc.modularui.widget.ParentWidget;
-import com.cleanroommc.modularui.widgets.ButtonWidget;
 import com.cleanroommc.modularui.value.IntValue;
 
 import net.minecraft.client.Minecraft;
@@ -41,9 +40,10 @@ import net.minecraft.util.StatCollector;
 public final class TerminalBrowserWidget extends ParentWidget<TerminalBrowserWidget>
         implements Interactable, TerminalBrowser.Display {
     private enum Drawer { NONE, MATERIALS, CHANNELS }
-    private static final int X = 9, RIGHT = 307, TOP = 47, BOTTOM = 187, SIDE = 197, CHANNEL_SIDE = 174;
+    private static final int X = 9, RIGHT = 307, TOP = 47, BOTTOM = 187, SIDE = 197, CHANNEL_SIDE = 166;
     private static final int LIST = 67, PANEL_END = 206, LINE = 17, BUTTON = 17;
-    private static final int CHANNEL_ROWS = 4, CHANNEL_HEIGHT = 28, ACTION_Y = 187;
+    private static final int CHANNEL_ROWS = 5, CHANNEL_HEIGHT = 23, ACTION_Y = 187;
+    private static final Pattern CHANNEL_NUMBERS = Pattern.compile("[0-9]*");
     private static final int DETAIL_TOP = TOP + 3, DETAIL_PADDING = 4, DETAIL_TEXT_WIDTH = 108,
             DETAIL_ROWS = 8, DETAIL_LINE = 11;
     private enum Control {
@@ -62,18 +62,34 @@ public final class TerminalBrowserWidget extends ParentWidget<TerminalBrowserWid
 
     private static final class Channel {
         final String key;
-        final int min, max;
+        final int min, declaredMax;
         final ChannelBlockLabel label;
-        boolean upgrade;
         String site = "";
-        int value, pending;
+        int value, pending, max;
 
         Channel(String key, int value, int min, int max) {
             this.key = key;
             this.value = value;
             this.min = min;
-            this.max = max;
-            label = new ChannelBlockLabel(key, min, max);
+            this.declaredMax = this.max = max;
+            label = new ChannelBlockLabel(key, min);
+        }
+
+        void useScan(Map<String, Integer> limits) {
+            Integer scanned = limits.get(key);
+            max = declaredMax == Integer.MAX_VALUE && scanned != null && scanned >= Math.max(1, min)
+                    ? scanned : declaredMax;
+        }
+
+        int normalize(int value) {
+            if (value == 0 && !key.isEmpty()) return 0;
+            return cap(value, Math.max(1, min), max);
+        }
+
+        int step(int from, int direction) {
+            int value = normalize(from);
+            if (!key.isEmpty() && direction < 0 && value == Math.max(1, min)) return 0;
+            return normalize(cap((long) value + direction, 0, Integer.MAX_VALUE));
         }
     }
 
@@ -81,21 +97,19 @@ public final class TerminalBrowserWidget extends ParentWidget<TerminalBrowserWid
     private final Supplier<String> title;
     private final List<Channel> channels = new ArrayList<>();
     private final Channel[] editingRows = new Channel[CHANNEL_ROWS];
-    private final Set<String> replacementTargets = new LinkedHashSet<>();
-    private final Set<String> excludedTargets = new LinkedHashSet<>();
-    private boolean scopeEdited;
     private final RenderItem icons = new RenderItem();
     private BrowserRenderer model = new BrowserRenderer();
     private Drawer drawer = Drawer.NONE;
     private String fullText = "";
-    private boolean dual, isolated, hatches, writable, dirty, dragMap;
+    private boolean dual, isolated, hatches, writable, sitePending, dirty, dragMap;
     private int axis = 1, layer, scroll, focus = -1, drag = -1, lastX, lastY, travel;
     private long generation = -1;
     private int sequence;
     private BrowserRenderer.Pick selected, hovered;
     private BrowserRenderer.Pick restorePick;
     private boolean restoreFocus;
-    private int modelRevision = -1;
+    private int modelRevision = -1, controllerMeta = -1;
+    private long limitsRefresh;
     private int lastHitX = Integer.MIN_VALUE, lastHitY, lastHitSections;
 
     public TerminalBrowserWidget(TerminalBrowser port, Supplier<String> title) {
@@ -104,14 +118,10 @@ public final class TerminalBrowserWidget extends ParentWidget<TerminalBrowserWid
         for (int i = 0; i < CHANNEL_ROWS; i++) {
             final int row = i;
             IntValue.Dynamic v = new IntValue.Dynamic(() -> rowValue(row), n -> setRow(row, n));
-            ChannelLevelField field = new ChannelLevelField(v::getIntValue, n -> setRow(row, n)) {
-                @Override public Result onMousePressed(int button) {
-                    if (button == 1) { back(); return Result.SUCCESS; }
-                    return super.onMousePressed(button);
-                }
+            ChannelLevelField field = new ChannelLevelField(v::getIntValue,
+                    (from, direction) -> scrollRow(row, from, direction), () -> rowMaximum(row)) {
                 @Override public void onFocus(ModularGuiContext context) {
                     editingRows[row] = channelAt(row);
-                    if (writable && editingRows[row] != null && editingRows[row].upgrade) selectTarget(editingRows[row]);
                     super.onFocus(context);
                 }
                 @Override public void onRemoveFocus(ModularGuiContext context) {
@@ -119,38 +129,21 @@ public final class TerminalBrowserWidget extends ParentWidget<TerminalBrowserWid
                     finally { editingRows[row] = null; }
                 }
             };
-            child(field.value(v).numbersInt(0, Integer.MAX_VALUE).pos(RIGHT - 36, LIST + i * CHANNEL_HEIGHT + 5).size(33, 16)
-                    .setEnabledIf(w -> channelAt(row) != null));
-            child(new ButtonWidget<>().pos(CHANNEL_SIDE + 2, LIST + i * CHANNEL_HEIGHT + 13).size(14, 13)
-                    .overlay((ctx, x, y, w, h, theme) -> {
-                        Channel c = channelAt(row);
-                        if (c != null) (replacementTargets.contains(c.key) ? GuiTextures.CHECK_BOX_FULL : GuiTextures.CHECK_BOX_EMPTY)
-                                .draw(ctx, x + 1, y + 1, 12, 12, theme);
-                    }).tooltip(t -> t.addLine(IKey.str(tr("replaceChannel"))))
-                    .onMousePressed(button -> {
-                        if (button != 0) return false;
-                        getContext().removeFocus();
-                        Channel c = channelAt(row);
-                        if (c == null || !c.upgrade || !writable) return false;
-                        if (replacementTargets.remove(c.key)) excludedTargets.add(c.key);
-                        else {
-                            replacementTargets.add(c.key);
-                            excludedTargets.remove(c.key);
-                        }
-                        scopeEdited = true;
-                        return true;
-                    }).setEnabledIf(w -> writable && channelAt(row) != null && channelAt(row).upgrade));
+            field.tooltipDynamic(t -> {
+                Channel c = channelAt(row);
+                if (c == null) return;
+                if (!c.key.isEmpty() && c.value == 0) t.addLine(IKey.str(tr("inheritMainChannel")));
+                t.addLine(IKey.str(c.label.range(c.max)));
+                if (!c.site.isEmpty()) t.addLine(IKey.str(c.site));
+                if (writable) t.addLine(IKey.str(tr("browser.levelHint")));
+            }).tooltipAutoUpdate(true);
+            child(field.value(v).numbersInt(n -> {
+                        Channel c = rowChannel(row);
+                        return c == null ? 0 : c.normalize(n);
+                    }).setPattern(CHANNEL_NUMBERS)
+                    .pos(RIGHT - 36, LIST + i * CHANNEL_HEIGHT + 3).size(33, 16)
+                    .setEnabledIf(w -> !sitePending && channelAt(row) != null));
         }
-    }
-
-    private void selectTarget(Channel channel) {
-        replacementTargets.add(channel.key);
-        excludedTargets.remove(channel.key);
-        scopeEdited = true;
-    }
-
-    private boolean canApply() {
-        return dirty || scopeEdited || !replacementTargets.isEmpty();
     }
 
     private Channel channelAt(int row) {
@@ -158,17 +151,31 @@ public final class TerminalBrowserWidget extends ParentWidget<TerminalBrowserWid
         return drawer == Drawer.CHANNELS && i >= 0 && i < channels.size() ? channels.get(i) : null;
     }
 
+    private Channel rowChannel(int row) {
+        return editingRows[row] != null ? editingRows[row] : channelAt(row);
+    }
+
     private int rowValue(int row) {
-        Channel c = editingRows[row] != null ? editingRows[row] : channelAt(row);
-        return c == null ? 0 : c.value;
+        Channel c = rowChannel(row);
+        return c == null ? 0 : c.normalize(c.value);
+    }
+
+    private int rowMaximum(int row) {
+        Channel c = rowChannel(row);
+        return c == null ? Integer.MAX_VALUE : c.max;
+    }
+
+    private int scrollRow(int row, int from, int direction) {
+        Channel c = rowChannel(row);
+        return c == null ? 0 : setRow(row, c.step(from, direction));
     }
 
     private int setRow(int row, int n) {
-        Channel c = editingRows[row] != null ? editingRows[row] : channelAt(row);
+        Channel c = rowChannel(row);
         if (c == null || !channels.contains(c)) return 0;
-        int value = n <= 0 && !c.key.isEmpty() ? 0 : cap(n, Math.max(1, c.min), c.max);
+        if (sitePending) return c.value;
+        int value = c.normalize(n);
         if (value != c.value) {
-            if (writable && c.upgrade) selectTarget(c);
             c.value = value;
             dirty = true;
             c.pending = ++sequence;
@@ -196,13 +203,6 @@ public final class TerminalBrowserWidget extends ParentWidget<TerminalBrowserWid
         for (int i = 0; i < count; i++) {
             String key = readStringSafe(b);
             Channel c = channel(old, key, b.readVarIntFromBuffer(), b.readVarIntFromBuffer(), b.readVarIntFromBuffer(), ack);
-            c.upgrade = b.readBoolean();
-            boolean previouslySelected = b.readBoolean();
-            if (!c.upgrade) replacementTargets.remove(key);
-            else if (!scopeEdited) {
-                if (previouslySelected) replacementTargets.add(key);
-                else replacementTargets.remove(key);
-            }
             c.site = "";
             if (b.readBoolean()) {
                 int size = b.readVarIntFromBuffer();
@@ -215,13 +215,20 @@ public final class TerminalBrowserWidget extends ParentWidget<TerminalBrowserWid
                                 + (partial ? "siteLevelsPartial" : "siteLevels"), found);
             }
         }
-        replacementTargets.removeAll(old.keySet());
-        excludedTargets.removeAll(old.keySet());
+        sitePending = b.isReadable() && b.readBoolean();
+        if (b.isReadable()) controllerMeta = b.readVarIntFromBuffer();
+        refreshChannelLimits();
+    }
+
+    private void refreshChannelLimits() {
+        limitsRefresh = System.nanoTime() + 500_000_000L;
+        Map<String, Integer> limits = ChannelBlockLabel.scannedMaximums(controllerMeta);
+        for (Channel c : channels) c.useScan(limits);
     }
 
     private Channel channel(Map<String, Channel> old, String key, int value, int min, int max, int ack) {
         Channel c = old.remove(key);
-        if (c == null || c.min != min || c.max != max) c = new Channel(key, value, min, max);
+        if (c == null || c.min != min || c.declaredMax != max) c = new Channel(key, value, min, max);
         if (c.pending <= ack) c.value = value;
         else dirty = true;
         channels.add(c);
@@ -230,7 +237,10 @@ public final class TerminalBrowserWidget extends ParentWidget<TerminalBrowserWid
 
     @Override
     public void accept(BrowserPacket packet) {
-        if (packet.type == BrowserPacket.HEADER && packet.revision != modelRevision) {
+        boolean offer = packet.type == BrowserPacket.CACHE_OFFER;
+        boolean reused = offer && generation >= 0 && model.restoreCached(packet);
+        if (offer && generation >= 0) port.answerCache(generation, packet, reused);
+        if ((packet.type == BrowserPacket.HEADER || reused) && packet.revision != modelRevision) {
             modelRevision = packet.revision;
             // Palette ids belong to one revision. Re-resolve the same position after its section arrives.
             if (selected != null) {
@@ -241,7 +251,7 @@ public final class TerminalBrowserWidget extends ParentWidget<TerminalBrowserWid
             focus = -1;
             details.clear();
         }
-        model.accept(packet);
+        if (!offer) model.accept(packet);
         lastHitX = Integer.MIN_VALUE;
     }
 
@@ -256,13 +266,11 @@ public final class TerminalBrowserWidget extends ParentWidget<TerminalBrowserWid
         restorePick = null;
         restoreFocus = false;
         details.clear();
-        modelRevision = -1;
+        modelRevision = controllerMeta = -1;
+        limitsRefresh = 0;
         channels.clear();
         java.util.Arrays.fill(editingRows, null);
-        replacementTargets.clear();
-        excludedTargets.clear();
-        scopeEdited = false;
-        isolated = dual = hatches = writable = dirty = false;
+        isolated = dual = hatches = writable = sitePending = dirty = false;
         axis = 1;
         focus = drag = -1;
         scroll = 0;
@@ -387,7 +395,6 @@ public final class TerminalBrowserWidget extends ParentWidget<TerminalBrowserWid
         if (dual) {
             rect(split, TOP, 1, BOTTOM - TOP, RULE);
             model.drawSlice(ox + split + 1, oy + TOP, end - split - 1, BOTTOM - TOP, ax, ay);
-            if (!model.sliceReady()) line(tr("browser.loadingSlice"), split + 4, TOP + 4, end - split - 8, MUTED);
         }
         if (drag < 0 && (ax != lastHitX || ay != lastHitY || lastHitSections != model.loadedSections())) {
             hovered = !overDetails() && inside(X, TOP, end - X, BOTTOM - TOP) ?
@@ -396,16 +403,13 @@ public final class TerminalBrowserWidget extends ParentWidget<TerminalBrowserWid
             lastHitY = ay;
             lastHitSections = model.loadedSections();
         }
-        if (b == null || !model.ready() && model.loadedSections() == 0) {
-            String error = model.error();
-            line(error == null || error.isEmpty() ? tr("browser.loading") : localError(error),
-                    X + 4, TOP + 6, end - X - 8, ACCENT);
-        }
+        String error = model.error();
+        if (!error.isEmpty()) line(localError(error), X + 4, TOP + 6, end - X - 8, ACCENT);
         key(end - 41, BOTTOM - BUTTON, 41, tr("browser.reset"), false, true);
         drawSlider(b);
         if (drawer != Drawer.NONE) drawDrawer();
         if (selected != null) drawDetails();
-        drawFooter();
+        drawFooter(split, end);
     }
 
     private String localError(String message) {
@@ -430,14 +434,16 @@ public final class TerminalBrowserWidget extends ParentWidget<TerminalBrowserWid
         line(text, right - labelWidth, 194, labelWidth, MUTED);
     }
 
-    private void drawFooter() {
+    private void drawFooter(int split, int end) {
         rect(X, 209, RIGHT - X, 1, RULE);
         String status = fullText;
-        if (status.isEmpty() && hovered != null) status = pickName(hovered) + "   " + coords(hovered);
-        if (status.isEmpty() && !model.ready()) status = model.error() == null || model.error().isEmpty()
-                ? tr("browser.loading") + "  " + model.loadedSections() + "/" + model.totalSections()
-                : localError(model.error());
-        if (status.isEmpty()) status = tr(dual ? "browser.sliceControls" : "browser.controls");
+        if (status.isEmpty() && hovered != null
+                && (selected == null || selected.x != hovered.x || selected.y != hovered.y || selected.z != hovered.z))
+            status = pickName(hovered) + "   " + coords(hovered);
+        if (status.isEmpty()) {
+            boolean overSlice = dual && inside(split + 1, TOP, end - split - 1, BOTTOM - TOP);
+            status = tr(overSlice ? "browser.sliceControls" : "browser.controls");
+        }
         line(status, X, 217, RIGHT - X, MUTED);
     }
 
@@ -455,8 +461,6 @@ public final class TerminalBrowserWidget extends ParentWidget<TerminalBrowserWid
     private void drawDrawer() {
         int left = drawerLeft();
         rect(left, TOP, RIGHT - left, 159, WELL);
-        String caption = drawer == Drawer.MATERIALS ? tr("materials") : tr("channels");
-        line(caption, left + 4, TOP + 5, RIGHT - left - 24, ACCENT);
         key(RIGHT - 15, TOP, 15, "×", false, true);
         if (drawer == Drawer.CHANNELS) {
             drawChannels();
@@ -466,23 +470,25 @@ public final class TerminalBrowserWidget extends ParentWidget<TerminalBrowserWid
     }
 
     private void drawChannels() {
+        if (System.nanoTime() >= limitsRefresh) refreshChannelLimits();
+        if (sitePending) line(tr("checkingSite"), CHANNEL_SIDE + 3, TOP + 5, RIGHT - CHANNEL_SIDE - 24, MUTED);
         scroll = cap(scroll, 0, Math.max(0, channels.size() - CHANNEL_ROWS));
         int inherited = channels.isEmpty() ? 1 : channels.get(0).value;
         for (int i = 0; i < CHANNEL_ROWS && scroll + i < channels.size(); i++) {
             Channel c = channels.get(scroll + i);
             int y = LIST + i * CHANNEL_HEIGHT;
-            ItemStack block = c.label.sample(c.value, inherited);
+            ItemStack block = sitePending ? null : c.label.sample(c.value, inherited, c.max);
+            int textX = CHANNEL_SIDE + 3, textWidth = RIGHT - CHANNEL_SIDE - 41;
             rect(CHANNEL_SIDE + 1, y, RIGHT - CHANNEL_SIDE - 2, CHANNEL_HEIGHT - 1, i % 2 == 0 ? BASE : WELL);
-            line(c.label.title(block), CHANNEL_SIDE + 3, y + 3, RIGHT - CHANNEL_SIDE - 41, TEXT);
-            int detailX = CHANNEL_SIDE + (writable && c.upgrade ? 18 : 3);
-            line(c.site.isEmpty() ? c.label.detail(block) : c.site, detailX, y + 15, RIGHT - 38 - detailX, MUTED);
+            line(c.label.name(), textX, y + 2, textWidth, TEXT);
+            if (block != null) line(block.getDisplayName(), textX, y + 12, textWidth, MUTED);
+            if (sitePending) key(RIGHT - 36, y + 3, 33, "—", false, false);
         }
         scrollBar(channels.size(), CHANNEL_ROWS, CHANNEL_ROWS * CHANNEL_HEIGHT);
-        if (writable) {
-            key(CHANNEL_SIDE + 2, ACTION_Y, 60, tr("browser.share"), false, true);
-            key(CHANNEL_SIDE + 64, ACTION_Y, RIGHT - CHANNEL_SIDE - 66,
-                    tr(replacementTargets.isEmpty() ? "apply" : "checkUpgrade"), false, canApply());
-            if (inside(CHANNEL_SIDE + 2, ACTION_Y, 60, BUTTON)) fullText = tr("shareHelp");
+        if (writable || sitePending) {
+            key(CHANNEL_SIDE + 2, ACTION_Y, 60, tr("browser.share"), false, writable && !sitePending);
+            key(CHANNEL_SIDE + 64, ACTION_Y, RIGHT - CHANNEL_SIDE - 66, tr("apply"), false, writable && !sitePending && dirty);
+            if (!sitePending && inside(CHANNEL_SIDE + 2, ACTION_Y, 60, BUTTON)) fullText = tr("shareHelp");
         }
     }
 
@@ -591,6 +597,7 @@ public final class TerminalBrowserWidget extends ParentWidget<TerminalBrowserWid
         if ((drawer == Drawer.CHANNELS) != (next == Drawer.CHANNELS) && generation >= 0)
             port.channelsVisible(generation, next == Drawer.CHANNELS);
         drawer = next;
+        if (next == Drawer.CHANNELS) refreshChannelLimits();
         scroll = 0;
         hovered = null;
         lastHitX = Integer.MIN_VALUE;
@@ -707,15 +714,11 @@ public final class TerminalBrowserWidget extends ParentWidget<TerminalBrowserWid
             show(Drawer.NONE);
             return;
         }
-        if (drawer == Drawer.CHANNELS && writable && y >= ACTION_Y && y < ACTION_Y + BUTTON) {
+        if (drawer == Drawer.CHANNELS && writable && !sitePending && y >= ACTION_Y && y < ACTION_Y + BUTTON) {
             getContext().removeFocus();
             boolean share = inside(CHANNEL_SIDE + 2, ACTION_Y, 60, BUTTON);
             boolean apply = inside(CHANNEL_SIDE + 64, ACTION_Y, RIGHT - CHANNEL_SIDE - 66, BUTTON);
-            if (share || apply && canApply()) {
-                port.adopt(generation, new LinkedHashSet<>(replacementTargets), new LinkedHashSet<>(excludedTargets), share);
-                excludedTargets.clear();
-                scopeEdited = false;
-            }
+            if (share || apply && dirty) port.adopt(generation, share);
         } else if (drawer == Drawer.MATERIALS) {
             if (y >= LIST && y < LIST + shownRows() * LINE) {
                 List<BrowserRenderer.MaterialEntry> rows = materialRows();

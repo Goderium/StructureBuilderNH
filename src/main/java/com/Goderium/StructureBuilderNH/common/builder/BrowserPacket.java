@@ -16,11 +16,12 @@ import java.util.UUID;
 /** Window-scoped, read-only model data. It never enters the world-preview channel. */
 public final class BrowserPacket {
     public static final int HEADER = 1, SECTION = 2, MATERIALS = 3, GROUPS = 4,
-            CHANNELS = 5, PROGRESS = 6, DONE = 7, CLOSE = 8, ERROR = 9, FRAGMENT = 10;
+            CHANNELS = 5, PROGRESS = 6, DONE = 7, CLOSE = 8, ERROR = 9, FRAGMENT = 10, CACHE_OFFER = 11, BATCH = 12;
     public static final int FRAME_BYTES = 28000, MAX_BYTES = 1048576;
+    static final int BATCH_HEADER_BYTES = 24, MAX_BATCH_MEMBERS = 16;
     private static final int MAX_DICTIONARY = Integer.MAX_VALUE;
 
-    public UUID id;
+    public UUID id, cacheKey;
     public int revision, type;
     public PreviewStream.Packet projection;
     public String name = "", error = "";
@@ -38,6 +39,8 @@ public final class BrowserPacket {
     public List<Group> groups;
     public int transfer, part, parts, totalBytes;
     public byte[] payload;
+    public int batchMembers;
+    byte[] encoded;
     int wireBytes, completedSection = -1;
 
     public static final class Material {
@@ -60,6 +63,10 @@ public final class BrowserPacket {
     }
 
     public void write(PacketBuffer b) {
+        if (encoded != null) {
+            b.writeBytes(encoded);
+            return;
+        }
         b.writeByte(type);
         b.writeLong(id.getMostSignificantBits());
         b.writeLong(id.getLeastSignificantBits());
@@ -105,8 +112,17 @@ public final class BrowserPacket {
                 }
                 break;
             case CHANNELS: strings(b, channelNames); break;
-            case PROGRESS:
-            case DONE: progress(b); break;
+            case PROGRESS: progress(b); break;
+            case DONE:
+                progress(b);
+                if (cacheKey != null) writeCacheKey(b);
+                break;
+            case CACHE_OFFER: writeCacheKey(b); break;
+            case BATCH:
+                b.writeByte(batchMembers);
+                b.writeShort(payload.length);
+                b.writeBytes(payload);
+                break;
             case CLOSE: break;
             case ERROR: string(b, error); break;
             case FRAGMENT:
@@ -179,8 +195,20 @@ public final class BrowserPacket {
                 }
                 break;
             case CHANNELS: p.channelNames = strings(b); break;
-            case PROGRESS:
-            case DONE: p.readProgress(b); break;
+            case PROGRESS: p.readProgress(b); break;
+            case DONE:
+                p.readProgress(b);
+                if (b.isReadable()) p.cacheKey = new UUID(b.readLong(), b.readLong());
+                break;
+            case CACHE_OFFER: p.cacheKey = new UUID(b.readLong(), b.readLong()); break;
+            case BATCH:
+                p.batchMembers = count(b.readUnsignedByte(), MAX_BATCH_MEMBERS);
+                int payloadBytes = count(b.readUnsignedShort(), FRAME_BYTES - BATCH_HEADER_BYTES);
+                if (p.batchMembers < 2 || payloadBytes < p.batchMembers * 23 || payloadBytes != b.readableBytes())
+                    throw new IllegalArgumentException("Invalid browser batch");
+                p.payload = new byte[payloadBytes];
+                b.readBytes(p.payload);
+                break;
             case CLOSE: break;
             case ERROR: p.error = string(b); break;
             case FRAGMENT:
@@ -197,11 +225,42 @@ public final class BrowserPacket {
         return p;
     }
 
+    boolean batchable() {
+        return type == SECTION || type == MATERIALS || type == GROUPS;
+    }
+
+    /** Keep the packed frame in the queue and decode one member inside the indexing budget. */
+    public int memberLength(int offset) {
+        if (offset < 0 || offset > payload.length - 2) throw new IllegalArgumentException("Missing browser member");
+        int length = (payload[offset] & 255) << 8 | (payload[offset + 1] & 255);
+        if (length < 21 || length > payload.length - offset - 2)
+            throw new IllegalArgumentException("Invalid browser member length");
+        return length;
+    }
+
+    public BrowserPacket readMember(int offset, int length) {
+        PacketBuffer b = new PacketBuffer(Unpooled.wrappedBuffer(payload, offset + 2, length));
+        try {
+            int childType = b.getUnsignedByte(b.readerIndex());
+            if (childType != SECTION && childType != MATERIALS && childType != GROUPS)
+                throw new IllegalArgumentException("Invalid browser member type");
+            BrowserPacket child = read(b);
+            if (!id.equals(child.id) || revision != child.revision || b.isReadable())
+                throw new IllegalArgumentException("Mismatched browser member");
+            return child;
+        } finally { b.release(); }
+    }
+
     private static PreviewStream.Packet projection(PacketBuffer b, BrowserPacket owner, int type) {
         PreviewStream.Packet p = new PreviewStream.Packet(); p.read(b, false);
         if (p.type != type || !owner.id.equals(p.id) || p.revision != owner.revision)
             throw new IllegalArgumentException("Mismatched browser projection");
         return p;
+    }
+
+    private void writeCacheKey(PacketBuffer b) {
+        b.writeLong(cacheKey.getMostSignificantBits());
+        b.writeLong(cacheKey.getLeastSignificantBits());
     }
 
     private void progress(PacketBuffer b) {
@@ -273,7 +332,7 @@ public final class BrowserPacket {
 
         public BrowserPacket accept(BrowserPacket p) {
             if (p.type != FRAGMENT) {
-                if (p.type == HEADER) {
+                if (p.type == HEADER || p.type == CACHE_OFFER) {
                     if (p.id.equals(activeId) && p.revision < activeRevision) return null;
                     resetTransfer(); activeId = p.id; activeRevision = p.revision;
                 } else if (activeId != null && (!activeId.equals(p.id) || activeRevision != p.revision)) return null;

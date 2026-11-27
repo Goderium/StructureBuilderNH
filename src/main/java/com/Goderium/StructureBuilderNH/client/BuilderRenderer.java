@@ -31,11 +31,13 @@ import net.minecraft.client.resources.IResourceManager;
 import net.minecraft.client.resources.IReloadableResourceManager;
 import net.minecraft.client.settings.KeyBinding;
 import net.minecraft.entity.Entity;
+import net.minecraft.entity.EntityLivingBase;
 import net.minecraft.entity.player.EntityPlayer;
 import net.minecraft.item.ItemStack;
 import net.minecraft.util.ChunkCoordinates;
 import net.minecraft.util.MathHelper;
 import net.minecraft.util.StatCollector;
+import net.minecraft.util.Vec3;
 import net.minecraft.util.AxisAlignedBB;
 import net.minecraft.world.ChunkPosition;
 import net.minecraft.world.World;
@@ -110,6 +112,7 @@ public final class BuilderRenderer extends BuilderProxy {
     private boolean preferGlassBatch = true;
     private boolean sampledReleasedSite;
     private final List<View> visibleControllers = new ArrayList<>();
+    private boolean visibleSiteMarkers;
     private long compilations;
     private String aimedMarker;
     private int aimedColor;
@@ -574,7 +577,7 @@ public final class BuilderRenderer extends BuilderProxy {
         }
 
         boolean texturedMarkers() {
-            return textured && (layers & PreviewStream.SHELL) != 0;
+            return !locateHatches && textured && (layers & PreviewStream.SHELL) != 0;
         }
 
         boolean controllerOutlineOnly() {
@@ -708,7 +711,8 @@ public final class BuilderRenderer extends BuilderProxy {
 
         boolean outlineOnly() {
             // Follow the mesh on screen until the replacement for this section is ready.
-            return (owner.layers & PreviewStream.SHELL) != 0 && (faces != 0 ? facesTextured : owner.textured);
+            return !owner.locateHatches && (owner.layers & PreviewStream.SHELL) != 0
+                    && (faces != 0 ? facesTextured : owner.textured);
         }
 
         private void discardStagedColor() {
@@ -917,9 +921,9 @@ public final class BuilderRenderer extends BuilderProxy {
                 long shell = solid[i];
                 long changed = occupied[i] ^ mask[i];
                 hasShell |= (shell & ~mask[i]) != 0;
-                hasHatches |= (hatch[i] & ~mask[i]) != 0;
+                hasHatches |= (hatch[i] & (owner.locateHatches ? -1L : ~mask[i])) != 0;
                 shellChanged |= (changed & shell) != 0;
-                if ((changed & hatch[i]) != 0) {
+                if (!owner.locateHatches && (changed & hatch[i]) != 0) {
                     hatchChanged = true;
                     borders |= borderSides(i, changed & hatch[i]);
                 }
@@ -972,6 +976,7 @@ public final class BuilderRenderer extends BuilderProxy {
     private void reloadPreviewTextures() {
         if (!textureReload) return;
         textureReload = false;
+        BrowserRenderer.clearCache();
         BlockPreviewTextures.clear();
         PreviewConnectedTextures.clear();
         for (View view : views.values()) {
@@ -1107,6 +1112,7 @@ public final class BuilderRenderer extends BuilderProxy {
         drainRetiredMoveSections();
         reloadPreviewTextures();
         if (unload) {
+            BrowserRenderer.clearCache();
             occlusion.release();
             glassPass = new WorldPreviewGlass();
             observe(null);
@@ -1180,7 +1186,14 @@ public final class BuilderRenderer extends BuilderProxy {
                 view.epoch = p.epoch;
                 view.revision = p.revision;
                 view.editable = p.editable;
-                view.locateHatches = p.locateHatches;
+                if (view.locateHatches != p.locateHatches) {
+                    view.locateHatches = p.locateHatches;
+                    for (Section s : view.sections.values()) {
+                        s.clearHatches();
+                        s.updateVisibility(s.occupied);
+                        if ((p.layers & PreviewStream.SHELL) != 0) s.markFacesDirty();
+                    }
+                }
                 if (view.textured != p.textured) {
                     view.textureSwitch.clear();
                     for (Section s : view.sections.values()) {
@@ -1535,8 +1548,9 @@ public final class BuilderRenderer extends BuilderProxy {
             aimedHint=!g.moving ? StatCollector.translateToLocal(
                     g.near ? "structurebuildernh.drag.hold" : "structurebuildernh.drag.remoteHold")
                     : g.limited ? StatCollector.translateToLocal("structurebuildernh.drag.limited")
-                    : StatCollector.translateToLocalFormatted("structurebuildernh.drag.controls",
-                            g.displayDistance(), PreviewTooltip.modifierName(mc));
+                    : StatCollector.translateToLocalFormatted("structurebuildernh.drag.distance", g.displayDistance())
+                            + " · " + StatCollector.translateToLocal(axisKey == 0 ? "structurebuildernh.drag.adjust"
+                                    : pitchGesture ? "structurebuildernh.drag.pitch" : "structurebuildernh.drag.yaw");
             return;
         }
         ItemStack held = mc.thePlayer.getHeldItem();
@@ -1560,7 +1574,8 @@ public final class BuilderRenderer extends BuilderProxy {
                 aimedHint = label.text;
             }
             if (aimedHatch && marker.owned && (v.editable || marker.issue)) {
-                aimedAction = StatCollector.translateToLocalFormatted("structurebuildernh.hatchAction", PreviewTooltip.modifierName(mc));
+                if (!previewModifierDown()) aimedAction = StatCollector.translateToLocal("structurebuildernh.hatchAction");
+                else if (!GuiScreen.isCtrlKeyDown()) aimedAction = StatCollector.translateToLocal("structurebuildernh.openTaskAction");
                 if (aimed != null) {
                     aimedMarker = roleName("markerHatch", choiceTitle(mc, marker, aimed.style));
                     if (previewModifierDown()) aimedAction = choiceHint(mc, aimed.style);
@@ -1579,6 +1594,8 @@ public final class BuilderRenderer extends BuilderProxy {
             String name = hitName(mc, marker);
             aimedMarker = name.isEmpty() ? StatCollector.translateToLocal("structurebuildernh.browser.block") : name;
             aimedColor = 0xa8c4c8;
+            if (marker.owned && held != null && held.getItem() == BuilderItem.ITEM && previewModifierDown() && !GuiScreen.isCtrlKeyDown())
+                aimedAction = StatCollector.translateToLocal("structurebuildernh.openTaskAction");
         }
     }
 
@@ -1593,9 +1610,10 @@ public final class BuilderRenderer extends BuilderProxy {
     }
 
     private static String choiceHint(Minecraft mc, PreviewStream.Style style) {
-        if (mc.gameSettings.keyBindSneak.getKeyCode() == 0) return null;
-        String key = style.groupSelectable && previewModifierDown() ? "previewPickHint" : "previewPickSingleHint";
-        return StatCollector.translateToLocalFormatted("structurebuildernh." + key, PreviewTooltip.modifierName(mc));
+        if (mc.gameSettings.keyBindSneak.getKeyCode() == 0 || !previewModifierDown()) return null;
+        boolean group = style.groupSelectable && GuiScreen.isCtrlKeyDown();
+        return StatCollector.translateToLocal(group ? "structurebuildernh.previewPickGroupHint"
+                : "structurebuildernh.previewPickSingleHint");
     }
 
     private static String roleName(String key, String name) {
@@ -1721,6 +1739,7 @@ public final class BuilderRenderer extends BuilderProxy {
             GL11.glDepthMask(false);
             visibleHatches.clear();
             visibleControllers.clear();
+            visibleSiteMarkers = false;
             visiblePreviews.clear();
             visibleBounds.clear();
             visibleIssues.clear();
@@ -1751,8 +1770,11 @@ public final class BuilderRenderer extends BuilderProxy {
                 if (view.controller != null && (view.layers & PreviewStream.HATCH) != 0) {
                     ChunkCoordinates at = moving == null ? view.controller : moving.at;
                     if (camera.isBoxInFrustum(at.posX, at.posY, at.posZ, at.posX + 1., at.posY + 1., at.posZ + 1.)
-                            && (moving != null && !moving.released || !occupancy.occupied(at.posX, at.posY, at.posZ)))
+                            && (view.locateHatches || moving != null && !moving.released
+                                    || !occupancy.occupied(at.posX, at.posY, at.posZ))) {
                         visibleControllers.add(view);
+                        visibleSiteMarkers |= view.locateHatches;
+                    }
                 }
                 if (view.box == null) continue;
                 visiblePreviews.add(view);
@@ -1818,6 +1840,8 @@ public final class BuilderRenderer extends BuilderProxy {
             if (drawSelection && !selectedMarker) drawPick(highlighted, highlightColor);
             drawGlassSections();
             drawTransitionColors();
+            if (visibleSiteMarkers) drawSiteMarkers(terminal,
+                    eye instanceof EntityLivingBase ? ((EntityLivingBase) eye).getLook(e.partialTicks) : eye.getLookVec());
             drawBounds();
             drawIssues();
             for (View view : contactViews) contactsByTask.get(view.id).drawSurface();
@@ -1886,14 +1910,14 @@ public final class BuilderRenderer extends BuilderProxy {
         GL11.glDepthMask(held);
         GL11.glPolygonOffset(1f, 1f);
         for (Section s : visibleHatches) {
-            if (s.marks == 0 || s.outlineOnly()) continue;
+            if (s.marks == 0 || s.outlineOnly() || s.owner.locateHatches) continue;
             selectMarkerSection(s);
             sectionLists.add(s.marks, renderGrip(s.owner));
         }
         sectionLists.flush();
         Tessellator t = Tessellator.instance;
         for (View view : visibleControllers) {
-            if (view.controllerOutlineOnly()) continue;
+            if (view.locateHatches || view.controllerOutlineOnly()) continue;
             PreviewGrip moving = renderGrip(view);
             ChunkCoordinates at = moving == null ? view.controller : moving.at;
             ChunkCoordinates source = view.controller;
@@ -1907,6 +1931,37 @@ public final class BuilderRenderer extends BuilderProxy {
         }
         GL11.glDisable(GL11.GL_POLYGON_OFFSET_FILL);
         GL11.glDepthMask(false);
+    }
+
+    private void drawSiteMarkers(boolean held, Vec3 look) {
+        GL11.glPushMatrix();
+        // Bring lines slightly forward without drawing a second surface at the block's depth.
+        if (look != null) GL11.glTranslated(-look.xCoord * .025, -look.yCoord * .025, -look.zCoord * .025);
+        GL11.glEnable(GL11.GL_DEPTH_TEST);
+        GL11.glDepthFunc(GL11.GL_LEQUAL);
+        GL11.glDepthMask(false);
+        GL11.glDisable(GL11.GL_TEXTURE_2D);
+        GL11.glDisable(GL11.GL_ALPHA_TEST);
+        GL11.glLineWidth(held ? 12f : 4f);
+        GL11.glEnable(GL11.GL_BLEND);
+        GL11.glBlendFunc(EXTBlendColor.GL_CONSTANT_ALPHA_EXT, EXTBlendColor.GL_ONE_MINUS_CONSTANT_ALPHA_EXT);
+        GL14.glBlendColor(0, 0, 0, held ? .85f : 1f);
+        for (Section s : visibleHatches)
+            if (s.owner.locateHatches) sectionLists.add(s.marks, renderGrip(s.owner));
+        sectionLists.flush();
+        Tessellator t = Tessellator.instance;
+        t.startDrawing(GL11.GL_LINES);
+        t.setColorOpaque_I(siteMarkerTint(HOST_COLOR));
+        double x = Math.floor(cameraX), y = Math.floor(cameraY), z = Math.floor(cameraZ);
+        GL11.glTranslated(x, y, z);
+        for (View view : visibleControllers) {
+            if (!view.locateHatches) continue;
+            PreviewGrip moving = renderGrip(view);
+            ChunkCoordinates at = moving == null ? view.controller : moving.at;
+            emitBox(t, at.posX - x, at.posY - y, at.posZ - z, at.posX - x + 1, at.posY - y + 1, at.posZ - z + 1);
+        }
+        t.draw();
+        GL11.glPopMatrix();
     }
 
     private static void markerCell(Tessellator t, int x, int y, int z, int sides, int color) {
@@ -2028,7 +2083,10 @@ public final class BuilderRenderer extends BuilderProxy {
             if (meshSteps == 0 && (view.partialFaces == null || view.partialFaces == s)
                     && (compilations & 1) == 0 && (shell && s.dirty && s.replaceFaces
                     || hatch && s.replaceMarks && s.needsMarkFaces())) compileNext(s);
-            if (hatch && !s.outlineOnly() && s.marks != 0) visibleHatches.add(s);
+            if (hatch && !s.outlineOnly() && s.marks != 0) {
+                visibleHatches.add(s);
+                visibleSiteMarkers |= view.locateHatches;
+            }
             if (s.needsMesh(view.layers)) queueVisibleMesh(s);
             if (shell && s.drawableFaces() != 0) {
                 if (stableShellCandidate == null && view.textured && s.textured && !s.dirty && !s.site.dirty
@@ -2039,7 +2097,7 @@ public final class BuilderRenderer extends BuilderProxy {
                     if (s.colorStart == 0) colorSections.add(s);
                     else transitionColors.add(s);
                 }
-                else if (hatches && (s.hasHatches || s.containsController())) roleTextures.add(s);
+                else if (hatches && !view.locateHatches && (s.hasHatches || s.containsController())) roleTextures.add(s);
                 else texturedSections.add(s);
             }
         }
@@ -2409,6 +2467,17 @@ public final class BuilderRenderer extends BuilderProxy {
         if (list == 0) return 0;
         beginSectionList(list, s);
         Tessellator t = Tessellator.instance;
+        if (view.locateHatches) {
+            t.startDrawing(GL11.GL_LINES);
+            HatchMesh.outline(s.hatch, (x, y, z) -> hatchType(s, x, y, z), (axis, x, y, z, role) -> {
+                t.setColorOpaque_I(siteMarkerTint(HATCH_ROLES[role - 1].color));
+                t.addVertex(x, y, z);
+                t.addVertex(x + (axis == 0 ? 1 : 0), y + (axis == 1 ? 1 : 0), z + (axis == 2 ? 1 : 0));
+            });
+            t.draw();
+            endSectionList();
+            return list;
+        }
         t.startDrawingQuads();
         HatchMesh.Boundary boundary = hatchBoundary(s);
         for (int word = 0; word < 64; word++) {
@@ -2437,6 +2506,10 @@ public final class BuilderRenderer extends BuilderProxy {
             int word = slot >> 6;
             return neighbor != null && (neighbor.hatch[word] & ~neighbor.occupied[word] & (1L << (slot & 63))) != 0;
         };
+    }
+
+    private static int siteMarkerTint(int color) {
+        return color + shade(0xffffff - color, 55);
     }
 
     private static int markerTint(int color) {
@@ -2848,16 +2921,17 @@ public final class BuilderRenderer extends BuilderProxy {
             if (near == null) return 0;
         }
         int i = (x & 15) | (z & 15) << 4 | (y & 15) << 8;
-        if ((near.hatch[i >> 6] & ~near.occupied[i >> 6] & (1L << i)) == 0) return 0;
-        if (near.roleIndex == null || near.roleIndex.hidden != near.occupied) {
-            near.roleIndex = new HatchMesh.Roles(near.hatch, near.occupied, near.markerRoles(near.owner));
+        long[] hidden = near.owner.locateHatches ? EMPTY_MASK : near.occupied;
+        if ((near.hatch[i >> 6] & ~hidden[i >> 6] & (1L << i)) == 0) return 0;
+        if (near.roleIndex == null || near.roleIndex.hidden != hidden) {
+            near.roleIndex = new HatchMesh.Roles(near.hatch, hidden, near.markerRoles(near.owner));
         }
         return near.roleIndex.type(i);
     }
 
     static int markerData(Section s, int i, int side, boolean textured) {
         int ordinary = textured ? 0xf000f0 : 0;
-        if ((s.owner.layers & PreviewStream.HATCH) == 0) return ordinary;
+        if (s.owner.locateHatches || (s.owner.layers & PreviewStream.HATCH) == 0) return ordinary;
         int x = i & 15, y = i >> 8, z = i >> 4 & 15;
         ChunkCoordinates host = s.owner.controller;
         if (host != null && s.x + x == host.posX && s.y + y == host.posY && s.z + z == host.posZ)

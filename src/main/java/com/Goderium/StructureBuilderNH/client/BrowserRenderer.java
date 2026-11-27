@@ -19,18 +19,21 @@ import org.lwjgl.opengl.GL13;
 import org.lwjgl.opengl.GL14;
 import org.lwjgl.opengl.GLContext;
 
-import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.Deque;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.PriorityQueue;
+import java.util.Set;
 import java.util.UUID;
 
 /** Window-owned, projection-only structure browser. All public coordinates are controller-relative. */
@@ -40,9 +43,14 @@ public final class BrowserRenderer implements AutoCloseable {
     private static final int PROXY_SECTIONS = 8;
     private static final int PROXY_THRESHOLD = 384, PICK_STEPS = 8192;
     private static final int CONSTANT_ALPHA = 0x8003, ONE_MINUS_CONSTANT_ALPHA = 0x8004;
-    private static final long FRAME_WINDOW = 16_000_000L, FRAME_BUDGET = 12_000_000L;
+    private static final long FRAME_WINDOW = 8_000_000L, FRAME_BUDGET = 12_000_000L;
+    private static final long STREAM_FRAME_BUDGET = 14_000_000L;
     private static final Deque<State> RETIRED = new ArrayDeque<>();
     private static final Deque<Framebuffer> RETIRED_IMAGES = new ArrayDeque<>();
+    private static final long CACHE_BYTES = 128L * 1024 * 1024;
+    private static final Map<UUID, CachedScene> MODELS = new LinkedHashMap<>(16, .75f, true);
+    private static long cachedBytes, resourceGeneration;
+    private static State warmState;
     private static final int[] DX = { -1, 1, 0, 0, 0, 0 };
     private static final int[] DY = { 0, 0, -1, 1, 0, 0 };
     private static final int[] DZ = { 0, 0, 0, 0, -1, 1 };
@@ -148,7 +156,7 @@ public final class BrowserRenderer implements AutoCloseable {
             assembler.clear();
             return;
         }
-        if (complete == null) return;
+        if (complete == null || complete.type == BrowserPacket.CLOSE) return;
         if (complete.id.equals(errorId) && complete.revision < errorRevision) return;
         if (complete.type == BrowserPacket.ERROR) {
             if (state != null && state.scene.id.equals(complete.id) && complete.revision < state.scene.revision) return;
@@ -179,39 +187,76 @@ public final class BrowserRenderer implements AutoCloseable {
                 if (!before.equals(next) || finalFit) {
                     double diagonal = Math.sqrt(square(next.maxX - (double) next.minX + 1)
                             + square(next.maxY - (double) next.minY + 1) + square(next.maxZ - (double) next.minZ + 1)) * .56;
-                    if (!cameraTouched && (finalFit || diagonal > camera.radius * 1.45)) camera.reset(next);
+                    if (!cameraTouched && (finalFit || diagonal > camera.radius * 1.45))
+                        camera.reset(next, state.scene.front);
                     if (!mapTouched && (finalFit || diagonal > mapCamera.radius * 1.45)) resetMapCamera();
                 }
                 return;
             }
-            State previous = state;
-            externalError = "";
-            errorId = null;
-            state = new State(new BrowserScene(complete));
-            if (fallback != null) retire(fallback);
-            boolean newSession = previous == null || !previous.scene.id.equals(complete.id);
-            fallback = newSession ? null : previous;
-            if (newSession && previous != null) retire(previous);
-            Bounds bounds = state.scene.bounds;
-            camera.setStructureFacing(complete.facing);
-            if (newSession) {
-                cameraTouched = mapTouched = false;
-                camera.reset(bounds);
-                resetMapCamera();
-            } else {
-                // A cached plan can be complete on its first header, without a later ready transition.
-                if (complete.ready && !cameraTouched) camera.reset(bounds);
-                state.scene.setSlice(previous.scene.axis, previous.scene.layer);
-                mapCamera.x = state.scene.axis == 0 ? state.scene.layer + .5 : mapCamera.x;
-                mapCamera.y = state.scene.axis == 1 ? state.scene.layer + .5 : mapCamera.y;
-                mapCamera.z = state.scene.axis == 2 ? state.scene.layer + .5 : mapCamera.z;
-            }
-            selected = null;
-            focusKey = null;
-            focusGeneration++;
-            materialVersion = sliceVersion = -1;
-            materialList = sliceList = Collections.emptyList();
+            showState(new State(new BrowserScene(complete)));
         } else if (state != null) state.scene.enqueue(complete);
+    }
+
+    boolean restoreCached(BrowserPacket offer) {
+        if (closed || offer.cacheKey == null) return false;
+        if (state != null && state.scene.id.equals(offer.id) && offer.revision < state.scene.revision) return false;
+        if (fallback != null && offer.cacheKey.equals(fallback.scene.cacheKey)) {
+            cacheOrRetire(fallback);
+            fallback = null;
+        }
+        CachedScene cached = MODELS.get(offer.cacheKey);
+        if (cached == null || assembler.accept(offer) == null) return false;
+        MODELS.remove(offer.cacheKey);
+        cachedBytes -= cached.bytes;
+        BrowserScene scene = cached.scene;
+        scene.rebind(offer);
+        State next = new State(scene);
+        if (warmState != null && warmState.scene == scene) {
+            next.takeWholeMeshes(warmState);
+            retire(warmState);
+            warmState = null;
+        }
+        for (BrowserScene.Section section : scene.order) {
+            section.detailed = next.geometry.containsKey(new MeshKey(section, 0, 0));
+            if (!section.detailed) {
+                next.queueWhole(section);
+                if (scene.sections.size() > PROXY_THRESHOLD) next.dirtyProxy(section.orderIndex / PROXY_SECTIONS);
+            }
+        }
+        showState(next);
+        return true;
+    }
+
+    private void showState(State next) {
+        State previous = state;
+        State visible = previous != null && previous.presented ? previous : fallback;
+        int previousAxis = previous == null ? 1 : previous.scene.axis;
+        int previousLayer = previous == null ? 0 : previous.scene.layer;
+        externalError = "";
+        errorId = null;
+        boolean newSession = previous == null || !previous.scene.id.equals(next.scene.id);
+        if (fallback != null && fallback != visible) cacheOrRetire(fallback);
+        if (previous != null && previous != visible) cacheOrRetire(previous);
+        fallback = !newSession && !next.presented ? visible : null;
+        if (visible != null && visible != fallback) cacheOrRetire(visible);
+        state = next;
+        Bounds bounds = state.scene.bounds;
+        if (newSession) {
+            cameraTouched = mapTouched = false;
+            camera.reset(bounds, next.scene.front);
+            resetMapCamera();
+        } else {
+            if (next.scene.ready && !cameraTouched) camera.reset(bounds, next.scene.front);
+            state.scene.setSlice(previousAxis, previousLayer);
+            mapCamera.x = state.scene.axis == 0 ? state.scene.layer + .5 : mapCamera.x;
+            mapCamera.y = state.scene.axis == 1 ? state.scene.layer + .5 : mapCamera.y;
+            mapCamera.z = state.scene.axis == 2 ? state.scene.layer + .5 : mapCamera.z;
+        }
+        selected = null;
+        focusKey = null;
+        focusGeneration++;
+        materialVersion = sliceVersion = -1;
+        materialList = sliceList = Collections.emptyList();
     }
 
     public String name() { return state == null ? "" : state.scene.name; }
@@ -306,7 +351,7 @@ public final class BrowserRenderer implements AutoCloseable {
     public void panSlice(double dx, double dy) { mapTouched = true; mapCamera.pan(dx, dy); }
     public void resetCamera() {
         cameraTouched = mapTouched = false;
-        if (state != null) camera.reset(state.scene.bounds);
+        if (state != null) camera.reset(state.scene.bounds, state.scene.front);
         resetMapCamera();
     }
 
@@ -386,7 +431,7 @@ public final class BrowserRenderer implements AutoCloseable {
         cam.width = width;
         cam.height = height;
         try (GLScope ignored = new GLScope(x, y, width, height, null)) {
-            pump();
+            if (!map || modelViewport.width == 0) pump();
             State shown = state != null && state.presented ? state : fallback != null ? fallback : state;
             if (shown == null) return;
             FrameCache image = viewport.image;
@@ -445,22 +490,30 @@ public final class BrowserRenderer implements AutoCloseable {
         long now = System.nanoTime(), window = now / FRAME_WINDOW;
         if (window == frameWindow) return;
         frameWindow = window;
-        long deadline = now + FRAME_BUDGET;
+        long deadline = now + (state != null && state.presented && !state.scene.complete()
+                ? STREAM_FRAME_BUDGET : FRAME_BUDGET);
         drainRetired(Math.min(deadline, now + 300000L));
         if (state == null) return;
         boolean needsPlane = sliced || mapViewport.width > 0;
         state.discardOldViews(Math.min(deadline, System.nanoTime() + 300000L));
-        state.scene.advance(Math.min(deadline, System.nanoTime() + 4_400_000L), 65536, needsPlane);
+        state.scene.advance(Math.min(deadline, System.nanoTime() + 5_000_000L), 131072, needsPlane);
         for (int n = 0; n < 16 && System.nanoTime() < deadline; n++) {
             BrowserScene.Replacement replacement = state.scene.replacements.pollFirst();
             if (replacement == null) break;
             state.replace(replacement);
         }
+        enqueueIndexed(Math.min(deadline, System.nanoTime() + 1_500_000L));
+        state.rankWhole(camera);
         while (System.nanoTime() < deadline) {
             Geometry geometry = nextGeometry(needsPlane);
             if (geometry == null) break;
-            geometry.compileBatch();
-            if (geometry.finished()) {
+            if (geometry.complete) {
+                geometry.rebuildSeamBatch();
+                state.renderRevision++;
+                if (!geometry.needsWork()) state.current = null;
+            } else {
+                geometry.compileBatch();
+                if (!geometry.finished()) continue;
                 geometry.complete = true;
                 state.renderRevision++;
                 geometry.releasePrevious();
@@ -471,10 +524,40 @@ public final class BrowserRenderer implements AutoCloseable {
                 state.presented |= geometry.hasLists() || state.scene.complete();
                 state.current = null;
                 if (state.presented && fallback != null) {
-                    retire(fallback);
+                    cacheOrRetire(fallback);
                     fallback = null;
                 }
+                if (geometry.seamBatches != 0 && !geometry.stale) state.current = geometry;
             }
+        }
+        if (state.scene.sections.size() > PROXY_THRESHOLD) {
+            for (int i = 0; i < 4 && System.nanoTime() < deadline; i++) {
+                Proxy proxy = state.dirtyProxies.pollFirst();
+                if (proxy == null) break;
+                proxy.compile();
+            }
+        }
+    }
+
+    private void enqueueIndexed(long deadline) {
+        BrowserScene scene = state.scene;
+        // Handle a bounded number of completed sections before choosing a mesh job.
+        for (int n = 0; n < 128 && System.nanoTime() < deadline; n++) {
+            BrowserScene.Section completed = scene.indexed.pollFirst();
+            if (completed == null) break;
+            if (scene.sections.get(completed.key) != completed) continue;
+            state.dirtyProxy(completed.orderIndex / PROXY_SECTIONS);
+            for (int dz = -1; dz <= 1; dz++) for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
+                if (dx == 0 && dy == 0 && dz == 0) continue;
+                BrowserScene.Section neighbor = scene.sections.get(new ChunkPosition((completed.x >> 4) + dx,
+                        (completed.y >> 4) + dy, (completed.z >> 4) + dz));
+                if (neighbor != null) {
+                    if (!neighbor.detailed && Math.abs(dx) + Math.abs(dy) + Math.abs(dz) == 1)
+                        state.dirtyProxy(neighbor.orderIndex / PROXY_SECTIONS);
+                    state.refreshSeam(neighbor, BrowserBlockAccess.neighborBit(-dx, -dy, -dz));
+                }
+            }
+            state.queueWhole(completed);
         }
     }
 
@@ -482,33 +565,18 @@ public final class BrowserRenderer implements AutoCloseable {
         if (state.current != null && state.current.valid()) return state.current;
         state.current = null;
         BrowserScene scene = state.scene;
-        // Handle a bounded number of completed sections before choosing a mesh job.
-        for (int n = 0; n < 4; n++) {
-            BrowserScene.Section completed = scene.indexed.pollFirst();
-            if (completed == null) break;
-            if (scene.sections.get(completed.key) != completed) continue;
-            state.dirtyProxy(completed.orderIndex / PROXY_SECTIONS);
-            for (int dz = -1; dz <= 1; dz++) for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
-                BrowserScene.Section neighbor = scene.sections.get(new ChunkPosition((completed.x >> 4) + dx,
-                        (completed.y >> 4) + dy, (completed.z >> 4) + dz));
-                if (neighbor != null && neighbor != completed) state.invalidate(neighbor);
-            }
-            state.whole.addLast(completed);
-        }
-        Proxy dirtyProxy = state.dirtyProxies.pollFirst();
-        if (dirtyProxy != null) dirtyProxy.compile();
         if (state.priority != null && state.priority.complete) {
             BrowserScene.Section priority = state.priority;
             state.priority = null;
             Geometry g = state.get(priority, sliced ? 1 : 0, true);
-            if (!g.complete) return state.current = g;
+            if (g.needsWork()) return state.current = g;
         }
         for (int n = 0; n < 27; n++) {
             BrowserScene.Section priority = state.priorityNeighbors.pollFirst();
             if (priority == null) break;
             if (!priority.complete) continue;
             Geometry geometry = state.get(priority, sliced ? 1 : 0, true);
-            if (!geometry.complete) return state.current = geometry;
+            if (geometry.needsWork()) return state.current = geometry;
         }
         if (needsPlane) {
             List<BrowserScene.Section> plane = scene.planeSections();
@@ -518,7 +586,7 @@ public final class BrowserRenderer implements AutoCloseable {
                 if (!section.complete) break;
                 state.planeCursor++;
                 Geometry geometry = state.get(section, 1, true);
-                if (!geometry.complete) return state.current = geometry;
+                if (geometry.needsWork()) return state.current = geometry;
             }
         }
         if (focusKey != null) {
@@ -530,20 +598,15 @@ public final class BrowserRenderer implements AutoCloseable {
                 state.focusCursor++;
                 if (!section.counts.containsKey(focusKey)) continue;
                 Geometry geometry = state.get(section, 2, true);
-                if (!geometry.complete) return state.current = geometry;
+                if (geometry.needsWork()) return state.current = geometry;
             }
         }
         BrowserScene.Section section;
         int visited = 0;
-        while (visited++ < 64 && (section = state.whole.pollFirst()) != null) {
+        while (visited++ < 64 && (section = state.pollWhole()) != null) {
             if (scene.sections.get(section.key) != section || !section.complete) continue;
             Geometry geometry = state.get(section, 0, true);
-            if (!geometry.complete) return state.current = geometry;
-        }
-        for (int n = 0; n < 2; n++) {
-            Proxy proxy = state.dirtyProxies.pollFirst();
-            if (proxy == null) break;
-            proxy.compile();
+            if (geometry.needsWork()) return state.current = geometry;
         }
         return null;
     }
@@ -750,13 +813,7 @@ public final class BrowserRenderer implements AutoCloseable {
         Bounds plane = scene.axis == 0 ? new Bounds(scene.layer, b.minY, b.minZ, scene.layer, b.maxY, b.maxZ)
                 : scene.axis == 1 ? new Bounds(b.minX, scene.layer, b.minZ, b.maxX, scene.layer, b.maxZ)
                 : new Bounds(b.minX, b.minY, scene.layer, b.maxX, b.maxY, scene.layer);
-        mapCamera.reset(plane);
-        mapCamera.yaw = scene.axis == 0 ? 90 : 0;
-        mapCamera.pitch = scene.axis == 1 ? 90 : 0;
-        mapCamera.fit(plane);
-        if (scene.axis == 0) mapCamera.x = scene.layer + .5;
-        else if (scene.axis == 1) mapCamera.y = scene.layer + .5;
-        else mapCamera.z = scene.layer + .5;
+        mapCamera.resetSlice(plane, scene.axis, scene.front);
     }
 
     private static void drawSelection(BrowserCamera cam, Pick pick) {
@@ -784,8 +841,8 @@ public final class BrowserRenderer implements AutoCloseable {
         if (closed) return;
         closed = true;
         assembler.clear();
-        retire(state);
-        retire(fallback);
+        cacheOrRetire(fallback);
+        cacheOrRetire(state);
         state = fallback = null;
         selected = null;
         modelViewport.image.retire();
@@ -795,12 +852,68 @@ public final class BrowserRenderer implements AutoCloseable {
         drainRetired(System.nanoTime() + 1000000L);
     }
 
+    private static final class CachedScene {
+        final BrowserScene scene;
+        final long bytes;
+
+        CachedScene(BrowserScene scene) {
+            this.scene = scene;
+            bytes = scene.estimatedCacheBytes();
+        }
+    }
+
+    private static void cacheOrRetire(State state) {
+        if (state == null) return;
+        BrowserScene scene = state.scene;
+        if (scene == null || scene.cacheKey == null || !scene.complete()
+                || state.assets != resourceGeneration || !scene.replacements.isEmpty()) {
+            retire(state);
+            return;
+        }
+        CachedScene entry = new CachedScene(scene);
+        if (entry.bytes > CACHE_BYTES) {
+            retire(state);
+            return;
+        }
+        CachedScene replaced = MODELS.put(scene.cacheKey, entry);
+        cachedBytes += entry.bytes - (replaced == null ? 0 : replaced.bytes);
+        if (state.presented && scene.indexed.isEmpty()) {
+            retire(warmState);
+            warmState = state;
+        } else {
+            retire(state);
+            if (replaced != null && warmState != null && warmState.scene == replaced.scene) {
+                retire(warmState);
+                warmState = null;
+            }
+        }
+        Iterator<CachedScene> oldest = MODELS.values().iterator();
+        while (cachedBytes > CACHE_BYTES && oldest.hasNext()) {
+            CachedScene removed = oldest.next();
+            cachedBytes -= removed.bytes;
+            oldest.remove();
+            if (warmState != null && warmState.scene == removed.scene) {
+                retire(warmState);
+                warmState = null;
+            }
+        }
+    }
+
+    static void clearCache() {
+        resourceGeneration++;
+        MODELS.clear();
+        cachedBytes = 0;
+        retire(warmState);
+        warmState = null;
+    }
+
     private static void retire(State state) {
         if (state != null && !RETIRED.contains(state)) {
             state.scene = null;
             state.current = null;
             state.priority = null;
             state.whole.clear();
+            state.rankedWhole = null;
             state.planeMeshes.clear();
             state.focusMeshes.clear();
             state.oldViews.clear();
@@ -841,10 +954,14 @@ public final class BrowserRenderer implements AutoCloseable {
 
     private final class State {
         BrowserScene scene;
+        final long assets = resourceGeneration;
         final LinkedHashMap<MeshKey, Geometry> geometry = new LinkedHashMap<>(32, .75f, true);
         final List<Geometry> transparent = new ArrayList<>();
         final Submission[] submissions = { new Submission(0), new Submission(1), new Submission(2) };
-        final Deque<BrowserScene.Section> whole = new ArrayDeque<>();
+        final Set<BrowserScene.Section> whole = new LinkedHashSet<>();
+        PriorityQueue<BrowserScene.Section> rankedWhole;
+        ViewOrder viewOrder;
+        long rankedAt;
         Deque<MeshKey> planeMeshes = new ArrayDeque<>(), focusMeshes = new ArrayDeque<>();
         final Deque<Deque<MeshKey>> oldViews = new ArrayDeque<>();
         final int[] batchFaces = new int[BATCH * 6];
@@ -862,11 +979,52 @@ public final class BrowserRenderer implements AutoCloseable {
 
         State(BrowserScene scene) { this.scene = scene; }
 
+        void rankWhole(BrowserCamera camera) {
+            if (whole.isEmpty() && current == null) return;
+            long now = System.nanoTime();
+            if (viewOrder != null && (viewOrder.matches(camera)
+                    || whole.size() > 1024 && now - rankedAt < 32_000_000L)) return;
+            rankedAt = now;
+            viewOrder = new ViewOrder(camera, scene);
+            ViewOrder order = viewOrder;
+            rankedWhole = new PriorityQueue<>(Comparator.comparingDouble(order::score)
+                    .thenComparingInt(s -> s.orderIndex));
+            rankedWhole.addAll(whole);
+            if (current != null && current.mode == 0 && !order.visible(current.section)) {
+                queueWhole(current.section);
+                current = null;
+            }
+        }
+
+        void queueWhole(BrowserScene.Section section) {
+            if (whole.add(section) && rankedWhole != null) rankedWhole.add(section);
+        }
+
+        BrowserScene.Section pollWhole() {
+            BrowserScene.Section section = rankedWhole == null ? null : rankedWhole.poll();
+            if (section != null) whole.remove(section);
+            return section;
+        }
+
+        void takeWholeMeshes(State old) {
+            Iterator<Map.Entry<MeshKey, Geometry>> it = old.geometry.entrySet().iterator();
+            while (it.hasNext()) {
+                Map.Entry<MeshKey, Geometry> entry = it.next();
+                Geometry mesh = entry.getValue();
+                if (mesh.mode != 0 || mesh.needsWork() || !mesh.valid()
+                        || mesh.seamVersion != mesh.section.seamVersion) continue;
+                Geometry restored = new Geometry(this, mesh);
+                geometry.put(entry.getKey(), restored);
+                presented |= restored.hasLists();
+                it.remove();
+            }
+        }
+
         Geometry get(BrowserScene.Section section, int mode, boolean create) {
             int generation = mode == 1 ? planeToken() : mode == 2 ? focusGeneration : 0;
             MeshKey key = new MeshKey(section, mode, generation);
             Geometry result = geometry.get(key);
-            if (result != null && (result.stale || result.sourceVersion != section.neighborhoodVersion)) {
+            if (result != null && (result.stale || result.sourceVersion != section.neighborhoodVersion || result.seamVersion != section.seamVersion)) {
                 Geometry next = new Geometry(this, section, mode, generation);
                 next.previous = result.drawable();
                 if (next.previous != result) result.deleteOwn();
@@ -924,10 +1082,24 @@ public final class BrowserRenderer implements AutoCloseable {
                 Geometry geometry = this.geometry.get(new MeshKey(section, mode, generation));
                 if (geometry != null && !geometry.stale) {
                     geometry.stale = true;
-                    if (mode == 0) whole.addLast(section);
+                    if (mode == 0) queueWhole(section);
                     else if (mode == 1) planeCursor = Math.min(planeCursor, section.planeIndices[scene.axis]);
                     else focusCursor = Math.min(focusCursor, sliced ? section.planeIndices[scene.axis] : section.orderIndex);
                 }
+            }
+        }
+
+        void refreshSeam(BrowserScene.Section section, int neighborBit) {
+            section.seamVersion++;
+            for (int mode = 0; mode < 3; mode++) {
+                int generation = mode == 0 ? 0 : mode == 1 ? planeToken() : focusGeneration;
+                Geometry mesh = geometry.get(new MeshKey(section, mode, generation));
+                if (mesh == null || mesh.stale || mesh.seamVersion != section.seamVersion - 1) continue;
+                mesh.seamVersion = section.seamVersion;
+                if (!mesh.markSeamBatches(neighborBit)) continue;
+                if (mode == 0) queueWhole(section);
+                else if (mode == 1) planeCursor = Math.min(planeCursor, section.planeIndices[scene.axis]);
+                else focusCursor = Math.min(focusCursor, sliced ? section.planeIndices[scene.axis] : section.orderIndex);
             }
         }
 
@@ -1020,6 +1192,46 @@ public final class BrowserRenderer implements AutoCloseable {
         vertex(t, axis, plane, positive != 0 ? u : u + 4, positive != 0 ? v + 4 : v);
     }
 
+    private static final class ViewOrder {
+        private final double x, y, z, yaw, pitch, halfWidth, halfHeight;
+        private final double[] right, up;
+        private final double paddedWidth, paddedHeight;
+        private final int originX, originY, originZ;
+
+        ViewOrder(BrowserCamera camera, BrowserScene scene) {
+            x = camera.x; y = camera.y; z = camera.z; yaw = camera.yaw; pitch = camera.pitch;
+            halfWidth = camera.halfWidth(); halfHeight = camera.halfHeight();
+            right = camera.right(); up = camera.up();
+            paddedWidth = halfWidth + projectedRadius(right);
+            paddedHeight = halfHeight + projectedRadius(up);
+            originX = scene.originX; originY = scene.originY; originZ = scene.originZ;
+        }
+
+        private static double projectedRadius(double[] axis) {
+            return 8 * (Math.abs(axis[0]) + Math.abs(axis[1]) + Math.abs(axis[2]));
+        }
+
+        boolean matches(BrowserCamera camera) {
+            return x == camera.x && y == camera.y && z == camera.z && yaw == camera.yaw && pitch == camera.pitch
+                    && halfWidth == camera.halfWidth() && halfHeight == camera.halfHeight();
+        }
+
+        private double project(BrowserScene.Section section, double[] axis) {
+            return (section.x - (double) originX + 8 - x) * axis[0]
+                    + (section.y - (double) originY + 8 - y) * axis[1]
+                    + (section.z - (double) originZ + 8 - z) * axis[2];
+        }
+
+        boolean visible(BrowserScene.Section section) {
+            return Math.abs(project(section, right)) <= paddedWidth && Math.abs(project(section, up)) <= paddedHeight;
+        }
+
+        double score(BrowserScene.Section section) {
+            double u = project(section, right) / paddedWidth, v = project(section, up) / paddedHeight;
+            return (Math.abs(u) <= 1 && Math.abs(v) <= 1 ? 0 : 4) + u * u + v * v;
+        }
+    }
+
     private static final class MeshKey {
         final BrowserScene.Section section;
         final int mode, generation;
@@ -1040,11 +1252,10 @@ public final class BrowserRenderer implements AutoCloseable {
         final State owner;
         final BrowserScene.Section section;
         final int mode, generation, sourceVersion;
-        final int[] opaque = new int[BATCHES], glass = new int[BATCHES], roles = new int[BATCHES];
-        final int[] markers = new int[BATCHES];
+        final int[] opaque, glass, roles, markers, starts, neighborReads;
         BrowserBlockAccess access;
         Geometry previous;
-        int batch, cursor;
+        int batch, cursor, seamVersion, seamBatches;
         boolean complete, deleted, stale;
         double distance;
 
@@ -1054,6 +1265,35 @@ public final class BrowserRenderer implements AutoCloseable {
             this.mode = mode;
             this.generation = generation;
             sourceVersion = section.neighborhoodVersion;
+            seamVersion = section.seamVersion;
+            opaque = new int[BATCHES]; glass = new int[BATCHES];
+            roles = new int[BATCHES]; markers = new int[BATCHES];
+            starts = new int[BATCHES]; neighborReads = new int[BATCHES];
+        }
+
+        Geometry(State owner, Geometry compiled) {
+            this.owner = owner;
+            section = compiled.section;
+            mode = compiled.mode;
+            generation = compiled.generation;
+            sourceVersion = compiled.sourceVersion;
+            seamVersion = compiled.seamVersion;
+            starts = compiled.starts;
+            neighborReads = compiled.neighborReads;
+            cursor = compiled.cursor;
+            batch = compiled.batch;
+            complete = true;
+            opaque = compiled.opaque;
+            glass = compiled.glass;
+            roles = compiled.roles;
+            markers = compiled.markers;
+            owner.lists += countLists(opaque) + countLists(glass) + countLists(roles) + countLists(markers);
+        }
+
+        private int countLists(int[] handles) {
+            int count = 0;
+            for (int handle : handles) if (handle != 0) count++;
+            return count;
         }
 
         boolean valid() { return !deleted && !stale && validForDraw(); }
@@ -1071,9 +1311,39 @@ public final class BrowserRenderer implements AutoCloseable {
             return false;
         }
 
+        boolean needsWork() { return !complete || seamBatches != 0; }
+
+        boolean markSeamBatches(int neighborBit) {
+            access = null;
+            int old = seamBatches;
+            for (int i = 0; i < batch; i++) {
+                if ((neighborReads[i] & neighborBit) != 0) seamBatches |= 1 << i;
+            }
+            return old == 0 && seamBatches != 0;
+        }
+
+        void rebuildSeamBatch() {
+            int savedBatch = batch, savedCursor = cursor;
+            batch = Integer.numberOfTrailingZeros(seamBatches);
+            seamBatches &= ~(1 << batch);
+            cursor = starts[batch];
+            for (int[] lists : new int[][] {opaque, glass, roles, markers}) {
+                if (lists[batch] == 0) continue;
+                GL11.glDeleteLists(lists[batch], 1);
+                owner.lists--;
+                lists[batch] = 0;
+            }
+            compileBatch();
+            batch = savedBatch;
+            cursor = savedCursor;
+            access = null;
+        }
+
         void compileBatch() {
             compiledBatches++;
             if (access == null) access = new BrowserBlockAccess(owner.scene, section);
+            access.beginBatch();
+            starts[batch] = cursor;
             int[] faces = owner.batchFaces;
             int count = 0;
             int solidRuns = 0, blendedRuns = 0;
@@ -1142,6 +1412,7 @@ public final class BrowserRenderer implements AutoCloseable {
                 }
             }
             compiledCells += cursor - begin;
+            neighborReads[batch] = access.neighborReads();
             batch++;
             if (finished()) access = null;
         }
@@ -1419,8 +1690,6 @@ public final class BrowserRenderer implements AutoCloseable {
         GL11.glLoadIdentity();
         GL11.glRotated(camera.pitch, 1, 0, 0);
         GL11.glRotated(camera.yaw, 0, 1, 0);
-        FloatBuffer basis = camera.worldToPreview();
-        if (basis != null) GL11.glMultMatrix(basis);
     }
 
     private static final class GLScope implements AutoCloseable {

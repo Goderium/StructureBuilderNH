@@ -214,7 +214,10 @@ public final class BuilderTasks extends WorldSavedData {
                     && t.state != BuildTask.State.REFUND && t.state != BuildTask.State.DISMANTLED) {
                 if (host != null && !t.existing && p.worldObj instanceof WorldServer)
                     t.attachExisting((WorldServer) p.worldObj);
-                if (host != null) t.requestSiteSurvey();
+                if (host != null) {
+                    t.refreshSiteTier(p.worldObj);
+                    t.requestSiteSurvey();
+                }
                 select(stack, t);
                 return;
             }
@@ -238,6 +241,7 @@ public final class BuilderTasks extends WorldSavedData {
             host.getMetaTileEntity().setItemNBT(itemTag);
             if (!itemTag.hasNoTags()) target.setTagCompound(itemTag);
             t.configureTarget(target);
+            t.refreshSiteTier(p.worldObj);
             t.requestSiteSurvey();
         }
         t.key = tag(stack).getString("network");
@@ -412,6 +416,7 @@ public final class BuilderTasks extends WorldSavedData {
             if (t.state == BuildTask.State.DONE || t.state == BuildTask.State.REFUND) continue;
             try {
                 if (System.nanoTime() < deadline) t.prepare(player, deadline);
+                if (t.adjustment != null && !work) t.adjustment.advance(player, world, Math.min(deadline, System.nanoTime() + 2_000_000L));
                 if (t.needsSiteSurvey()) t.inspectSite(world, Math.min(deadline, System.nanoTime() + 2_000_000L));
                 if (t.state == BuildTask.State.INSPECTING_UPGRADE) t.inspectUpgrade(player, world, deadline);
                 else if (t.state == BuildTask.State.SCANNING) t.scan(player, world, deadline);

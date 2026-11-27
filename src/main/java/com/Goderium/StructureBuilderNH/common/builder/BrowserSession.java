@@ -1,7 +1,6 @@
 package com.Goderium.StructureBuilderNH.common.builder;
 
 import com.gtnewhorizon.structurelib.StructureLibAPI;
-import com.gtnewhorizon.structurelib.alignment.constructable.ChannelDataAccessor;
 import com.gtnewhorizon.structurelib.alignment.enumerable.ExtendedFacing;
 import com.gtnewhorizon.structurelib.util.MiscUtils;
 import com.Goderium.StructureBuilderNH.util.Bounds;
@@ -19,6 +18,8 @@ import net.minecraft.item.ItemStack;
 import net.minecraft.nbt.NBTTagCompound;
 import net.minecraft.network.PacketBuffer;
 
+import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.BitSet;
@@ -33,6 +34,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.WeakHashMap;
 import java.util.UUID;
 import java.util.function.Consumer;
 
@@ -41,6 +43,10 @@ public final class BrowserSession implements AutoCloseable {
     private static final long CAPTURE_NANOS = 8_000_000L;
     private static final int FRAMES_PER_TICK = 8, BYTES_PER_TICK = 228_000;
     private static final int CACHE_CELLS = 65536;
+    // Only completed source metadata stays server-side. The client owns the model and its meshes.
+    private static final Map<BuildTask, LinkedHashMap<UUID, Manifest>> CACHE_MANIFESTS =
+            Collections.synchronizedMap(new WeakHashMap<>());
+    private static final int CACHE_MANIFEST_LIMIT = 32, CACHE_REPLY_TICKS = 3;
     private final UUID id = UUID.randomUUID();
     private final EntityPlayerMP player;
     private final BuildTask source;
@@ -56,7 +62,18 @@ public final class BrowserSession implements AutoCloseable {
     private final BitSet dirtySections = new BitSet(), emittedSections = new BitSet(), choiceSections = new BitSet();
     private final Consumer<Blueprint.Section> observer = section -> dirtySections.set(section.id);
     private final LinkedHashMap<String, Blueprint> cache = new LinkedHashMap<>(4, .75f, true);
+    private static final class Manifest {
+        final String[] channels;
+        final Map<String, Integer> maximums;
+
+        Manifest(Set<String> channels, Map<String, Integer> maximums) {
+            this.channels = channels.toArray(new String[0]);
+            this.maximums = Collections.unmodifiableMap(new LinkedHashMap<>(maximums));
+        }
+    }
+
     private Blueprint plan;
+    private Manifest cachedManifest;
     private NBTTagCompound channels;
     private int tier, revision, cursor, nextMaterial = 1, transfer, knownChannels = -1;
     private int dirtyCursor;
@@ -66,6 +83,9 @@ public final class BrowserSession implements AutoCloseable {
     private int sharedIdle;
     private long sharedWalks;
     private String configKey;
+    private UUID cacheKey;
+    private boolean cacheChecked, clientCached;
+    private int cacheWait, cacheSourceRevision;
     private Bounds lastBounds;
     private Iterator<Map.Entry<MaterialChoice, Integer>> finalGroups;
     private boolean groupsComplete;
@@ -87,7 +107,8 @@ public final class BrowserSession implements AutoCloseable {
         if (player == null || sender == null) throw new IllegalArgumentException("Missing browser owner");
         this.player = player;
         this.source = source;
-        this.facing = source == null ? ExtendedFacing.SOUTH_NORMAL_NONE : source.facing;
+        ExtendedFacing preferred = source == null ? ExtendedFacing.SOUTH_NORMAL_NONE : source.facing;
+        this.facing = source != null && source.existing ? preferred : PreviewPose.initialFacing(Blueprint.prototype(target), preferred);
         this.target = ItemStack.copyItemStack(target);
         this.sender = sender;
         this.tier = normalizedTier(tier);
@@ -101,6 +122,11 @@ public final class BrowserSession implements AutoCloseable {
     public boolean closed() { return closed; }
     /** A live, unmodifiable, small set; callers may compare its contents between GUI ticks. */
     public Set<String> observedChannels() { return readOnlyObserved; }
+
+    Map<String, Integer> channelMaximums() {
+        if (cachedManifest != null) return cachedManifest.maximums;
+        return ready() ? plan.channelMaximums() : null;
+    }
 
     /** Preview-only configuration; the caller separately validates any eventual task changes. */
     public void configure(int tier, NBTTagCompound channels) {
@@ -122,6 +148,10 @@ public final class BrowserSession implements AutoCloseable {
         plan = null; borrowed = false; header = false; finalHeader = false; completed = false;
         borrowedSelectionsReady = false; sharedIdle = 0;
         cursor = 0; nextMaterial = 1; knownChannels = -1;
+        cacheChecked = clientCached = false;
+        cacheKey = null;
+        cachedManifest = null;
+        cacheWait = 0;
         originX = originY = originZ = 0;
         outbound.clear(); materialIds.clear(); groupIds.clear();
         hatchTypes = new HatchNames(true);
@@ -136,12 +166,34 @@ public final class BrowserSession implements AutoCloseable {
         if (player.isDead || player.playerNetServerHandler == null) { release(); return; }
         long deadline = System.nanoTime() + CAPTURE_NANOS;
         try {
+            if (clientCached) {
+                if (source.revision == cacheSourceRevision) return;
+                restart(false);
+            }
+            if (!cacheChecked) {
+                cacheChecked = true;
+                cacheKey = cacheKey();
+                Map<UUID, Manifest> known = CACHE_MANIFESTS.get(source);
+                if (cacheKey != null && known != null && known.containsKey(cacheKey)) {
+                    BrowserPacket offer = packet(BrowserPacket.CACHE_OFFER);
+                    offer.cacheKey = cacheKey;
+                    cacheWait = CACHE_REPLY_TICKS;
+                    sender.accept(offer);
+                    return;
+                }
+            }
+            if (cacheWait > 0 && --cacheWait > 0) return;
             if (borrowed) {
                 boolean compatible = source.plan == plan && matchesSource();
-                if (!compatible || !plan.ready && !activeSource()) restart(true);
-                else if (!plan.ready) {
+                if (!compatible || !plan.ready && !activeSource()) {
+                    restart(true);
+                    return;
+                } else if (!plan.ready) {
                     if (sharedWalks != plan.browserWalks) { sharedWalks = plan.browserWalks; sharedIdle = 0; }
-                    else if (++sharedIdle >= 20) restart(true);
+                    else if (++sharedIdle >= 20) {
+                        restart(true);
+                        return;
+                    }
                 }
             }
             if (plan == null) start();
@@ -156,7 +208,7 @@ public final class BrowserSession implements AutoCloseable {
                 finally { ChannelProbe.end(); }
             }
             observed.addAll(plan.browserChannels.observed());
-            observed.remove("chisel");
+            observed.removeIf(key -> "chisel".equals(key) || BuildTask.isInternalPreviewChannel(target, key));
             if (borrowed && plan.ready && !borrowedSelectionsReady && source.hasCachedSelections()) {
                 borrowedSelectionsReady = true;
                 if (!choiceSections.isEmpty()) {
@@ -176,31 +228,21 @@ public final class BrowserSession implements AutoCloseable {
             }
             int frames = 0, bytes = 0;
             while (frames < FRAMES_PER_TICK && bytes < BYTES_PER_TICK) {
-                if (outbound.isEmpty()) {
-                    if (System.nanoTime() >= deadline) break;
-                    int dirty = dirtySections.nextSetBit(dirtyCursor);
-                    if (dirty < 0) dirty = dirtySections.nextSetBit(0);
-                    if (dirty >= 0) {
-                        dirtySections.clear(dirty);
-                        dirtyCursor = dirty + 1;
-                        section(plan.sections.get(dirty));
-                    } else if (plan.ready && !groupsComplete) {
-                        finalGroups();
-                        if (outbound.isEmpty()) break;
-                    } else break;
-                }
-                BrowserPacket next = outbound.peekFirst();
-                if (next == null || bytes + next.wireBytes > BYTES_PER_TICK) break;
-                outbound.removeFirst();
+                BrowserPacket next = nextFrame(deadline, BYTES_PER_TICK - bytes);
+                if (next == null) break;
                 sender.accept(next);
                 bytes += next.wireBytes;
-                if (next.completedSection >= 0 && !emittedSections.get(next.completedSection)) {
-                    emittedSections.set(next.completedSection); cursor++;
-                }
                 frames++;
             }
             if (plan.ready && dirtySections.isEmpty() && groupsComplete && outbound.isEmpty() && !completed) {
                 BrowserPacket done = packet(BrowserPacket.DONE); progress(done);
+                if (cacheKey != null && cacheKey.equals(cacheKey())
+                        && (!borrowed || choiceSections.isEmpty() || borrowedSelectionsReady)) {
+                    done.cacheKey = cacheKey;
+                    LinkedHashMap<UUID, Manifest> known = CACHE_MANIFESTS.computeIfAbsent(source, k -> new LinkedHashMap<>());
+                    known.put(cacheKey, new Manifest(observed, plan.channelMaximums()));
+                    if (known.size() > CACHE_MANIFEST_LIMIT) known.remove(known.keySet().iterator().next());
+                }
                 sender.accept(done); completed = true;
             } else if (!completed && (outbound.isEmpty() || !plan.ready)) {
                 BrowserPacket progress = packet(BrowserPacket.PROGRESS); progress(progress); sender.accept(progress);
@@ -214,6 +256,29 @@ public final class BrowserSession implements AutoCloseable {
         }
     }
 
+    void answerCache(UUID stream, int version, boolean hit) {
+        if (cacheWait == 0 || !id.equals(stream) || revision != version) return;
+        cacheWait = 0;
+        if (!hit) return;
+        if (!cacheKey.equals(cacheKey())) {
+            restart(false);
+            return;
+        }
+        Map<UUID, Manifest> known = CACHE_MANIFESTS.get(source);
+        cachedManifest = known == null ? null : known.get(cacheKey);
+        if (cachedManifest == null) return;
+        Collections.addAll(observed, cachedManifest.channels);
+        cacheSourceRevision = source.revision;
+        clientCached = true;
+    }
+
+    private UUID cacheKey() {
+        if (source == null) return null;
+        String value = source.id + ":" + source.revision + ":" + facing.getIndex() + ":"
+                + RebuildConfig.useSurvivalConstruct + ":" + configKey;
+        return UUID.nameUUIDFromBytes(value.getBytes(StandardCharsets.UTF_8));
+    }
+
     private void start() {
         if (Blueprint.prototype(target) == null) throw new IllegalArgumentException("Controller has no constructable blueprint");
         if (!forcePrivate && source != null && source.plan != null && (source.plan.ready || activeSource())
@@ -225,20 +290,15 @@ public final class BrowserSession implements AutoCloseable {
         } else {
             plan = cache.get(configKey);
             if (plan == null) {
-                ItemStack trigger = new ItemStack(StructureLibAPI.getDefaultHologramItem(), tier);
-                for (Object raw : MiscUtils.getTagKeys(channels)) {
-                    String name = (String) raw;
-                    ChannelDataAccessor.setChannelData(trigger, name, channels.getInteger(name));
-                }
-                if (!channels.hasKey("chisel")) ChannelDataAccessor.setChannelData(trigger, "chisel", 1);
+                ItemStack trigger = BuildTask.structureTrigger(target, tier, channels);
                 ChannelProbe.begin(observed);
                 try {
+                    boolean actual = usesActualShape(tier);
                     plan = Blueprint.read(target, trigger, facing,
-                            0, 0, 0, player, ignored -> false, RebuildConfig.useSurvivalConstruct);
+                            0, 0, 0, player, ignored -> false, actual || RebuildConfig.useSurvivalConstruct, actual);
                 } finally { ChannelProbe.end(); }
             }
         }
-        observed.remove("chisel");
         dirtySections.set(0, plan.sections.size());
         if (!plan.ready) plan.addBrowserObserver(observer);
     }
@@ -414,13 +474,75 @@ public final class BrowserSession implements AutoCloseable {
         p.sentSections = cursor; p.ready = plan.ready;
     }
 
+    private boolean fillOutbound(long deadline) {
+        if (!outbound.isEmpty()) return true;
+        if (System.nanoTime() >= deadline) return false;
+        int dirty = dirtySections.nextSetBit(dirtyCursor);
+        if (dirty < 0) dirty = dirtySections.nextSetBit(0);
+        if (dirty >= 0) {
+            dirtySections.clear(dirty);
+            dirtyCursor = dirty + 1;
+            section(plan.sections.get(dirty));
+        } else if (plan.ready && !groupsComplete) finalGroups();
+        return !outbound.isEmpty();
+    }
+
+    private BrowserPacket nextFrame(long deadline, int remainingBytes) {
+        if (!fillOutbound(deadline) || outbound.peekFirst().wireBytes > remainingBytes) return null;
+        BrowserPacket first = takeOutbound();
+        int capacity = Math.min(BrowserPacket.FRAME_BYTES, remainingBytes) - BrowserPacket.BATCH_HEADER_BYTES;
+        if (first.encoded == null || first.wireBytes + 2 >= capacity || !fillOutbound(deadline)
+                || !fitsBatch(outbound.peekFirst(), capacity - first.wireBytes - 2)) return first;
+
+        ByteArrayOutputStream payload = new ByteArrayOutputStream(Math.min(capacity, first.wireBytes * 4));
+        appendMember(payload, first);
+        BrowserPacket packed = packet(BrowserPacket.BATCH);
+        packed.batchMembers = 1;
+        while (packed.batchMembers < BrowserPacket.MAX_BATCH_MEMBERS && System.nanoTime() < deadline
+                && fillOutbound(deadline) && fitsBatch(outbound.peekFirst(), capacity - payload.size())) {
+            appendMember(payload, takeOutbound());
+            packed.batchMembers++;
+        }
+        if (packed.batchMembers == 1) return first;
+        packed.payload = payload.toByteArray();
+        packed.wireBytes = BrowserPacket.BATCH_HEADER_BYTES + packed.payload.length;
+        return packed;
+    }
+
+    private static boolean fitsBatch(BrowserPacket p, int bytes) {
+        return p.encoded != null && p.wireBytes + 2 <= bytes;
+    }
+
+    private static void appendMember(ByteArrayOutputStream batch, BrowserPacket p) {
+        batch.write(p.wireBytes >> 8);
+        batch.write(p.wireBytes & 255);
+        batch.write(p.encoded, 0, p.encoded.length);
+    }
+
+    private BrowserPacket takeOutbound() {
+        BrowserPacket p = outbound.removeFirst();
+        if (p.completedSection >= 0 && !emittedSections.get(p.completedSection)) {
+            emittedSections.set(p.completedSection);
+            cursor++;
+        }
+        return p;
+    }
+
     private void enqueue(BrowserPacket p) {
         PacketBuffer b = new PacketBuffer(Unpooled.buffer());
         try {
             p.write(b);
             int length = b.readableBytes();
             if (length > BrowserPacket.MAX_BYTES) throw new IllegalArgumentException("Browser packet exceeds model limit");
-            if (length <= BrowserPacket.FRAME_BYTES) { p.wireBytes = length; outbound.add(p); return; }
+            if (length <= BrowserPacket.FRAME_BYTES) {
+                if (p.batchable()) {
+                    p.encoded = new byte[length];
+                    b.readBytes(p.encoded);
+                }
+                p.wireBytes = length;
+                outbound.add(p);
+                return;
+            }
             int transfer = ++this.transfer, parts = (length + BrowserPacket.FRAME_BYTES - 1) / BrowserPacket.FRAME_BYTES;
             for (int part = 0; part < parts; part++) {
                 BrowserPacket fragment = packet(BrowserPacket.FRAGMENT);
@@ -447,7 +569,7 @@ public final class BrowserSession implements AutoCloseable {
         return tier;
     }
 
-    private static NBTTagCompound normalize(NBTTagCompound input) {
+    private NBTTagCompound normalize(NBTTagCompound input) {
         NBTTagCompound result = new NBTTagCompound();
         if (input == null) return result;
         Set<?> names = MiscUtils.getTagKeys(input);
@@ -456,15 +578,19 @@ public final class BrowserSession implements AutoCloseable {
             String name = (String) raw; int value = input.getInteger(name);
             if (name.isEmpty() || name.length() > 128 || value < 0)
                 throw new IllegalArgumentException("Invalid browser channel");
-            if (value > 0) result.setInteger(name, value);
+            if (value > 0 && !BuildTask.isInternalPreviewChannel(target, name)) result.setInteger(name, value);
         }
         return result;
     }
 
-    private static String key(int tier, NBTTagCompound channels) {
+    private boolean usesActualShape(int tier) {
+        return source != null && source.readActualStructure && tier == source.tier;
+    }
+
+    private String key(int tier, NBTTagCompound channels) {
         Map<String, Integer> values = new TreeMap<>();
         for (Object raw : MiscUtils.getTagKeys(channels)) values.put((String) raw, channels.getInteger((String) raw));
-        StringBuilder key = new StringBuilder().append(tier).append(':');
+        StringBuilder key = new StringBuilder().append(usesActualShape(tier)).append(':').append(tier).append(':');
         for (Map.Entry<String, Integer> entry : values.entrySet())
             key.append(entry.getKey().length()).append(':').append(entry.getKey()).append('=').append(entry.getValue()).append(';');
         return key.toString();

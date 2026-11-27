@@ -1,52 +1,33 @@
 package com.Goderium.StructureBuilderNH.client;
 
-import com.Goderium.StructureBuilderNH.common.builder.PreviewPose;
 import com.Goderium.StructureBuilderNH.util.Bounds;
-import com.gtnewhorizon.structurelib.alignment.enumerable.ExtendedFacing;
 import net.minecraftforge.common.util.ForgeDirection;
-import org.lwjgl.BufferUtils;
-import java.nio.FloatBuffer;
 
 /** Orthographic camera. Camera changes never invalidate model geometry. */
 final class BrowserCamera {
-    // NEI previews a south-facing controller from 50 degrees east-to-south and 20 degrees above.
-    private static final ExtendedFacing SOUTH = ExtendedFacing.of(ForgeDirection.SOUTH);
-    private static final double DEFAULT_YAW = -40, DEFAULT_PITCH = 20;
+    // NEI's reference model faces south and is viewed from the southeast.
+    private static final double NEI_SOUTH_YAW = -40, DEFAULT_PITCH = 20;
+    private static final double DEFAULT_YAW = NEI_SOUTH_YAW + 180;
     double x, y, z, radius = 8, zoom = 1, yaw = DEFAULT_YAW, pitch = DEFAULT_PITCH;
     double fitHalfWidth = 8, fitHalfHeight = 8;
     int width = 1, height = 1;
-    private ExtendedFacing facing = SOUTH;
-    private PreviewPose frame;
-    private FloatBuffer worldToPreview;
 
-    void setStructureFacing(ExtendedFacing next) {
-        if (facing == next) return;
-        facing = next;
-        frame = next == SOUTH ? null : new PreviewPose(SOUTH, next);
-        if (frame == null) return;
-        if (worldToPreview == null) worldToPreview = BufferUtils.createFloatBuffer(16);
-        // OpenGL columns of the inverse (transpose) of the signed structure basis.
-        worldToPreview.clear();
-        worldToPreview.put(frame.xx).put(frame.xy).put(frame.xz).put(0);
-        worldToPreview.put(frame.yx).put(frame.yy).put(frame.yz).put(0);
-        worldToPreview.put(frame.zx).put(frame.zy).put(frame.zz).put(0);
-        worldToPreview.put(0).put(0).put(0).put(1).flip();
+    void reset(Bounds bounds, ForgeDirection front) {
+        boolean horizontal = front.offsetX != 0 || front.offsetZ != 0;
+        reset(bounds, horizontal ? NEI_SOUTH_YAW + frontYaw(front) : DEFAULT_YAW, DEFAULT_PITCH);
     }
 
-    FloatBuffer worldToPreview() {
-        if (frame == null) return null;
-        worldToPreview.position(0);
-        return worldToPreview;
+    void resetSlice(Bounds bounds, int axis, ForgeDirection front) {
+        // Looking down from +Y, the controller's horizontal front should point to the bottom of the map.
+        double sliceYaw = axis == 1 ? frontYaw(front) : axis == 0 ? 90 : 0;
+        reset(bounds, sliceYaw, axis == 1 ? 90 : 0);
     }
 
-    private double[] worldVector(double a, double b, double c) {
-        return frame == null ? new double[] {a, b, c}
-                : new double[] {frame.xx * a + frame.xy * b + frame.xz * c,
-                        frame.yx * a + frame.yy * b + frame.yz * c,
-                        frame.zx * a + frame.zy * b + frame.zz * c};
+    private static double frontYaw(ForgeDirection front) {
+        return Math.toDegrees(Math.atan2(-front.offsetX, front.offsetZ));
     }
 
-    void reset(Bounds bounds) {
+    private void reset(Bounds bounds, double yaw, double pitch) {
         if (bounds == null) return;
         x = (bounds.minX + (double) bounds.maxX + 1) * .5;
         y = (bounds.minY + (double) bounds.maxY + 1) * .5;
@@ -55,13 +36,13 @@ final class BrowserCamera {
                 + square(bounds.maxY - (double) bounds.minY + 1)
                 + square(bounds.maxZ - (double) bounds.minZ + 1)) * .56);
         zoom = 1;
-        yaw = DEFAULT_YAW;
-        pitch = DEFAULT_PITCH;
+        this.yaw = yaw;
+        this.pitch = pitch;
         fit(bounds);
     }
 
     /** Freeze the projected framing at reset time; subsequent rotation retains the user's scale. */
-    void fit(Bounds bounds) {
+    private void fit(Bounds bounds) {
         double dx = bounds.maxX - (double) bounds.minX + 1, dy = bounds.maxY - (double) bounds.minY + 1;
         double dz = bounds.maxZ - (double) bounds.minZ + 1;
         double[] right = right(), up = up();
@@ -94,18 +75,18 @@ final class BrowserCamera {
 
     double[] right() {
         double a = Math.toRadians(yaw);
-        return worldVector(Math.cos(a), 0, Math.sin(a));
+        return new double[] {Math.cos(a), 0, Math.sin(a)};
     }
 
     double[] up() {
         double a = Math.toRadians(yaw), b = Math.toRadians(pitch);
         // Row 1 of Rx(pitch)*Ry(yaw), i.e. inverse-transform of screen-up.
-        return worldVector(Math.sin(a) * Math.sin(b), Math.cos(b), -Math.cos(a) * Math.sin(b));
+        return new double[] {Math.sin(a) * Math.sin(b), Math.cos(b), -Math.cos(a) * Math.sin(b)};
     }
 
     double[] eye() {
         double a = Math.toRadians(yaw), b = Math.toRadians(pitch);
-        return worldVector(-Math.sin(a) * Math.cos(b), Math.sin(b), Math.cos(a) * Math.cos(b));
+        return new double[] {-Math.sin(a) * Math.cos(b), Math.sin(b), Math.cos(a) * Math.cos(b)};
     }
 
     /** Origin and normalized direction in controller-relative coordinates. */

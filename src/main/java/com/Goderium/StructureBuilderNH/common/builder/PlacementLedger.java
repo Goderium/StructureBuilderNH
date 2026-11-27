@@ -39,13 +39,19 @@ final class PlacementLedger {
     }
 
     final BuildTask task;
+    private final boolean watchChanges;
     private final Map<Long, Section> sections = new LinkedHashMap<>();
     private final Map<String, Integer> types = new HashMap<>();
     private final List<String> palette = new ArrayList<>();
     int count;
 
     PlacementLedger(BuildTask task) {
+        this(task, true);
+    }
+
+    PlacementLedger(BuildTask task, boolean watchChanges) {
         this.task = task;
+        this.watchChanges = watchChanges;
     }
 
     static long key(int x, int y, int z) {
@@ -84,13 +90,18 @@ final class PlacementLedger {
         if (section == null) {
             section = new Section(x >> 4, y >> 4, z >> 4);
             sections.put(key, section);
-            task.store.watch(task.dim, key, this);
+            if (watchChanges) task.store.watch(task.dim, key, this);
         }
         int i = slot(x, y, z);
         if (!section.cells.get(i)) count++;
         section.cells.set(i);
         section.types[i] = type.shortValue();
-        task.changed();
+        if (watchChanges) task.changed();
+    }
+
+    boolean contains(int x, int y, int z) {
+        Section section = sections.get(key(x, y, z));
+        return section != null && section.cells.get(slot(x, y, z));
     }
 
     boolean matches(World world, int x, int y, int z) {
@@ -120,13 +131,13 @@ final class PlacementLedger {
         count--;
         if (section.cells.isEmpty()) {
             sections.remove(key);
-            task.store.unwatch(task.dim, key, this);
+            if (watchChanges) task.store.unwatch(task.dim, key, this);
         }
         task.changed();
     }
 
     void discard() {
-        for (long key : sections.keySet()) task.store.unwatch(task.dim, key, this);
+        for (long key : sections.keySet()) if (watchChanges) task.store.unwatch(task.dim, key, this);
         sections.clear();
         palette.clear();
         types.clear();
@@ -237,7 +248,7 @@ final class PlacementLedger {
             if (sections.containsKey(key)) continue;
             sections.put(key, s);
             count += s.cells.cardinality();
-            task.store.watch(task.dim, key, this);
+            if (watchChanges) task.store.watch(task.dim, key, this);
         }
     }
 

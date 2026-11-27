@@ -63,20 +63,18 @@ final class ChannelMemory {
         return changed;
     }
 
-    void remember(BuildTask task, List<IChannelDefinition> definitions, boolean share) {
+    void remember(BuildTask task, int tier, NBTTagCompound levels, List<IChannelDefinition> definitions) {
         NBTTagCompound player = child(players, task.owner);
         NBTTagCompound machine = child(child(player, "machines"), machineKey(task.target));
         NBTTagCompound local = child(machine, "channels");
         NBTTagCompound common = child(player, "common");
-        machine.setInteger("tier", task.tier);
+        machine.setInteger("tier", tier);
         for (IChannelDefinition d : definitions) {
             String key = d.getChannel();
-            int value = task.channels.getInteger(key);
+            int value = levels.getInteger(key);
             local.setInteger(key, value); // Zero explicitly inherits the main tier on this machine.
-            if (share) {
-                if (value > 0) common.setInteger(key, value);
-                else common.removeTag(key);
-            }
+            if (value > 0) common.setInteger(key, value);
+            else common.removeTag(key);
         }
         task.changed();
     }

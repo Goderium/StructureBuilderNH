@@ -110,6 +110,7 @@ public final class Blueprint extends GTDummyWorld {
         final int dots;
         ForgeDirection front = ForgeDirection.UNKNOWN;
         MaterialChoice choice;
+        ChannelUpgrade.Proof channelProof;
         private final boolean previewFluid;
         private PieceInputs inputs;
         String piece = "";
@@ -177,7 +178,12 @@ public final class Blueprint extends GTDummyWorld {
 
     static Blueprint read(ItemStack target, ItemStack trigger, ExtendedFacing facing, int x, int y, int z,
             EntityPlayer actor, IntPredicate initiallyConfirmed, boolean useSurvivalConstruct) {
-        Blueprint plan = new Blueprint(target, trigger.copy(), facing, x, y, z, actor, initiallyConfirmed);
+        return read(target, trigger, facing, x, y, z, actor, initiallyConfirmed, useSurvivalConstruct, false);
+    }
+
+    static Blueprint read(ItemStack target, ItemStack trigger, ExtendedFacing facing, int x, int y, int z,
+            EntityPlayer actor, IntPredicate initiallyConfirmed, boolean useSurvivalConstruct, boolean actual) {
+        Blueprint plan = new Blueprint(target, trigger.copy(), facing, x, y, z, actor, initiallyConfirmed, actual);
         if (useSurvivalConstruct && plan.controller instanceof ISurvivalConstructable) {
             try {
                 EntityPlayer reader = new PreviewPlayer(plan);
@@ -188,7 +194,7 @@ public final class Blueprint extends GTDummyWorld {
                 StructureBuilderNH.LOG.warn("Falling back to construct for {}", plan.controller.getClass().getName(), failure);
             }
             // A rejected survival reader may already have written blocks or changed its controller.
-            plan = new Blueprint(target, trigger.copy(), facing, x, y, z, actor, initiallyConfirmed);
+            plan = new Blueprint(target, trigger.copy(), facing, x, y, z, actor, initiallyConfirmed, actual);
         }
         ((IConstructable) plan.controller).construct(plan.trigger, false);
         if (plan.pieces.isEmpty() && plan.size <= 1) throw new IllegalArgumentException("Controller supplied no structure");
@@ -196,7 +202,7 @@ public final class Blueprint extends GTDummyWorld {
     }
 
     private Blueprint(ItemStack target, ItemStack trigger, ExtendedFacing facing, int x, int y, int z,
-            EntityPlayer actor, IntPredicate initiallyConfirmed) {
+            EntityPlayer actor, IntPredicate initiallyConfirmed, boolean actual) {
         this.initiallyConfirmed = initiallyConfirmed;
         this.x = x;
         this.y = y;
@@ -215,7 +221,7 @@ public final class Blueprint extends GTDummyWorld {
         base.setFrontFacing(facing.getDirection());
         controller = base.getMetaTileEntity();
         if (controller instanceof IAlignment) ((IAlignment) controller).setExtendedFacing(facing);
-        if (controller instanceof INEIPreviewModifier)
+        if (!actual && controller instanceof INEIPreviewModifier)
             ((INEIPreviewModifier) controller).onPreviewConstruct(trigger);
         Cell anchor = new Cell(null, target, GregTechAPI.sBlockMachines, m, false, -1, false);
         anchor.front = facing.getDirection();
@@ -293,6 +299,7 @@ public final class Blueprint extends GTDummyWorld {
         final int id;
         final Map<ShapeRegistry.Shape, Integer> shapeScopes = new IdentityHashMap<>();
         final Map<IStructureElement<?>, Cell> last = new IdentityHashMap<>();
+        final Map<IStructureElement<?>, ChannelUpgrade.Proof> channelProofs = new IdentityHashMap<>();
         final Map<IStructureElement<?>, MaterialChoice.NativeMaterial> materialDefaults = new IdentityHashMap<>();
 
         PieceInputs(Object context, ItemStack trigger, int id) {
@@ -481,7 +488,7 @@ public final class Blueprint extends GTDummyWorld {
         }
         Map<String, Cell> orientedCells = roleCells.computeIfAbsent(front, ignored -> new HashMap<>());
         Cell cell = orientedCells.get(role);
-        if (cell == null || cell.element != e || cell.block != block || cell.meta != blockMeta
+        if (cell == null || cell.inputs != inputs || cell.element != e || cell.block != block || cell.meta != blockMeta
                 || cell.air != air || !Materials.equal(cell.item, item)) {
             cell = new Cell(
                     e,
@@ -493,6 +500,9 @@ public final class Blueprint extends GTDummyWorld {
                     nativePredicate);
             cell.front = front;
             cell.inputs = inputs;
+            if (!inputs.channelProofs.containsKey(e))
+                inputs.channelProofs.put(e, upgrades.observe(e, inputs.context, inputs.trigger));
+            cell.channelProof = inputs.channelProofs.get(e);
             cell.piece = piece;
             cell.role = role;
             cell.symbol = symbol;
@@ -685,6 +695,8 @@ public final class Blueprint extends GTDummyWorld {
     /** Actual supported native named channels, independent of the current world's blocks. */
     Set<String> upgradeChannels() { return upgrades.channels(); }
 
+    Map<String, Integer> channelMaximums() { return upgrades.maximums(); }
+
     /** O(1), populated by the normal incremental blueprint walk; never queries a world or loads a chunk. */
     String upgradeChannel(Cell cell) { return upgrades.channel(cell); }
 
@@ -693,7 +705,7 @@ public final class Blueprint extends GTDummyWorld {
     }
 
     /** Native writes stay in this private world's one sampling slot and are restored before returning. */
-    ChannelUpgrade.Material sampleUpgrade(Cell cell, ItemStack trigger, int px, int py, int pz) {
+    ChannelUpgrade.Material sampleUpgrade(Cell cell, ItemStack trigger, int px, int py, int pz, boolean allowsAir) {
         int ox = sx, oy = sy, oz = sz, om = meta;
         Block previous = sample;
         TileEntity previousTile = tile;
@@ -701,8 +713,11 @@ public final class Blueprint extends GTDummyWorld {
         try {
             sx = px; sy = py; sz = pz;
             sample = Blocks.air; meta = 0; tile = null; wroteAir = false;
-            if (!cell.element.placeBlock(cell.inputs.context, this, px, py, pz, trigger)
-                    || sx != px || sy != py || sz != pz || sample == Blocks.air
+            boolean placed = cell.element.placeBlock(cell.inputs.context, this, px, py, pz, trigger);
+            if (sx != px || sy != py || sz != pz) return null;
+            // isAir() records the air write but returns false from placeBlock.
+            if (allowsAir && wroteAir && sample == Blocks.air) return new ChannelUpgrade.Material(Blocks.air, 0, null);
+            if (!placed || sample == Blocks.air
                     || sample == StructureLibAPI.getBlockHint() || StructureFluids.isFluid(sample)
                     || tile != null || sample.hasTileEntity(meta)) return null;
             Block block = sample;

@@ -12,6 +12,8 @@ dependencies {
     compileOnly(pack.gtnhdev('Applied-Energistics-2-Unofficial')) { transitive = false }
     compileOnly(pack.gtnhdev('Chisel')) { transitive = false }
     compileOnly(pack.gtnhdev('StructureLib')) { transitive = false }
+    compileOnly(pack.gtnhdev('BlockRenderer6343')) { transitive = false }
+    compileOnly('it.unimi.dsi:fastutil:8.5.18') { transitive = false }
     compileOnly(pack.gtnhdev('GTNHLib')) { transitive = false }
     compileOnly(pack.gtnhdev('ModularUI')) { transitive = false }
     compileOnly(pack.gtnhdev('ModularUI2')) { transitive = false }

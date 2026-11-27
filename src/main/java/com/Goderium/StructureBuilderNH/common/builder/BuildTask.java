@@ -12,12 +12,15 @@ import com.gtnewhorizon.structurelib.alignment.enumerable.ExtendedFacing;
 import com.gtnewhorizon.structurelib.structure.*;
 
 import gregtech.api.interfaces.tileentity.IGregTechTileEntity;
+import gregtech.api.interfaces.metatileentity.IMetaTileEntity;
 import gregtech.api.metatileentity.implementations.MTEHatch;
+import gregtech.api.metatileentity.implementations.MTEMultiBlockBase;
 import gregtech.common.blocks.ItemMachines;
 
 import net.minecraft.block.Block;
 import net.minecraft.entity.player.EntityPlayerMP;
 import net.minecraft.item.Item;
+import net.minecraft.init.Blocks;
 import net.minecraft.item.ItemStack;
 import net.minecraft.nbt.*;
 import net.minecraft.tileentity.TileEntity;
@@ -127,6 +130,8 @@ final class BuildTask {
 
     ItemStack target;
     int tier = 1, cursor, total, placed, revision;
+    boolean readActualStructure;
+    SiteAdjustment adjustment;
     boolean useSurvivalConstruct = RebuildConfig.useSurvivalConstruct;
     int siteRevision = -1, siteInstalled, siteTotal, siteUnknown;
     boolean siteComplete;
@@ -135,11 +140,11 @@ final class BuildTask {
     private long nextSiteSurvey;
 
     boolean surveysExistingSite() {
-        return existing && target != null && !upgrading() && (state == State.DRAFT || state == State.PREVIEW);
+        return existing && target != null && adjustment == null && !upgrading() && (state == State.DRAFT || state == State.PREVIEW);
     }
 
     boolean hasSiteCount() {
-        return siteRevision == revision && !upgrading() && (state == State.DRAFT || state == State.PREVIEW);
+        return adjustment == null && siteRevision == revision && !upgrading() && (state == State.DRAFT || state == State.PREVIEW);
     }
 
     boolean awaitingSiteCount() {
@@ -222,6 +227,7 @@ final class BuildTask {
     private boolean obsoleteFluidOrder;
     private final int[] xyz = new int[3];
     private BitSet pending = new BitSet();
+    int pendingCount() { return pending.cardinality(); }
     private BitSet confirmed = new BitSet();
     private long nextSalvageRetry;
     private Blueprint ordinaryProgressPlan;
@@ -238,7 +244,7 @@ final class BuildTask {
         ItemStack material, installedMaterial;
         OrdinaryStatus status = OrdinaryStatus.UNKNOWN;
         int x, y, z;
-        boolean counted, matches, blankRitual, host;
+        boolean counted, matches, blankRitual, host, canClear;
         private final int[] position = new int[3];
     }
 
@@ -246,12 +252,12 @@ final class BuildTask {
         ordinaryCell(index, world, result, true);
     }
 
-    private void ordinaryCell(int index, World world, OrdinaryCell result, boolean itemDetails) {
+    void ordinaryCell(int index, World world, OrdinaryCell result, boolean itemDetails) {
         result.cell = null;
         result.material = result.installedMaterial = null;
         result.status = OrdinaryStatus.UNKNOWN;
         result.x = result.y = result.z = 0;
-        result.counted = result.matches = result.blankRitual = result.host = false;
+        result.counted = result.matches = result.blankRitual = result.host = result.canClear = false;
         if (upgrading() || plan == null || !plan.ready || index < 0 || index >= plan.size) return;
         try {
             Blueprint.Cell cell = plan.at(index, result.position);
@@ -292,6 +298,9 @@ final class BuildTask {
                 return;
             }
             boolean previewFluid = selection == null ? cell.isFluid() : selection.group.isFluid(selection.index);
+            result.canClear = !result.host && (selection == null || !selection.conflict)
+                    && (result.material != null || previewFluid || cell.air
+                            || selection != null && selection.group.isAir(selection.index));
             if (previewFluid) {
                 // Leave process fluids to the machine or player, and keep empty cells visible in the projection.
                 if (air) {
@@ -311,6 +320,22 @@ final class BuildTask {
             }
             result.matches = result.host ? anchorValid(world)
                     : materialMatches(cell, world, result.x, result.y, result.z);
+            if (!result.host && !air) {
+                ChannelUpgrade.Result replacement = adjustment == null ? null
+                        : adjustment.replacement(cell, world, result.x, result.y, result.z);
+                if (replacement != null) result.matches = replacement.kind == ChannelUpgrade.Kind.KEEP;
+                else if (!result.matches && existing && selection == null) {
+                    String channel = plan.upgradeChannel(cell);
+                    if (!channel.isEmpty()) {
+                        result.matches = plan.upgrade(cell, world, result.x, result.y, result.z,
+                                java.util.Collections.singleton(channel)).sourceValue > 0;
+                        if (result.matches && cell.air) {
+                            result.installedMaterial = ordinaryInstalledMaterial(world, result);
+                            result.counted = result.installedMaterial != null;
+                        }
+                    }
+                }
+            }
             if (result.matches) {
                 if (air) {
                     result.counted = false;
@@ -832,6 +857,7 @@ final class BuildTask {
         if (sameAnchor && !attach && next == facing) return true;
         PreviewPose.Allowed allowed = allowedPoses();
         applyPreviewMove(px, py, pz, next, attach);
+        if (attach) refreshSiteTier(world);
         movedAllowed = allowed;
         return true;
     }
@@ -846,7 +872,10 @@ final class BuildTask {
             materialSelections=transform.rotateSelections(materialSelections,false);
         }
         x=px; y=py; z=pz; facing=next;
-        if (attach) existing = temporaryHost = true;
+        if (attach) {
+            existing = temporaryHost = true;
+            useSiteDefaults();
+        }
         pending.clear(); manualHatches.clear();
         needed.rows.clear(); shortage.rows.clear(); errors.rows.clear();
         cursor=total=placed=0; siteRevision=-1; detail="";
@@ -968,7 +997,7 @@ final class BuildTask {
 
     /** Channel-page permission only; review must never enable the world/material editor. */
     boolean canConfigureChannels() {
-        return !hasReserved() && savedLink == null && !ordering()
+        return !hasReserved() && savedLink == null && !ordering() && (adjustment == null || !adjustment.approved)
                 && (state == State.DRAFT || state == State.PREVIEW || state == State.MISSING
                     || state == State.UPGRADE_REVIEW || state == State.BLOCKED && !upgradeApproved
                             && (upgrading() || existing && "obstruction".equals(reason)));
@@ -994,7 +1023,12 @@ final class BuildTask {
             if (existing || ledger.count != 0 || deleteRequested || dismantleRequested || upgrading()
                     || state != State.DRAFT && state != State.PREVIEW) return false;
             applyPreviewMove(x, y, z, actual, true);
-        } else if (!existing) { existing = temporaryHost = true; changed(); }
+        } else if (!existing) {
+            existing = temporaryHost = true;
+            useSiteDefaults();
+            resetPlan();
+        }
+        refreshSiteTier(world);
         return true;
     }
 
@@ -1006,7 +1040,7 @@ final class BuildTask {
         }
     }
 
-    void resolveReplacementChannels(int nextTier, NBTTagCompound next, Set<String> selected, Set<String> excluded) {
+    void resolveReplacementChannels(int nextTier, NBTTagCompound next, Set<String> selected) {
         Set<String> supported = plan.upgradeChannels();
         selected.retainAll(supported);
         for (String channel : supported) {
@@ -1014,7 +1048,51 @@ final class BuildTask {
             int after = next.getInteger(channel);
             if ((before > 0 ? before : tier) != (after > 0 ? after : nextTier)) selected.add(channel);
         }
-        selected.removeAll(excluded);
+    }
+
+    private void useSiteDefaults() {
+        readActualStructure = true;
+        tier = 1;
+        channels = new NBTTagCompound();
+        pendingDefaults = new NBTTagCompound();
+    }
+
+    void refreshSiteTier(World world) {
+        if (!readActualStructure || !surveysExistingSite() || !world.blockExists(x, y, z)) return;
+        TileEntity host = world.getTileEntity(x, y, z);
+        if (!(host instanceof IGregTechTileEntity) || ((IGregTechTileEntity) host).getMetaTileID() != target.getMetadata()) return;
+        IMetaTileEntity controller = ((IGregTechTileEntity) host).getMetaTileEntity();
+        int actualTier = readMainChannel(controller);
+        if (actualTier > 0 && actualTier != tier) {
+            tier = actualTier;
+            resetPlan();
+        }
+    }
+
+    static int readMainChannel(IMetaTileEntity controller) {
+        if (!(controller instanceof MTEMultiBlockBase) || !((MTEMultiBlockBase) controller).mMachine
+                || !"com.Nxer.TwistSpaceTechnology.common.machine.TST_BloodyHell".equals(controller.getClass().getName())) return 0;
+        // Bloody Hell defines its main blueprint channel as the tier found by its native structure check.
+        try {
+            int value = (Integer) controller.getClass().getMethod("getAltarTierForSpeed").invoke(controller);
+            return value >= 1 && value <= 6 ? value : 0;
+        } catch (ReflectiveOperationException | RuntimeException | LinkageError unavailable) {
+            return 0;
+        }
+    }
+
+    void applySiteChannels(int nextTier, NBTTagCompound next, Set<String> changedChannels) {
+        if (adjustment == null) adjustment = new SiteAdjustment(this);
+        changedChannels.retainAll(plan.upgradeChannels());
+        adjustment.selectChannels(changedChannels);
+        if (tier != nextTier) {
+            readActualStructure = false;
+            adjustment.targetShapeChanged = true;
+        }
+        tier = nextTier;
+        channels = next;
+        pendingDefaults = new NBTTagCompound();
+        resetDraft();
     }
 
     /** Call before writing new tier/channel values, while the old ready plan can validate the selected scope. */
@@ -1136,11 +1214,18 @@ final class BuildTask {
             materialCells = new NBTTagCompound();
             materialGroups = new NBTTagCompound();
         }
+        if (adjustment != null) adjustment.discard();
+        adjustment = null;
         target = ItemStack.copyItemStack(stack);
         if (target == null) previewLayers = 0;
         else target.stackSize = 1;
         observedChannels.clear();
-        store.channelMemory.restore(this);
+        readActualStructure = false;
+        if (existing) useSiteDefaults();
+        else {
+            facing = PreviewPose.initialFacing(Blueprint.prototype(target), facing);
+            store.channelMemory.restore(this);
+        }
         resetDraft();
         return true;
     }
@@ -1179,19 +1264,45 @@ final class BuildTask {
         changed();
     }
 
+    private static final String BOTTLED_CHAOS_PREVIEW = "bottledchaosprototype";
+
+    static boolean isInternalPreviewChannel(ItemStack target, String key) {
+        if (!BOTTLED_CHAOS_PREVIEW.equals(key)) return false;
+        IMetaTileEntity controller = Blueprint.prototype(target);
+        return controller != null && "com.Nxer.TwistSpaceTechnology.common.modularizedMachine.MM_BottledChaos"
+                .equals(controller.getClass().getName());
+    }
+
+    static void removeInternalPreviewChannel(ItemStack target, NBTTagCompound levels) {
+        if (levels.hasKey(BOTTLED_CHAOS_PREVIEW) && isInternalPreviewChannel(target, BOTTLED_CHAOS_PREVIEW))
+            levels.removeTag(BOTTLED_CHAOS_PREVIEW);
+    }
+
     List<IChannelDefinition> definitions() {
-        if (Blueprint.prototype(target) == null) return Collections.emptyList();
-        IStructureDefinition<?> def =
-                ((IConstructable) Blueprint.prototype(target)).getStructureDefinition();
+        IMetaTileEntity controller = Blueprint.prototype(target);
+        if (controller == null) return Collections.emptyList();
+        IStructureDefinition<?> def = ((IConstructable) controller).getStructureDefinition();
         List<IChannelDefinition> list = new ArrayList<>();
         if (def != null) list.addAll(def.getChannelDefinitions());
         Set<String> extra = new HashSet<>(observedChannels);
         for (IChannelDefinition d : list) extra.remove(d.getChannel());
         for (String id : extra) list.add(IChannelDefinition.unbounded(id));
         // This presence-only channel is built into the wireless blueprint.
-        list.removeIf(d -> "chisel".equals(d.getChannel()));
+        list.removeIf(d -> "chisel".equals(d.getChannel()) || isInternalPreviewChannel(target, d.getChannel()));
         list.sort(Comparator.comparing(IChannelDefinition::getChannel));
         return list;
+    }
+
+    static ItemStack structureTrigger(ItemStack controller, int tier, NBTTagCompound channels) {
+        ItemStack trigger = new ItemStack(StructureLibAPI.getDefaultHologramItem(), tier);
+        for (Object name : com.gtnewhorizon.structurelib.util.MiscUtils.getTagKeys(channels)) {
+            String key = (String) name;
+            int value = channels.getInteger(key);
+            if (value > 0 && !isInternalPreviewChannel(controller, key))
+                ChannelDataAccessor.setChannelData(trigger, key, value);
+        }
+        if (!channels.hasKey("chisel")) ChannelDataAccessor.setChannelData(trigger, "chisel", 1);
+        return trigger;
     }
 
     void prepare(EntityPlayerMP actor, long deadline) {
@@ -1205,16 +1316,9 @@ final class BuildTask {
         ChannelProbe.begin(observedChannels);
         try {
             if (plan == null) {
-                ItemStack trigger = new ItemStack(StructureLibAPI.getDefaultHologramItem(), tier);
-                for (Object name :
-                        com.gtnewhorizon.structurelib.util.MiscUtils.getTagKeys(channels)) {
-                    String key = (String) name;
-                    int value = channels.getInteger(key);
-                    if (value > 0) ChannelDataAccessor.setChannelData(trigger, key, value);
-                }
-                if (!channels.hasKey("chisel"))
-                    ChannelDataAccessor.setChannelData(trigger, "chisel", 1);
-                boolean survivalSource = useSurvivalConstruct;
+                ItemStack trigger = structureTrigger(target, tier, channels);
+                boolean survivalSource = readActualStructure || useSurvivalConstruct
+                        && (adjustment == null || !adjustment.targetShapeChanged);
                 if (removalTool != null) {
                     WorldServer world = (WorldServer) actor.worldObj;
                     if (world.getTotalWorldTime() < nextRestorationCheck) return;
@@ -1239,7 +1343,7 @@ final class BuildTask {
                     reason = "";
                 }
                 plan = Blueprint.read(target, trigger, facing, x, y, z, actor, this::initiallyConfirmed,
-                        survivalSource);
+                        survivalSource, readActualStructure && removalTool == null);
             }
             if (!plan.ready) plan.advance(deadline);
             if (plan.ready) {
@@ -1304,6 +1408,14 @@ final class BuildTask {
         }
         if (state != State.DRAFT && state != State.PREVIEW && state != State.MISSING && state != State.BLOCKED) return;
         if (target == null) return;
+        if (adjustment != null && !adjustment.approved) {
+            if (!adjustment.canStart()) {
+                ChunkCoordinates blocker = adjustment.blocker;
+                if (blocker != null) stop(adjustment.obstruction, blocker.posX, blocker.posY, blocker.posZ);
+                return;
+            }
+            adjustment.approved = true;
+        }
         if (confirmed == null) resetPlan();
         invalidateOrdinaryProgress();
         total = placed = 0;
@@ -1385,7 +1497,7 @@ final class BuildTask {
 
     void scan(EntityPlayerMP actor, WorldServer world, long deadline) {
         if (upgrading()) { scanUpgrade(actor,world,deadline); return; }
-        if (plan == null || !plan.ready) return;
+        if (plan == null || !plan.ready || adjustment != null && !recoverUpgrade(world)) return;
         if (!prepareOrdinaryProgress(world, deadline)) return;
         for (int n = 0;
                 cursor < plan.size && n < 8192 && System.nanoTime() < deadline;
@@ -1396,27 +1508,37 @@ final class BuildTask {
             ordinaryCell(cursor, world, ordinaryWork, false);
             updateOrdinaryProgress(cursor, ordinaryWork);
             confirm(cursor, ordinaryWork.status == OrdinaryStatus.INSTALLED);
-            if (ordinaryWork.matches) {
-                continue;
-            }
+            boolean plannedClear = adjustment != null && adjustment.clearing.matches(world, px, py, pz);
+            if (ordinaryWork.matches && !plannedClear) continue;
             if (cursor == 0
                     && (existing || !plan.controller.isFacingValid(facing.getDirection()))) {
                 stop("anchor", px, py, pz);
                 return;
             }
             ItemStack material = ordinaryWork.material;
-            if (ordinaryWork.status != OrdinaryStatus.MISSING) {
+            if (ordinaryWork.status != OrdinaryStatus.MISSING && !plannedClear) {
                 stop("obstruction", px, py, pz);
                 return;
             }
+            if (material == null) continue;
             if (!ordinaryWork.blankRitual) needed.add(material, 1);
             pending.set(cursor);
         }
         changed();
         if (cursor < plan.size) return;
-        if (pending.isEmpty() && !checkMaterialsOnly) {
+        if (pending.isEmpty() && (adjustment == null || adjustment.clearing.count == 0) && !checkMaterialsOnly) {
             finish(actor, world);
             return;
+        }
+        if (adjustment != null && adjustment.clearing.count != 0 && !actor.capabilities.isCreativeMode) {
+            String status = upgradeDepositProblem(Wireless.find(this, world, actor));
+            if (!status.isEmpty()) {
+                reason = status;
+                state = State.MISSING;
+                changed();
+                return;
+            }
+            if (upgradeNetwork.isEmpty()) upgradeNetwork = key;
         }
         if (pending.isEmpty() || actor.capabilities.isCreativeMode) {
             cursor = 0;
@@ -1977,7 +2099,8 @@ final class BuildTask {
 
     private boolean returnSalvage(Wireless net, WorldServer world) {
         if (!salvage.rows.isEmpty() && world.getTotalWorldTime()<nextSalvageRetry) return false;
-        String status = upgrading() ? upgradeDepositProblem(net) : depositProblem(net, true);
+        String status = upgrading() || adjustment != null && adjustment.approved
+                ? upgradeDepositProblem(net) : depositProblem(net, true);
         if (status.isEmpty() && !salvage.rows.isEmpty()) {
             deposit(net, salvage);
             if (!salvage.rows.isEmpty()) status = "refundSpace";
@@ -2017,7 +2140,8 @@ final class BuildTask {
 
     void finish(EntityPlayerMP actor, WorldServer world) {
         if (!upgradeNetwork.isEmpty() && !upgradeNetwork.equals(key)) { reason="upgradeNetwork"; changed(); return; }
-        if (upgrading() && !salvage.rows.isEmpty() && !returnSalvage(Wireless.find(this,world,actor),world)) return;
+        if ((upgrading() || adjustment != null) && !salvage.rows.isEmpty()
+                && !returnSalvage(Wireless.find(this, world, actor), world)) return;
         funding.clear();
         confirmed = new BitSet();
         issue = null;
@@ -2026,7 +2150,8 @@ final class BuildTask {
         reason = "";
         retryRefund(actor, world);
         changed();
-        notify(actor, upgrading() ? "upgraded" : "done");
+        notify(actor, upgrading() || adjustment != null ? "upgraded" : "done");
+        adjustment = null;
         discardCachedPlan();
         if (upgrading()) releaseUpgradePhaseData();
         if (!hasReserved()) upgradeNetwork="";
@@ -2036,6 +2161,8 @@ final class BuildTask {
     int build(EntityPlayerMP actor, WorldServer world, ItemStack terminal, int budget, long deadline) {
         if (upgrading()) return buildUpgrade(actor,world,terminal,budget,deadline);
         if (plan == null || !plan.ready || budget <= 0) return 0;
+        if (adjustment != null && (!recoverUpgrade(world) || world.getTotalWorldTime() < nextSalvageRetry
+                || !salvage.rows.isEmpty() && !returnSalvage(Wireless.find(this, world, actor), world))) return 0;
         if (!prepareOrdinaryProgress(world, deadline)) return 0;
         boolean creative = actor.capabilities.isCreativeMode;
         if (!requireChunk(world, x, y, z)) return 0;
@@ -2058,12 +2185,30 @@ final class BuildTask {
             ordinaryCell(cursor, world, ordinaryWork, false);
             updateOrdinaryProgress(cursor, ordinaryWork);
             confirm(cursor, ordinaryWork.status == OrdinaryStatus.INSTALLED);
+            ItemStack material = ordinaryWork.material;
+            boolean scheduled = adjustment != null && adjustment.clearing.contains(px, py, pz);
             if (ordinaryWork.matches) {
+                if (scheduled && material != null) completeSiteClear(px, py, pz);
                 pending.clear(cursor);
                 continue;
             }
+            if (scheduled) {
+                if (material == null) continue; // Removals run after the new structure is in place.
+                if (ordinaryWork.status != OrdinaryStatus.MISSING) {
+                    if (!replaceSiteCell(actor, world, terminal, material, px, py, pz)) break;
+                    ordinaryCell(cursor, world, ordinaryWork, false);
+                    updateOrdinaryProgress(cursor, ordinaryWork);
+                    used++;
+                    if (!ordinaryWork.matches) {
+                        stop("obstruction", px, py, pz);
+                        break;
+                    }
+                    confirm(cursor, ordinaryWork.status == OrdinaryStatus.INSTALLED);
+                    if (!salvage.rows.isEmpty()) { cursor++; break; }
+                    continue;
+                }
+            }
             boolean blankRitual = ordinaryWork.blankRitual;
-            ItemStack material = ordinaryWork.material;
             if (ordinaryWork.status != OrdinaryStatus.MISSING) {
                 stop("obstruction", px, py, pz);
                 break;
@@ -2140,6 +2285,7 @@ final class BuildTask {
                 }
             }
             if (!blankRitual && !world.isAirBlock(px, py, pz)) ledger.record(world, px, py, pz);
+            if (scheduled) completeSiteClear(px, py, pz);
             ordinaryCell(cursor, world, ordinaryWork, false);
             updateOrdinaryProgress(cursor, ordinaryWork);
             if (!ordinaryWork.matches) {
@@ -2150,10 +2296,167 @@ final class BuildTask {
         }
         changed();
         if (cursor >= plan.size) {
+            if (adjustment != null) {
+                if (!salvage.rows.isEmpty()) return used;
+                if (adjustment.clearing.count > 0 && used < budget && System.nanoTime() < deadline)
+                    used += clearForBuild(actor, world, terminal, budget - used, deadline);
+                if (adjustment.clearing.count > 0 || !salvage.rows.isEmpty() || state != State.BUILDING) return used;
+            }
             cursor = 0;
             state = State.VERIFYING;
             changed();
         }
+        return used;
+    }
+
+    private void completeSiteClear(int x, int y, int z) {
+        adjustment.clearing.forget(x, y, z);
+        adjustment.completedClears++;
+        changed();
+    }
+
+    private boolean replaceSiteCell(EntityPlayerMP actor, WorldServer world, ItemStack terminal, ItemStack material,
+            int x, int y, int z) {
+        if (!adjustment.approved || !pending.get(cursor) || !adjustment.clearing.matches(world, x, y, z)) {
+            stop("rescan", x, y, z);
+            return false;
+        }
+        UpgradePlacement.Recovery transaction = UpgradePlacement.prepare(world, x, y, z, material, ledger.matches(world, x, y, z));
+        ItemStack previous = SiteAdjustment.installed(world, x, y, z);
+        if (transaction == null || previous == null || previous.hasTagCompound()
+                || !ledger.canRecord(transaction.targetBlock, transaction.targetMeta)) {
+            stop("upgradePlacement", x, y, z);
+            return false;
+        }
+        boolean creative = actor.capabilities.isCreativeMode;
+        ItemStack input = creative ? null : funding.next(material);
+        if (!creative && (input == null || backpack.count(input) == 0 && held.count(input) == 0)) {
+            stop("rescan", x, y, z);
+            return false;
+        }
+        if (!world.checkNoEntityCollision(AxisAlignedBB.getBoundingBox(x, y, z, x + 1, y + 1, z + 1))) {
+            pointAt(x, y, z);
+            reason = "occupied";
+            return false;
+        }
+        Wireless net = creative ? null : Wireless.find(this, world, actor);
+        if (!creative && !canReturnReplacedBlock(net, world, previous, x, y, z)) return false;
+        if (!performReplacement(actor, world, terminal, transaction, material)) return false;
+        if (!creative) {
+            if (backpack.count(input) > 0) backpack.add(input, -1); else held.add(input, -1);
+            funding.add(material, input, -1);
+            salvage.add(previous, 1);
+        }
+        ledger.record(world, x, y, z);
+        upgradeRecovery = null;
+        pending.clear(cursor);
+        completeSiteClear(x, y, z);
+        UpgradePlacement.notifyReplacement(transaction, world);
+        if (!salvage.rows.isEmpty()) returnSalvage(net, world);
+        return true;
+    }
+
+    private boolean canReturnReplacedBlock(Wireless net, WorldServer world, ItemStack previous, int x, int y, int z) {
+        String status = upgradeDepositProblem(net);
+        if (!status.isEmpty()) {
+            reason = status;
+            changed();
+            return false;
+        }
+        if (salvage.count(previous) == Integer.MAX_VALUE) {
+            stop("upgradeRows", x, y, z);
+            return false;
+        }
+        if (net.items.injectItems(appeng.util.item.AEItemStack.create(previous).setStackSize(1), Actionable.SIMULATE, net.source) != null) {
+            reason = "refundSpace";
+            pointAt(x, y, z);
+            nextSalvageRetry = world.getTotalWorldTime() + 20;
+            changed();
+            return false;
+        }
+        return true;
+    }
+
+    private boolean performReplacement(EntityPlayerMP actor, WorldServer world, ItemStack terminal,
+            UpgradePlacement.Recovery transaction, ItemStack material) {
+        double charge = TerminalEnergy.REPLACE.reserve(actor, terminal);
+        if (charge < 0) { reason = "noEnergy"; changed(); return false; }
+        upgradeRecovery = transaction;
+        changed();
+        UpgradePlacement.Outcome outcome = null;
+        try {
+            outcome = UpgradePlacement.replace(transaction, actor, world, material);
+        } finally {
+            if (outcome != UpgradePlacement.Outcome.SUCCESS) TerminalEnergy.refund(terminal, charge);
+        }
+        if (outcome == UpgradePlacement.Outcome.SUCCESS) return true;
+        int x = transaction.x, y = transaction.y, z = transaction.z;
+        if (transaction.oldMatches(world)) {
+            ledger.restoreOwnership(world, x, y, z, transaction.owned);
+            upgradeRecovery = null;
+        }
+        stop(upgradeRecovery != null ? "upgradeRollback" : outcome == UpgradePlacement.Outcome.DENIED ? "denied" : "upgradePlacement",
+                x, y, z);
+        return false;
+    }
+
+    private int clearForBuild(EntityPlayerMP actor, WorldServer world, ItemStack terminal, int budget, long deadline) {
+        if (!adjustment.approved || !requireChunk(world, x, y, z)) return 0;
+        if (existing && !anchorValid(world)) {
+            stop("anchor", x, y, z);
+            return 0;
+        }
+        boolean creative = actor.capabilities.isCreativeMode;
+        Wireless net = creative ? null : Wireless.find(this, world, actor);
+        if (!creative && !returnSalvage(net, world)) return 0;
+        state = State.BUILDING;
+        int used = 0;
+        while (adjustment.clearing.count > 0 && used < budget && System.nanoTime() < deadline) {
+            ChunkCoordinates at = adjustment.clearing.next();
+            int px = at.posX, py = at.posY, pz = at.posZ;
+            if (!requireChunk(world, px, py, pz)) break;
+            int destination = plan.indexAt(px, py, pz);
+            if (destination >= 0) {
+                ordinaryCell(destination, world, ordinaryWork, false);
+                if (ordinaryWork.material != null || ordinaryWork.status == OrdinaryStatus.UNKNOWN) {
+                    stop("rescan", px, py, pz);
+                    break;
+                }
+            }
+            if (world.getBlock(px, py, pz) != Blocks.air) {
+                if (!adjustment.clearing.matches(world, px, py, pz)) {
+                    stop("rescan", px, py, pz);
+                    break;
+                }
+                if (!creative) {
+                    ItemStack expected = SiteAdjustment.installed(world, px, py, pz);
+                    if (expected != null && net.items.injectItems(appeng.util.item.AEItemStack.create(expected).setStackSize(1),
+                            Actionable.SIMULATE, net.source) != null) {
+                        reason = "refundSpace";
+                        pointAt(px, py, pz);
+                        nextSalvageRetry = world.getTotalWorldTime() + 20;
+                        break;
+                    }
+                }
+                double charge = TerminalEnergy.REMOVE.reserve(actor, terminal);
+                if (charge < 0) { reason = "noEnergy"; break; }
+                boolean removed = false;
+                try {
+                    removed = adjustment.clearing.harvest(actor, world, terminal, px, py, pz);
+                } finally {
+                    if (!removed) TerminalEnergy.refund(terminal, charge);
+                }
+                if (!removed || adjustment.clearing.matches(world, px, py, pz)) {
+                    stop("harvest", px, py, pz);
+                    break;
+                }
+            }
+            completeSiteClear(px, py, pz);
+            used++;
+            if (!creative && !salvage.rows.isEmpty() && !returnSalvage(net, world)) break;
+        }
+        if (adjustment.clearing.count == 0) invalidateOrdinaryProgress();
+        changed();
         return used;
     }
 
@@ -2221,25 +2524,7 @@ final class BuildTask {
             }
             UpgradePlacement.Recovery transaction=new UpgradePlacement.Recovery(px,py,pz,result.oldBlock,result.oldMeta,
                     result.targetBlock,result.targetMeta,ledger.matches(world,px,py,pz));
-            double charge = TerminalEnergy.REPLACE.reserve(actor, terminal);
-            if (charge < 0) { reason = "noEnergy"; changed(); break; }
-            upgradeRecovery=transaction;
-            changed();
-            UpgradePlacement.Outcome outcome = null;
-            try {
-                outcome = UpgradePlacement.replace(transaction,actor,world,material);
-            } finally {
-                if (outcome != UpgradePlacement.Outcome.SUCCESS) TerminalEnergy.refund(terminal, charge);
-            }
-            if (outcome!=UpgradePlacement.Outcome.SUCCESS) {
-                if (transaction.oldMatches(world)) {
-                    ledger.restoreOwnership(world,px,py,pz,transaction.owned);
-                    upgradeRecovery=null;
-                }
-                stop(upgradeRecovery==null ? outcome==UpgradePlacement.Outcome.DENIED ? "denied" : "upgradePlacement"
-                        : "upgradeRollback",px,py,pz);
-                break;
-            }
+            if (!performReplacement(actor, world, terminal, transaction, material)) break;
             // Commit exactly one reserved target and one proven old component. Creative contributes neither.
             if (!creative) {
                 if (backpack.count(input)>0) backpack.add(input,-1); else held.add(input,-1);
@@ -2252,6 +2537,7 @@ final class BuildTask {
             pending.clear(cursor); placed++; used++;
             confirm(cursor,true);
             revision++; changed();
+            UpgradePlacement.notifyReplacement(transaction, world);
             if (!salvage.rows.isEmpty() && !returnSalvage(net,world)) {
                 cursor++;
                 break;
@@ -2344,6 +2630,8 @@ final class BuildTask {
         n.setBoolean("received", received);
         n.setInteger("tier", tier);
         n.setBoolean("useSurvivalConstruct", useSurvivalConstruct);
+        if (readActualStructure) n.setBoolean("readActualStructure", true);
+        if (adjustment != null) n.setTag("siteAdjustment", adjustment.save());
         n.setByte("previewLayers", (byte) previewLayers);
         if (texturedPreview) n.setBoolean("texturedPreview", true);
         if (!pendingDefaults.hasNoTags()) n.setTag("pendingDefaults", pendingDefaults);
@@ -2435,7 +2723,6 @@ final class BuildTask {
             t.state=State.BLOCKED; t.reason="upgradeRows"; t.upgradeApproved=false;
         }
         if (t.upgradeRecoveryFault) { t.state=State.REFUND; t.reason="upgradeRollback"; }
-        if (!t.upgrading() && t.upgradeRecovery!=null) { t.state=State.REFUND; t.reason="upgradeRollback"; }
         if (t.state == State.DISMANTLING && "harvestTool".equals(t.reason)) t.reason = "";
         t.detail = n.getString("detail");
         int[] problem = n.getIntArray("issue");
@@ -2485,6 +2772,25 @@ final class BuildTask {
             }
         }
         t.target = ItemStack.loadItemStackFromNBT(n.getCompoundTag("target"));
+        removeInternalPreviewChannel(t.target, t.channels);
+        removeInternalPreviewChannel(t.target, t.pendingDefaults);
+        t.readActualStructure = n.getBoolean("readActualStructure");
+        NBTTagCompound adjustmentTag = n.getCompoundTag("siteAdjustment");
+        boolean legacyClear = n.getByte("clearMode") > 0;
+        t.adjustment = SiteAdjustment.load(t, adjustmentTag, !legacyClear);
+        if (!t.upgrading() && t.adjustment == null && t.upgradeRecovery != null) {
+            t.state = State.REFUND;
+            t.reason = "upgradeRollback";
+        }
+        // Clear queues from older builds may include unrelated terrain. Cancel and refund the task.
+        if (legacyClear && adjustmentTag.getBoolean("approved")
+                && t.state != State.DONE && t.state != State.DISMANTLED
+                && t.state != State.DISMANTLING && t.state != State.TEARDOWN_PAUSED) {
+            t.state = State.REFUND;
+            t.previewLayers = 0;
+            t.issue = null;
+            t.reason = t.detail = "";
+        }
         // Queued builds and reservations address cells by ordinal. Resume with the source
         // that produced those ordinals, including construct-only saves from earlier versions.
         boolean savedSource = n.getBoolean("useSurvivalConstruct");

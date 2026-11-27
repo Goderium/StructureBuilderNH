@@ -11,7 +11,7 @@ import java.util.TreeSet;
 /** A read-only sample for the open channel editor. Never loads chunks for a tooltip. */
 final class ChannelSurvey {
     final Blueprint plan;
-    final Map<String, Set<Integer>> levels = new HashMap<>();
+    final Map<String, Set<Integer>> values = new HashMap<>();
     final Set<String> incomplete = new HashSet<>();
     private final int[] xyz = new int[3];
     private int cursor;
@@ -32,9 +32,9 @@ final class ChannelSurvey {
                 continue;
             }
             ChannelUpgrade.Result result = plan.upgrade(cell, world, xyz[0], xyz[1], xyz[2], supported);
-            if (result.sourceValue > 0)
-                levels.computeIfAbsent(channel, k -> new TreeSet<>()).add(result.sourceTier);
-            else if (!world.isAirBlock(xyz[0], xyz[1], xyz[2])) incomplete.add(channel);
+            if (result.sourceValue > 0) {
+                values.computeIfAbsent(channel, k -> new TreeSet<>()).add(result.sourceValue);
+            } else if (!world.isAirBlock(xyz[0], xyz[1], xyz[2])) incomplete.add(channel);
         }
         return cursor == plan.size;
     }

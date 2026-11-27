@@ -19,7 +19,7 @@ final class PreviewCubeProfiles {
     };
 
     private static final class Profile {
-        final boolean translucentCube, fullBright, declaresCube;
+        final boolean translucentCube, fullBright, declaresCube, fixedBounds;
         final Method base, glow;
 
         Profile(Class<?> type) {
@@ -30,6 +30,11 @@ final class PreviewCubeProfiles {
             fullBright = inherits(type, "com.rwtema.extrautils.block.BlockGreenScreen");
             Method normal = method(type, "isNormalCube", IBlockAccess.class, int.class, int.class, int.class);
             declaresCube = normal != null && normal.getDeclaringClass() != Block.class;
+            Method bounds = method(type, "setBlockBoundsBasedOnState", IBlockAccess.class, int.class, int.class, int.class);
+            Method srgBounds = method(type, "func_149719_a", IBlockAccess.class, int.class, int.class, int.class);
+            fixedBounds = (bounds != null || srgBounds != null)
+                    && (bounds == null || bounds.getDeclaringClass() == Block.class)
+                    && (srgBounds == null || srgBounds.getDeclaringClass() == Block.class);
             base = iconMethod(type, "getBaseIcon");
             glow = base == null ? null : iconMethod(type, "getGlowIcon");
         }
@@ -38,14 +43,19 @@ final class PreviewCubeProfiles {
     static boolean cube(Block block, int meta) {
         Profile profile = PROFILES.get(block.getClass());
         if (profile.translucentCube) return meta >= 0 && meta <= 2;
+        // RenderBlocks uses the standard cube path for render ID 0 even when the normal-block flag is false.
+        if (profile.fixedBounds && block.getRenderType() == 0 && unitBounds(block)) return true;
         if (!profile.declaresCube) return false;
         ACCESS.block = block; ACCESS.meta = meta;
         try {
-            return block.isNormalCube(ACCESS, 0, 0, 0)
-                    && block.getBlockBoundsMinX() == 0 && block.getBlockBoundsMinY() == 0 && block.getBlockBoundsMinZ() == 0
-                    && block.getBlockBoundsMaxX() == 1 && block.getBlockBoundsMaxY() == 1 && block.getBlockBoundsMaxZ() == 1;
+            return block.isNormalCube(ACCESS, 0, 0, 0) && unitBounds(block);
         }
         finally { ACCESS.block = null; }
+    }
+
+    private static boolean unitBounds(Block block) {
+        return block.getBlockBoundsMinX() == 0 && block.getBlockBoundsMinY() == 0 && block.getBlockBoundsMinZ() == 0
+                && block.getBlockBoundsMaxX() == 1 && block.getBlockBoundsMaxY() == 1 && block.getBlockBoundsMaxZ() == 1;
     }
 
     static boolean fullBright(Block block) { return PROFILES.get(block.getClass()).fullBright; }

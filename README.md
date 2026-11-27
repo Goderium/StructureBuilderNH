@@ -2,6 +2,6 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-- A better construction blueprint designed to reduce lag and save time when building very large structures
-- The Wireless Structure Terminal can preview and automatically build GTNH multiblocks, replace blocks in existing structures using the selected StructureLib channels, and dismantle blocks placed by a task. It draws materials from your inventory or an ME network and can request missing items through ME autocrafting
-- StructureLib blueprints gain a `rebuild` channel. With the channel enabled, sneak-right-click in Creative mode to clear the target area and rebuild the structure
+- A better construction blueprint for smoother previews and faster builds of large GTNH multiblocks
+- Adds the Wireless Structure Terminal for previewing, building and dismantling multiblocks, resuming unfinished builds and replacing blocks by channel. It uses materials from your inventory or ME network and can request ME autocrafting
+- Adds a `rebuild` channel to StructureLib blueprints for clearing and rebuilding structures in Creative mode

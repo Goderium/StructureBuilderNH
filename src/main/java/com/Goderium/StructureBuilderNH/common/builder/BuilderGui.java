@@ -68,11 +68,12 @@ final class BuilderGui {
     private static final int TASK_BODY = ROW_WIDTH - ACTION_WIDTH - 4;
     private static final int EDGE = 9, FOOTER_Y = 206, BUTTON_H = 17;
     private static final int UPGRADE = 512, HAS_REPLACEMENTS = 2048;
-    private static final int SITE_COUNTS = 4096, PARTIAL_BUILD = 8192, CHECKING_SITE = 16384;
+    private static final int EXISTING_SITE = 4096, CHECKING_SITE = 16384;
     private static final int TEXTURED_PREVIEW = 1 << 15;
     private static final int AWAITING_SITE = 1 << 18;
     private static final int SITE_COMPLETE = 1 << 17;
     private static final int REPAIR_CELL = 1 << 16;
+    private static final int SITE_ADJUSTMENT = 1 << 20, SITE_CAN_START = 1 << 21;
     private static final int LOCKED_MARKER = 128;
     private static final int CELL_SLOT_X = 13, CELL_SLOT_Y = 78, BAG_X = EDGE, BAG_Y = 152;
     final PlayerInventoryGuiData data;
@@ -90,6 +91,11 @@ final class BuilderGui {
         }
         @Override
         public boolean onMousePressed(int button) {
+            if (button == 1) {
+                for (IWidget widget : getContext().getAllBelowMouse()) {
+                    if (widget instanceof TextFieldWidget && widget.isEnabled()) return super.onMousePressed(button);
+                }
+            }
             if (onCellPage() && (button == 0 || button == 1)) {
                 int slot = bagSlot(getContext().getAbsMouseX() - getArea().x, getContext().getAbsMouseY() - getArea().y);
                 if (slot >= 0 && data.getPlayer().inventory.getItemStack() == null) {
@@ -201,12 +207,6 @@ final class BuilderGui {
             this.name = name;
             machine = renderer.line(name);
             count = IKey.dynamic(() -> progress).color(INK).shadow(false).alignment(Alignment.CenterRight);
-        }
-
-        String removalHint() {
-            if (removalModes == BuildTask.UNDO_PLACEMENTS) return tr("undoOnlyHint");
-            if (removalModes == BuildTask.DISMANTLE_SITE) return tr("siteOnlyHint");
-            return tr("dismantleHint");
         }
 
         void layout(boolean dismantle) {
@@ -487,8 +487,12 @@ final class BuilderGui {
         StringSyncValue formation = str("formation", this::controllerFormation);
         StringSyncValue reason = str("reason", () -> task == null ? ""
                 : page == Page.MAIN && markerNoticeUntil > player().ticksExisted ? "markerLocked" : task.reason);
-        StringSyncValue detail = str("detail", () -> task == null ? "" : task.detail);
+        StringSyncValue detail = str("detail", this::taskDetail);
         StringSyncValue progress = str("progress", this::mainProgress);
+        StringSyncValue adjustmentState = str("adjustmentState", this::adjustmentStatus);
+        IntSyncValue swaps = integer("swapCount", () -> task == null || task.adjustment == null ? 0 : task.adjustment.replacementCount);
+        IntSyncValue additions = integer("additionCount", () -> task == null || task.adjustment == null ? 0 : task.adjustment.additionsCount);
+        IntSyncValue removals = integer("removalCount", () -> task == null || task.adjustment == null ? 0 : task.adjustment.removalCount);
         IntSyncValue unknownAtSite = new IntSyncValue(() -> site == null ? 0 : site.unknownCells);
         IntSyncValue blockedAtSite = new IntSyncValue(() -> site == null ? 0 : site.blockedCells);
         sync.syncValue("unknownAtSite", unknownAtSite);
@@ -507,11 +511,26 @@ final class BuilderGui {
                 String why = tr(reason.getStringValue());
                 if (!why.equals(message)) message += ": " + why;
             }
-            if (in(phase, "DRAFT", "PREVIEW") && (flags.getIntValue() & UPGRADE) == 0) {
+            if (!adjustmentState.getStringValue().isEmpty() && reason.getStringValue().isEmpty()) {
+                String review = adjustmentState.getStringValue();
+                if ("changeSummary".equals(review)) {
+                    StringJoiner changes = new StringJoiner("  |  ");
+                    if (swaps.getIntValue() > 0) changes.add(quantity("changeReplace", swaps.getIntValue()));
+                    if (additions.getIntValue() > 0) changes.add(quantity("changeBuild", additions.getIntValue()));
+                    if (removals.getIntValue() > 0) changes.add(quantity("changeRemove", removals.getIntValue()));
+                    if (changes.length() > 0) message = changes.toString();
+                } else {
+                    message = tr(review);
+                }
+            }
+            if (in(phase, "DRAFT", "PREVIEW") && (flags.getIntValue() & (UPGRADE | SITE_ADJUSTMENT)) == 0) {
                 if ((flags.getIntValue() & SITE_COMPLETE) != 0) message = tr("state.SITE_COMPLETE");
                 if ((flags.getIntValue() & (CHECKING_SITE | AWAITING_SITE)) != 0) message = tr("checkingSite");
-                if (unknownAtSite.getIntValue() > 0) message += "  " + quantity("siteUnverified", unknownAtSite.getIntValue());
-                if (blockedAtSite.getIntValue() > 0) message += "  " + quantity("siteBlocked", blockedAtSite.getIntValue());
+                if (blockedAtSite.getIntValue() > 0) message = quantity("siteBlocked", blockedAtSite.getIntValue());
+                if (unknownAtSite.getIntValue() > 0) {
+                    String unknown = quantity("siteUnverified", unknownAtSite.getIntValue());
+                    message = blockedAtSite.getIntValue() > 0 ? message + "  |  " + unknown : unknown;
+                }
             }
             return detail.getStringValue().isEmpty() ? message
                     : message + "  " + StatCollector.translateToLocal(detail.getStringValue());
@@ -535,10 +554,11 @@ final class BuilderGui {
                                                 | (task.upgradeCount > 0 ? HAS_REPLACEMENTS : 0)
                                                 | (builtOnSite() ? SITE_COMPLETE : 0)
                                                 | (task.awaitingSiteCount() ? AWAITING_SITE : 0)
-                                                | (site != null ? SITE_COUNTS : 0)
+                                                | (task.adjustment != null ? SITE_ADJUSTMENT : 0)
+                                                | (task.adjustment != null && (task.adjustment.approved || task.adjustment.canStart() || task.adjustment.blocker != null)
+                                                        ? SITE_CAN_START : 0)
+                                                | (task.existing ? EXISTING_SITE : 0)
                                                 | (site == null && checkingSite != null ? CHECKING_SITE : 0)
-                                                | (site != null && site.installedCells > 0 && site.installedCells < site.totalCells
-                                                        ? PARTIAL_BUILD : 0)
                                                 | (task.texturedPreview ? TEXTURED_PREVIEW : 0)
                                                 | (task.repairableIssue() ? REPAIR_CELL : 0)
                                                 | (task.previewLayers << 4));
@@ -575,22 +595,58 @@ final class BuilderGui {
         rule(main, EDGE, 36, LIST_WIDTH);
         BooleanSupplier settled =
                 () -> in(phase, "DONE", "REFUND", "DISMANTLING", "DISMANTLED", "TEARDOWN_PAUSED");
-        label(
-                main,
-                () -> tr(in(phase, "DISMANTLING") ? (data.getPlayer().capabilities.isCreativeMode ? "removalProgress" : "salvage")
+        BooleanSupplier siteComplete = () -> (flags.getIntValue() & SITE_COMPLETE) != 0
+                || "state.SITE_COMPLETE".equals(adjustmentState.getStringValue());
+        BooleanSupplier waitingForSite = () -> (flags.getIntValue() & AWAITING_SITE) != 0
+                || "checkingSite".equals(adjustmentState.getStringValue());
+        BooleanSupplier showBuildControls = () -> target.getValue() != null
+                && !settled.getAsBoolean() && !siteComplete.getAsBoolean();
+        BooleanSupplier showMaterials = () -> target.getValue() != null
+                && !siteComplete.getAsBoolean() && !waitingForSite.getAsBoolean()
+                && !in(phase, "DISMANTLED")
+                && (!in(phase, "DONE") || (flags.getIntValue() & 8) != 0);
+        Supplier<String> materialsHeading = () -> !showMaterials.getAsBoolean() ? ""
+                : tr(in(phase, "DISMANTLING") ? (data.getPlayer().capabilities.isCreativeMode ? "removalProgress" : "salvage")
                         : in(phase, "REFUND") || in(phase, "DONE") && (flags.getIntValue() & 8) != 0 ? "leftovers"
-                        : (flags.getIntValue() & UPGRADE) != 0 ? "replacementList"
-                        : (flags.getIntValue() & SITE_COUNTS) != 0 ? "installedTotal" : "materials"),
-                10,
-                38,
-                99,
-                13,
-                ACCENT);
-        label(main, () -> in(phase, "UPGRADE_REVIEW")
-                ? StatCollector.translateToLocalFormatted("structurebuildernh.replaceCount", progress.getStringValue())
-                : progress.getStringValue(), 104, 38, EDGE + MATERIAL_WIDTH - 104, 13, MUTED, Alignment.CenterRight)
-                .setEnabledIf(w -> !in(phase, "REFUND"));
+                        : (flags.getIntValue() & (EXISTING_SITE | SITE_ADJUSTMENT | UPGRADE)) != 0
+                                ? "pendingBuild" : "materials");
+        Supplier<String> progressHeading = () -> {
+            String count = progress.getStringValue();
+            if (count.isEmpty() || target.getValue() == null || waitingForSite.getAsBoolean() || in(phase, "REFUND")) return "";
+            if (in(phase, "UPGRADE_REVIEW"))
+                return StatCollector.translateToLocalFormatted("structurebuildernh.replaceCount", count);
+            return tr(in(phase, "DISMANTLING", "TEARDOWN_PAUSED", "DISMANTLED")
+                    || (flags.getIntValue() & SITE_ADJUSTMENT) != 0 ? "progress" : "installed") + "  " + count;
+        };
+        if (!server()) {
+            TextRenderer header = new TextRenderer();
+            header.setShadow(false);
+            main.child(new Widget<>().pos(10, 38).size(EDGE + MATERIAL_WIDTH - 10, 13)
+                    .overlay((ctx, x, y, width, height, theme) -> {
+                        String left = materialsHeading.get(), right = progressHeading.get();
+                        int gap = left.isEmpty() || right.isEmpty() ? 0 : 6;
+                        int textWidth = textWidth(left) + textWidth(right);
+                        header.setScale(Math.min(1f, (float) (width - gap) / Math.max(1, textWidth)));
+                        header.setPos(x, y);
+                        if (!left.isEmpty()) {
+                            header.setAlignment(Alignment.CenterLeft, width, height);
+                            header.setColor(ACCENT);
+                            header.drawSimple(left);
+                        }
+                        if (!right.isEmpty()) {
+                            header.setAlignment(Alignment.CenterRight, width, height);
+                            header.setColor(MUTED);
+                            header.drawSimple(right);
+                        }
+                    })
+                    .tooltipDynamic(t -> {
+                        String left = materialsHeading.get(), right = progressHeading.get();
+                        if (!left.isEmpty()) t.addLine(IKey.str(left));
+                        if (!right.isEmpty()) t.addLine(IKey.str(right));
+                    }).tooltipAutoUpdate(true));
+        }
         list(main, materials, EDGE, 52, MATERIAL_WIDTH + 7, 80);
+        materials.setEnabledIf(w -> showMaterials.getAsBoolean());
         ParentWidget<?> preview = new ParentWidget<>().pos(OPTIONS_X, 65).size(OPTIONS_WIDTH, 66)
                 .setEnabledIf(w -> target.getValue() != null && !settled.getAsBoolean());
         main.child(preview);
@@ -610,60 +666,54 @@ final class BuilderGui {
         int solidWidth = 31;
         previewStyle(shellStyles, 0, solidWidth, false);
         previewStyle(shellStyles, solidWidth + 1, OPTIONS_WIDTH - solidWidth - 1, true);
-        singleLine(main, status, 10, 133, LIST_WIDTH - 2, 13, MUTED);
+        singleLine(main, status, 10, 133, LIST_WIDTH - 2, 13, MUTED).tooltipDynamic(t -> {
+            String why = reason.getStringValue();
+            if ("refundUnbound".equals(why) || "refundBagSpace".equals(why)) t.addLine(IKey.str(tr("refundKept")));
+            if ("refundPermission".equals(why) || "refundSpace".equals(why)) t.addLine(IKey.str(tr("refundRetry")));
+        }).tooltipAutoUpdate(true);
         rule(main, EDGE, 147, LIST_WIDTH);
         panel.child(SlotGroupWidget.playerInventory(false).left(BAG_X).top(BAG_Y)
                 .setEnabledIf(w -> view.getIntValue() == Page.MAIN.ordinal() || onCellPage()));
         button(main, 178, 187, 129, () -> tr("cell.title"), "repairCell", false)
                 .setEnabledIf(w -> (flags.getIntValue() & REPAIR_CELL) != 0);
         label(main, () -> tr("rate"), 178, 152, 129, 14, MUTED)
-                .setEnabledIf(w -> !settled.getAsBoolean());
+                .setEnabledIf(w -> showBuildControls.getAsBoolean());
         main.child(
                 new TextFieldWidget()
                         .value(rate)
                         .numbersInt(() -> 1, maxRate::getIntValue)
                         .pos(178, 169)
                         .size(129, 16)
-                        .setEnabledIf(w -> !settled.getAsBoolean()));
+                        .setEnabledIf(w -> showBuildControls.getAsBoolean()));
         button(main, 178, FOOTER_Y, 60, () -> tr("cancel"), "cancel", false)
                 .setEnabledIf(
                         w ->
                                 target.getValue() != null
                                         && !settled.getAsBoolean()
                                         && !in(phase, "DRAFT", "PREVIEW")
-                                        && !(in(phase, "UPGRADE_REVIEW") && (flags.getIntValue() & HAS_REPLACEMENTS) != 0));
-        button(main, 178, FOOTER_Y, 60,
-                () -> tr((flags.getIntValue() & 8) != 0 ? "refundAndReturn" : "buildList"), "buildList", false)
-                .setEnabledIf(w -> in(phase, "UPGRADE_REVIEW") && (flags.getIntValue() & HAS_REPLACEMENTS) != 0);
-        button(
-                        main,
-                        242,
-                        FOOTER_Y,
-                        65,
-                        () -> primaryAction(phase.getStringValue()),
-                        "go",
-                        true)
-                .setEnabledIf(
-                        w ->
-                                target.getValue() != null && (flags.getIntValue() & (SITE_COMPLETE | AWAITING_SITE)) == 0
-                                        && in(
-                                                phase, "DRAFT", "PREVIEW", "BLOCKED", "READY",
-                                                "MISSING", "UPGRADE_REVIEW"));
+                );
+        button(main, 178, FOOTER_Y, 60, () -> tr("delete"), "deleteTask", false)
+                .setEnabledIf(w -> !selectedId.getStringValue().isEmpty() && (in(phase, "DRAFT", "PREVIEW")
+                        || settled.getAsBoolean() && !in(phase, "DISMANTLING")
+                                && (!in(phase, "DONE", "REFUND") || (flags.getIntValue() & 264) == 0)))
+                .tooltip(t -> t.addLine(IKey.str(tr("deleteHint"))));
+        BooleanSupplier canStart =
+                () -> target.getValue() != null
+                        && !siteComplete.getAsBoolean() && !waitingForSite.getAsBoolean()
+                        && ((flags.getIntValue() & SITE_ADJUSTMENT) == 0
+                                || (flags.getIntValue() & SITE_CAN_START) != 0 || in(phase, "MISSING"))
+                        && (!in(phase, "UPGRADE_REVIEW") || (flags.getIntValue() & HAS_REPLACEMENTS) != 0)
+                        && in(phase, "DRAFT", "PREVIEW", "BLOCKED", "READY", "MISSING", "UPGRADE_REVIEW");
+        IDrawable startText = IKey.str(tr("start")).color(INK).shadow(false).alignment(Alignment.Center);
+        IDrawable disabledStart = fill(STRIPE);
+        control(main, 242, FOOTER_Y, 65, () -> tr("start"), () -> {
+            if (canStart.getAsBoolean()) sendAction("go");
+        }, true).overlay((ctx, x, y, w, h, theme) -> {
+            if (!canStart.getAsBoolean()) disabledStart.draw(ctx, x, y, w, h, theme);
+            startText.draw(ctx, x, y, w, h, theme);
+        }).setEnabledIf(w -> showBuildControls.getAsBoolean());
         button(main, 178, FOOTER_Y, 129, () -> tr("retryRefund"), "retryRefund", false)
                 .setEnabledIf(w -> in(phase, "DONE", "REFUND") && (flags.getIntValue() & 264) != 0);
-        button(main, 178, FOOTER_Y, 129, () -> tr("remove"), "deleteTask", false)
-                .setEnabledIf(w -> settled.getAsBoolean() && !in(phase, "DISMANTLING")
-                        && (!in(phase, "DONE", "REFUND") || (flags.getIntValue() & 264) == 0));
-        button(
-                        main,
-                        178,
-                        FOOTER_Y,
-                        60,
-                        () -> tr(in(phase, "PREVIEW") ? "remove" : "discard"),
-                        "deleteTask",
-                        false)
-                .setEnabledIf(w -> in(phase, "DRAFT", "PREVIEW") && target.getValue() != null);
-
         heading(groups, "materialRoles", this::name);
         list(groups, roles, EDGE, 44, LIST_WIDTH, 150);
         heading(choice, "alternatives", this::name);
@@ -705,19 +755,6 @@ final class BuilderGui {
         return panel;
     }
 
-    private String primaryAction(String phase) {
-        switch (phase) {
-            case "state.DRAFT":
-            case "state.PREVIEW": return tr((flags.getIntValue() & PARTIAL_BUILD) != 0 ? "resumeBuild" : "start");
-            case "state.BLOCKED": return tr("resume");
-            case "state.MISSING": return tr("shortage");
-            case "state.UPGRADE_REVIEW":
-                if ((flags.getIntValue() & HAS_REPLACEMENTS) != 0) return tr("startUpgrade");
-                return tr((flags.getIntValue() & 8) != 0 ? "refundAndReturn" : "continueBuilding");
-            default: return tr("start");
-        }
-    }
-
     private String controllerFormation() {
         if (task == null || task.state != BuildTask.State.DONE || task.target == null) return "";
         WorldServer world = DimensionManager.getWorld(task.dim);
@@ -727,7 +764,7 @@ final class BuilderGui {
         IGregTechTileEntity gt = (IGregTechTileEntity) tile;
         if (gt.getMetaTileID() != task.target.getMetadata() || !(gt.getMetaTileEntity() instanceof MTEMultiBlockBase)) return "";
         return ((MTEMultiBlockBase) gt.getMetaTileEntity()).mMachine
-                ? "machineFormed" : "machineUnformed";
+                ? "" : "machineUnformed";
     }
 
     private static boolean in(StringSyncValue phase, String... states) {
@@ -878,10 +915,6 @@ final class BuilderGui {
                     show(Page.BROWSER);
                 }
                 return;
-            case "buildList":
-                if (page == Page.MAIN && task.state == BuildTask.State.UPGRADE_REVIEW
-                        && world != null && player().worldObj == world) task.continueOrdinaryBuild(player(), world);
-                break;
             case "auto":
                 if (page == Page.ORDER && task.state == BuildTask.State.MISSING) {
                     task.auto = !task.auto;
@@ -901,10 +934,6 @@ final class BuilderGui {
                 return;
             case "go":
                 if (page != Page.MAIN || builtOnSite() || task.awaitingSiteCount()) return;
-                if (task.state == BuildTask.State.UPGRADE_REVIEW && task.upgradeCount == 0) {
-                    if (world != null && player().worldObj == world) task.continueOrdinaryBuild(player(), world);
-                    break;
-                }
                 if (task.state == BuildTask.State.MISSING) {
                     show(Page.ORDER);
                     return;
@@ -991,45 +1020,62 @@ final class BuilderGui {
         sendRows();
     }
 
-    private void commitChannels(int tier, NBTTagCompound next, Set<String> specified, Set<String> excluded, boolean share) {
+    private void commitChannels(int tier, NBTTagCompound next, Set<String> specified, boolean share) {
         if (page != Page.BROWSER || task == null || !task.canConfigureChannels()
                 || task.existing && (task.plan == null || !task.plan.ready)) return;
+        if (share) {
+            task.store.channelMemory.remember(task, tier, next, channels);
+            return;
+        }
         boolean changed = !task.usesConfiguredSource() || task.tier != tier || !task.channels.equals(next);
-        if (!share && task.existing && task.plan != null && task.plan.ready) {
-            task.resolveReplacementChannels(tier, next, specified, excluded);
-        } else specified.clear();
+        if (task.existing && !task.upgrading()) {
+            if (tier != task.tier || !specified.isEmpty()) task.applySiteChannels(tier, next, specified);
+            return;
+        }
+        if (!task.existing) specified.clear();
+        else task.resolveReplacementChannels(tier, next, specified);
         if (!specified.isEmpty()) {
             if (!task.setUpgradeChannels(specified)) return;
-            task.tier = tier;
-            task.channels = next;
-        } else if (changed || !share && task.upgrading()) {
+        } else if (changed || task.upgrading()) {
             if (task.upgrading() && !task.setUpgradeChannels(Collections.emptySet())) return;
-            task.tier = tier;
-            task.channels = next;
             task.resetDraft();
         }
-        task.store.channelMemory.remember(task, channels, share);
+        task.tier = tier;
+        task.channels = next;
+        task.changed();
     }
 
-    private String dimensions() {
-        com.Goderium.StructureBuilderNH.util.Bounds b = task.plan.bounds;
-        return (b.maxX - b.minX + 1)
-                + " x "
-                + (b.maxY - b.minY + 1)
-                + " x "
-                + (b.maxZ - b.minZ + 1);
+    private String adjustmentStatus() {
+        SiteAdjustment plan = task == null ? null : task.adjustment;
+        if (plan == null || (task.state != BuildTask.State.DRAFT && task.state != BuildTask.State.PREVIEW)) return "";
+        if (!plan.ready) return "checkingSite";
+        if (plan.blocker != null) return plan.obstruction;
+        if (!plan.approved && !plan.canStart()) return "state.SITE_COMPLETE";
+        return "changeSummary";
+    }
+
+    private String taskDetail() {
+        if (task == null) return "";
+        if (!task.detail.isEmpty() || task.adjustment == null || task.adjustment.blocker == null) return task.detail;
+        net.minecraft.util.ChunkCoordinates at = task.adjustment.blocker;
+        return at.posX + ", " + at.posY + ", " + at.posZ;
     }
 
     private String mainProgress() {
         if (task == null) return "";
         if (task.state == BuildTask.State.UPGRADE_REVIEW) return String.valueOf(task.upgradeCount);
+        if (task.adjustment != null && task.adjustment.approved && task.constructionPreview()) {
+            int work = task.adjustment.additionsCount + task.adjustment.replacementCount;
+            return task.adjustment.completedClears + Math.max(0, work - task.pendingCount()) + " / "
+                    + (work + task.adjustment.replacementCount + task.adjustment.removalCount);
+        }
         boolean live = task.state == BuildTask.State.BUILDING || task.state == BuildTask.State.VERIFYING
                 || task.state == BuildTask.State.QUEUED;
         if (site != null && (!live || task.total == 0))
             return site.installedCells + " / " + site.totalCells + (site.unknownCells > 0 ? " *" : "");
         if (task.hasSiteCount()) return task.siteInstalled + " / " + task.siteTotal + (task.siteUnknown > 0 ? " *" : "");
         if (task.total > 0) return task.placed + " / " + task.total;
-        return task.plan != null && task.plan.ready ? dimensions() : "";
+        return "";
     }
 
     private static String quantity(String key, int count) {
@@ -1042,6 +1088,7 @@ final class BuilderGui {
 
     private void surveyBuildSite() {
         if (page != Page.MAIN || task == null || task.plan == null || !task.plan.ready || task.upgrading()
+                || task.adjustment != null
                 || player().dimension != task.dim || task.state == BuildTask.State.REFUND
                 || task.state == BuildTask.State.DONE || task.state == BuildTask.State.DISMANTLED
                 || task.state == BuildTask.State.DISMANTLING || task.state == BuildTask.State.TEARDOWN_PAUSED) {
@@ -1479,7 +1526,7 @@ final class BuilderGui {
         OrdinaryBuildSurvey currentSite = !missing && site != null && site.valid(task) ? site : null;
         // Building updates the placement ledger every block; the approved replacement rows stay the same.
         boolean stableRows = task != null && (task.state == BuildTask.State.DISMANTLING && task.salvage.rows.isEmpty()
-                || !missing && task.upgrading() && (task.state == BuildTask.State.QUEUED
+                || !missing && (task.upgrading() || task.adjustment != null) && (task.state == BuildTask.State.QUEUED
                         || task.state == BuildTask.State.BUILDING || task.state == BuildTask.State.VERIFYING));
         String key =
                 task == null
@@ -1492,10 +1539,11 @@ final class BuilderGui {
                                 + "/"
                                 + task.state
                                 + "/"
-                                + (task.plan != null && task.plan.ready);
+                                + (task.plan != null && task.plan.ready)
+                                + "/" + (task.adjustment == null ? "" : task.adjustment.ready + "/" + task.adjustment.reviewedAt);
         if (previous.equals(key)) {
             if (sentSite == currentSite) return;
-            if (sentSite != null && currentSite != null && currentSite.total.same(sentSite.total)) {
+            if (sentSite != null && currentSite != null && !task.existing && currentSite.total.same(sentSite.total)) {
                 // Keep the scroll position and selectable rows while only the counts change.
                 for (Materials.Entry entry : currentSite.total.rows.values()) {
                     ItemStack item = entry.item;
@@ -1543,7 +1591,16 @@ final class BuilderGui {
             return;
         }
         if (list == null) return;
+        if (!missing && task.adjustment != null && task.state != BuildTask.State.DISMANTLING
+                && task.state != BuildTask.State.DISMANTLED && task.state != BuildTask.State.TEARDOWN_PAUSED) {
+            sendAdjustmentRows(task.adjustment);
+            return;
+        }
         boolean catalog = !missing && task.plan != null && list == task.plan.bill;
+        if (catalog && task.existing) {
+            if (currentSite != null) sendMaterialRows(currentSite.missing, 1);
+            return;
+        }
         Map<ItemId, ChoiceEntry> alternatives = new LinkedHashMap<>();
         if (catalog) {
             Materials combined = new Materials();
@@ -1573,12 +1630,8 @@ final class BuilderGui {
             }
         }
         for (Materials.Entry e : list.rows.values()) {
-            int amount = e.count;
-            if (catalog && currentSite == null
-                    && task.existing
-                    && Materials.equal(e.item, task.target)) amount--;
-            if (amount <= 0) continue;
-            final int n = amount;
+            if (e.count <= 0) continue;
+            int n = e.count;
             ChoiceEntry entry = alternatives.get(ItemId.create(e.item));
             if (catalog && currentSite != null) {
                 boolean selectable = entry != null && task.editable();
@@ -1624,6 +1677,46 @@ final class BuilderGui {
                         }
                     });
         }
+    }
+
+    private void sendAdjustmentRows(SiteAdjustment plan) {
+        if (!plan.ready) return;
+        Map<ItemId, List<UpgradeBill.Row>> grouped = new LinkedHashMap<>();
+        for (UpgradeBill.Row row : plan.replacements.rows)
+            grouped.computeIfAbsent(ItemId.create(row.target), k -> new ArrayList<>()).add(row);
+        for (List<UpgradeBill.Row> group : grouped.values()) {
+            ItemStack item = group.get(0).target;
+            int toBuild = plan.additions.count(item);
+            int number = toBuild + group.stream().mapToInt(row -> row.count).sum();
+            sync.callSyncedAction("rows", b -> {
+                b.writeByte(18);
+                ByteBufAdapters.ITEM_STACK.serializeSafe(b, item);
+                b.writeVarIntToBuffer(number);
+                b.writeVarIntToBuffer(toBuild);
+                b.writeVarIntToBuffer(group.size());
+                for (UpgradeBill.Row row : group) {
+                    ByteBufAdapters.ITEM_STACK.serializeSafe(b, row.previous);
+                    b.writeVarIntToBuffer(row.count);
+                }
+            });
+        }
+        for (Map.Entry<ItemId, Materials.Entry> e : plan.additions.rows.entrySet()) {
+            if (!grouped.containsKey(e.getKey())) sendMaterialRow(e.getValue(), 1);
+        }
+        sendMaterialRows(plan.removals, 17);
+    }
+
+    private void sendMaterialRows(Materials source, int type) {
+        for (Materials.Entry e : source.rows.values()) sendMaterialRow(e, type);
+    }
+
+    private void sendMaterialRow(Materials.Entry e, int type) {
+        sync.callSyncedAction("rows", b -> {
+            b.writeByte(type);
+            ByteBufAdapters.ITEM_STACK.serializeSafe(b, e.item);
+            b.writeVarIntToBuffer(e.count);
+            if (type == 1) b.writeBoolean(false);
+        });
     }
 
     private void sendRefundRows(Materials source, int type) {
@@ -1673,6 +1766,27 @@ final class BuilderGui {
             ItemStack stack = ByteBufAdapters.ITEM_STACK.deserializeSafe(b);
             SiteRow row = stack == null ? null : siteRows.get(ItemId.create(stack));
             if (row != null) row.read(b);
+            return;
+        }
+        if (type == 18) {
+            ItemStack item = ByteBufAdapters.ITEM_STACK.deserializeSafe(b);
+            int count = b.readVarIntFromBuffer(), toBuild = b.readVarIntFromBuffer(), pairs = b.readVarIntFromBuffer();
+            if (item == null || pairs < 0 || pairs > UpgradeBill.MAX_ROWS) return;
+            List<String> hints = new ArrayList<>();
+            for (int i = 0; i < pairs; i++) {
+                ItemStack old = ByteBufAdapters.ITEM_STACK.deserializeSafe(b);
+                int number = b.readVarIntFromBuffer();
+                if (old != null) hints.add(old.getDisplayName() + " → " + item.getDisplayName() + " ×" + number);
+            }
+            if (toBuild > 0) hints.add(quantity("adjustmentBuildCount", toBuild));
+            adjustmentRow(item, item.getDisplayName(), count, INK, hints);
+            return;
+        }
+        if (type == 17) {
+            ItemStack item = ByteBufAdapters.ITEM_STACK.deserializeSafe(b);
+            int count = b.readVarIntFromBuffer();
+            if (item != null) adjustmentRow(item, tr("pendingRemoval") + " " + item.getDisplayName(), count, MUTED,
+                    Collections.singletonList(item.getDisplayName() + " → " + tr("previewAir")));
             return;
         }
         if (type == 11) {
@@ -1776,7 +1890,10 @@ final class BuilderGui {
                         queueAction(id, action);
                     }
                 }, false).setEnabledIf(w -> row.canDismantle)
-                        .tooltip(t -> t.addLine(IKey.dynamic(row::removalHint)));
+                        .tooltipDynamic(t -> {
+                            if ((row.removalModes & BuildTask.DISMANTLE_SITE) != 0) t.addLine(IKey.str(tr("siteOnlyHint")));
+                            if ((row.removalModes & BuildTask.UNDO_PLACEMENTS) != 0) t.addLine(IKey.str(tr("undoOnlyHint")));
+                        }).tooltipAutoUpdate(true);
                 jobs.child(row.entry);
             }
             return;
@@ -1865,15 +1982,19 @@ final class BuilderGui {
     }
 
     private void replacementRow(ItemStack old, ItemStack next, int count) {
-        ParentWidget<?> row = new ParentWidget<>().size(MATERIAL_WIDTH, 32)
+        adjustmentRow(next, next.getDisplayName(), count, INK,
+                Collections.singletonList(old.getDisplayName() + " → " + next.getDisplayName()));
+    }
+
+    private void adjustmentRow(ItemStack item, String name, int count, int color, List<String> hints) {
+        ParentWidget<?> row = new ParentWidget<>().size(MATERIAL_WIDTH, 16)
                 .background(fill(materials.getChildren().size() % 2 == 0 ? STRIPE : SURFACE));
-        row.child(new ItemDrawable(old).asWidget().pos(1, 0));
-        row.child(new ItemDrawable(next).asWidget().pos(1, 16));
+        row.child(new ItemDrawable(item).asWidget().pos(1, 0));
         String quantity = String.format(Locale.ROOT, "%,d", count);
         int countWidth = textWidth(quantity) + 6;
-        singleLine(row, old::getDisplayName, 20, 1, MATERIAL_WIDTH - 23, 14, MUTED);
-        singleLine(row, () -> "→ " + next.getDisplayName(), 20, 17, MATERIAL_WIDTH - 23 - countWidth, 14, INK);
-        label(row, () -> quantity, MATERIAL_WIDTH - countWidth - 2, 17, countWidth, 14, ACCENT, Alignment.CenterRight);
+        singleLine(row, () -> name, 20, 1, MATERIAL_WIDTH - 23 - countWidth, 14, color);
+        label(row, () -> quantity, MATERIAL_WIDTH - countWidth - 2, 1, countWidth, 14, ACCENT, Alignment.CenterRight);
+        row.tooltip(t -> hints.forEach(hint -> t.addLine(IKey.str(hint))));
         materials.child(row);
     }
 

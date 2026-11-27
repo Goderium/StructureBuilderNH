@@ -14,6 +14,15 @@ final class BrowserBlockAccess implements IBlockAccess {
     private final BrowserScene scene;
     private final BrowserScene.Section[] near = new BrowserScene.Section[27];
     private final int sx, sy, sz;
+    private int neighborReads;
+
+    void beginBatch() { neighborReads = 0; }
+
+    int neighborReads() { return neighborReads; }
+
+    static int neighborBit(int dx, int dy, int dz) {
+        return 1 << (13 + dx + 3 * dy + 9 * dz);
+    }
 
     BrowserBlockAccess(BrowserScene scene, BrowserScene.Section section) {
         this.scene = scene;
@@ -27,7 +36,9 @@ final class BrowserBlockAccess implements IBlockAccess {
     BrowserScene.Material material(int x, int y, int z) {
         int dx = (x >> 4) - sx, dy = (y >> 4) - sy, dz = (z >> 4) - sz;
         if (dx < -1 || dx > 1 || dy < -1 || dy > 1 || dz < -1 || dz > 1) return null;
-        BrowserScene.Section section = near[13 + dx + 3 * dy + 9 * dz];
+        int index = 13 + dx + 3 * dy + 9 * dz;
+        if (index != 13) neighborReads |= 1 << index;
+        BrowserScene.Section section = near[index];
         return section == null ? null : scene.material(section, (x & 15) | ((z & 15) << 4) | ((y & 15) << 8));
     }
 

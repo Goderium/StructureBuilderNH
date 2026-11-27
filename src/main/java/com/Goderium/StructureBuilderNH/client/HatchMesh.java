@@ -33,6 +33,51 @@ final class HatchMesh {
         }
     }
 
+    interface RoleAt { int role(int x, int y, int z); }
+
+    interface Edge { void line(int axis, int x, int y, int z, int role); }
+
+    static void outline(long[] hatches, RoleAt roles, Edge sink) {
+        for (int word = 0; word < hatches.length; word++) {
+            for (long bits = hatches[word]; bits != 0; bits &= bits - 1) {
+                int slot = word * 64 + Long.numberOfTrailingZeros(bits);
+                int x = slot & 15, y = slot >> 8, z = slot >> 4 & 15;
+                for (int axis = 0; axis < 3; axis++) {
+                    for (int corner = 0; corner < 4; corner++) {
+                        int u = corner & 1, v = corner >> 1;
+                        int axisU = (axis + 1) % 3, axisV = (axis + 2) % 3;
+                        int ex = x + (axisU == 0 ? u : axisV == 0 ? v : 0);
+                        int ey = y + (axisU == 1 ? u : axisV == 1 ? v : 0);
+                        int ez = z + (axisU == 2 ? u : axisV == 2 ? v : 0);
+                        emitEdge(roles, sink, axis, axisU, axisV, ex, ey, ez, 3 - corner);
+                    }
+                }
+            }
+        }
+    }
+
+    private static void emitEdge(RoleAt roles, Edge sink, int axis, int axisU, int axisV, int x, int y, int z,
+            int owner) {
+        int mask = 0, first = 0;
+        boolean different = false;
+        for (int i = 0; i < 4; i++) {
+            int u = (i & 1) - 1, v = (i >> 1) - 1;
+            int role = roles.role(x + (axisU == 0 ? u : axisV == 0 ? v : 0),
+                    y + (axisU == 1 ? u : axisV == 1 ? v : 0), z + (axisU == 2 ? u : axisV == 2 ? v : 0));
+            if (role == 0) continue;
+            // The first hatch around an edge owns it, including across section boundaries.
+            if (first == 0) {
+                if (i != owner) return;
+                first = role;
+            }
+            different |= role != first;
+            mask |= 1 << i;
+        }
+        // Two adjacent hatches of one role share a flat surface. Only its outer contour is drawn.
+        if (first == 0 || mask == 15 || !different && (mask == 3 || mask == 5 || mask == 10 || mask == 12)) return;
+        sink.line(axis, x, y, z, first);
+    }
+
     interface Boundary {
         boolean occupied(int side, int wrappedSlot);
     }

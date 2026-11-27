@@ -73,6 +73,10 @@ final class UpgradeBill {
                 result.targetTier);
     }
 
+    boolean add(ItemStack previous, ItemStack target) {
+        return add(previous, target, 1, 0, 0, 0, 0);
+    }
+
     private boolean add(
             ItemStack previous,
             ItemStack target,

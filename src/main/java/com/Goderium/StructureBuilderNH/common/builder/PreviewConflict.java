@@ -20,6 +20,7 @@ final class PreviewConflict {
     private PreviewPose transform;
     private int revision, section, slot, wait;
     private final int[] point = new int[3], witness = new int[3];
+    private final BuildTask.OrdinaryCell siteCell = new BuildTask.OrdinaryCell();
     private final List<BuildTask> nearby = new ArrayList<>();
 
     boolean update(BuildTask task, World world, PreviewDragMessage proposal, List<BuildTask> tasks, Set<String> visible) {
@@ -100,7 +101,7 @@ final class PreviewConflict {
     private boolean blocked(BuildTask task, World world, int sx, int sy, int sz) {
         project(sx, sy, sz);
         int px = point[0], py = point[1], pz = point[2];
-        boolean conflict = task.previewObstruction(world, sx, sy, sz, px, py, pz, pose);
+        boolean conflict = worldBlocked(task, world, sx, sy, sz, px, py, pz);
         if (!conflict) for (BuildTask other : nearby) {
             if (other.plan.bounds.contains(px, py, pz) && other.plan.projectsBlock(px, py, pz)) {
                 conflict = true;
@@ -109,6 +110,19 @@ final class PreviewConflict {
         }
         if (conflict) { witness[0] = sx; witness[1] = sy; witness[2] = sz; }
         return conflict;
+    }
+
+    private boolean worldBlocked(BuildTask task, World world, int sx, int sy, int sz, int px, int py, int pz) {
+        if (sequence == 0 && task.existing) {
+            // An applied channel change is reviewed against both the old and new plan by SiteAdjustment.
+            if (task.adjustment != null) return false;
+            if (task.surveysExistingSite()) {
+                if (!world.blockExists(px, py, pz) || world.isAirBlock(px, py, pz)) return false;
+                task.ordinaryCell(plan.indexAt(sx, sy, sz), world, siteCell, false);
+                return siteCell.status == BuildTask.OrdinaryStatus.BLOCKED;
+            }
+        }
+        return task.previewObstruction(world, sx, sy, sz, px, py, pz, pose);
     }
 
     private void project(int sx, int sy, int sz) {

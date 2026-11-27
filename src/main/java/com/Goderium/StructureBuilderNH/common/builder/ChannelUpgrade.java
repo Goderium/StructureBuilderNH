@@ -1,6 +1,7 @@
 package com.Goderium.StructureBuilderNH.common.builder;
 
 import com.gtnewhorizon.structurelib.alignment.constructable.ChannelDataAccessor;
+import com.gtnewhorizon.structurelib.structure.IChannelDefinition;
 import com.gtnewhorizon.structurelib.structure.IStructureElement;
 import com.gtnewhorizon.structurelib.structure.StructureUtility;
 
@@ -13,17 +14,21 @@ import net.minecraft.init.Blocks;
 import net.minecraft.item.ItemStack;
 import net.minecraft.world.World;
 
+import org.apache.commons.lang3.tuple.Pair;
+
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.function.BiFunction;
 import java.util.function.Function;
 
-/** Read-only recognition of the finite, native GT glass and heating-coil channel families. */
+/** Recognizes installed blocks using finite construction choices from the structure element. */
 final class ChannelUpgrade {
     enum Kind { SKIP, KEEP, REPLACE, BLOCKED }
 
@@ -37,12 +42,12 @@ final class ChannelUpgrade {
         Result(Kind kind, Profile profile, Material previous, Block oldBlock, int oldMeta) {
             this.kind = kind;
             channel = profile == null ? "" : profile.channel;
-            target = profile == null ? null : profile.target.item.copy();
+            target = profile == null ? null : ItemStack.copyItemStack(profile.target.item);
             targetBlock = profile == null ? null : profile.target.block;
             targetMeta = profile == null ? 0 : profile.target.meta;
             targetValue = profile == null ? 0 : profile.targetValue;
             targetTier = profile == null ? 0 : profile.target.tier;
-            this.previous = previous == null ? null : previous.item.copy();
+            this.previous = previous == null ? null : ItemStack.copyItemStack(previous.item);
             sourceValue = previous == null ? 0 : previous.value;
             sourceTier = previous == null ? 0 : previous.tier;
             this.oldBlock = oldBlock;
@@ -60,17 +65,25 @@ final class ChannelUpgrade {
         Material(Block block, int meta, ItemStack item) {
             this.block = block;
             this.meta = meta;
-            this.item = item.copy();
-            this.item.stackSize = 1;
+            this.item = ItemStack.copyItemStack(item);
+            if (this.item != null) this.item.stackSize = 1;
         }
 
         boolean same(Block block, int meta) { return this.block == block && this.meta == meta; }
     }
 
-    private static final class Proof {
+    static final class Proof {
         final String channel;
         final int maximum;
-        Proof(String channel, int maximum) { this.channel = channel; this.maximum = maximum; }
+        final boolean allowsAir;
+
+        Proof(String channel, int maximum) { this(channel, maximum, false); }
+
+        Proof(String channel, int maximum, boolean allowsAir) {
+            this.channel = channel;
+            this.maximum = maximum;
+            this.allowsAir = allowsAir;
+        }
     }
 
     private static final class Profile {
@@ -88,8 +101,8 @@ final class ChannelUpgrade {
         void add(Material material) {
             Map<Integer, Material> variants = materials.computeIfAbsent(material.block, b -> new LinkedHashMap<>());
             Material old = variants.get(material.meta);
-            // Several channel values can produce the same block. Keep one stable value for the material list.
-            if (old == null || old.value < material.value) variants.put(material.meta, material);
+            // Some lists repeat the final tier as a shortcut. Keep the original selector value.
+            if (old == null || old.value > material.value) variants.put(material.meta, material);
         }
 
         Material find(Block block, int meta) {
@@ -101,7 +114,9 @@ final class ChannelUpgrade {
     private static final Result SKIP = new Result(Kind.SKIP, null, null, null, 0);
     private static final int MAX_NATIVE_VALUES = 256;
     private final Blueprint plan;
-    private final Map<IStructureElement<?>, Proof> proofs = new IdentityHashMap<>();
+    private final Map<String, Integer> maximums = new LinkedHashMap<>();
+    private final Map<String, Integer> readOnlyMaximums = Collections.unmodifiableMap(maximums);
+    private final Set<String> unknownRanges = new TreeSet<>();
     private final Map<Blueprint.Cell, Profile> profiles = new IdentityHashMap<>();
     private final Set<Blueprint.Cell> rejected = Collections.newSetFromMap(new IdentityHashMap<>());
     private final Map<String, Integer> active = new LinkedHashMap<>();
@@ -110,6 +125,27 @@ final class ChannelUpgrade {
     ChannelUpgrade(Blueprint plan) { this.plan = plan; }
 
     Set<String> channels() { return plan.ready ? channels : Collections.emptySet(); }
+
+    Proof observe(IStructureElement<?> element, Object context, ItemStack trigger) {
+        Proof proof = prove(element, context, trigger);
+        for (String key : element.getChannels()) {
+            if (proof == null || !key.equals(proof.channel)) {
+                unknownRanges.add(key);
+                maximums.remove(key);
+            }
+        }
+        if (proof != null && !unknownRanges.contains(proof.channel))
+            maximums.merge(proof.channel, proof.maximum, Math::max);
+        return proof;
+    }
+
+    Map<String, Integer> maximums() { return readOnlyMaximums; }
+
+    static IChannelDefinition withObservedMaximum(IChannelDefinition channel, Map<String, Integer> bounds) {
+        int maximum = bounds.getOrDefault(channel.getChannel(), 0);
+        if (channel.getMaximumValue() != Integer.MAX_VALUE || maximum < channel.getMinimumValue()) return channel;
+        return IChannelDefinition.bounded(channel.getChannel(), channel.getMinimumValue(), maximum);
+    }
 
     String channel(Blueprint.Cell cell) {
         Profile profile = profiles.get(cell);
@@ -127,8 +163,8 @@ final class ChannelUpgrade {
         int meta = world.getBlockMetadata(x, y, z);
         if (world.getTileEntity(x, y, z) != null || block.hasTileEntity(meta))
             return new Result(Kind.BLOCKED, profile, null, block, meta);
-        if (block == Blocks.air) return new Result(Kind.KEEP, profile, null, block, meta);
         Material source = profile.find(block, meta);
+        if (block == Blocks.air) return new Result(Kind.KEEP, profile, source, block, meta);
         if (profile.target.same(block, meta)) return new Result(Kind.KEEP, profile, source, block, meta);
         if (source == null) return new Result(Kind.BLOCKED, profile, null, block, meta);
         return new Result(Kind.REPLACE, profile, source, block, meta);
@@ -138,17 +174,12 @@ final class ChannelUpgrade {
     void record(Blueprint.Cell old, Blueprint.Cell cell, int x, int y, int z) {
         Profile previous = profiles.get(old);
         if (previous != null) count(previous.channel, -1);
-        if (cell == null || cell.element == null || cell.air || cell.hatch || cell.isFluid() || cell.inscribedRitual
+        if (cell == null || cell.element == null || cell.hatch || cell.isFluid() || cell.inscribedRitual
                 || cell.choice != null || cell.constraints != null || rejected.contains(cell)) return;
         Profile profile = profiles.get(cell);
         if (profile == null) {
-            Proof proof;
-            if (proofs.containsKey(cell.element)) proof = proofs.get(cell.element);
-            else {
-                proof = prove(cell.element);
-                proofs.put(cell.element, proof);
-            }
-            if (proof == null) return;
+            Proof proof = cell.channelProof;
+            if (proof == null || cell.air && !proof.allowsAir) return;
             profile = sample(cell, proof, x, y, z);
             if (profile == null) { rejected.add(cell); return; }
             profiles.put(cell, profile);
@@ -171,7 +202,7 @@ final class ChannelUpgrade {
             if (pieceTrigger == null) return null;
             int value = Math.max(1, Math.min(proof.maximum,
                     ChannelDataAccessor.getChannelData(pieceTrigger, proof.channel)));
-            Material target = plan.sampleUpgrade(cell, pieceTrigger.copy(), x, y, z);
+            Material target = plan.sampleUpgrade(cell, pieceTrigger.copy(), x, y, z, proof.allowsAir);
             if (target == null || !target.same(cell.block, cell.meta) || !Materials.equal(target.item, cell.item))
                 return null;
             if ("glass".equals(proof.channel)) {
@@ -187,7 +218,7 @@ final class ChannelUpgrade {
                 ChannelDataAccessor.setChannelData(trigger, proof.channel, rank);
                 Material material;
                 try {
-                    material = plan.sampleUpgrade(cell, trigger, x, y, z);
+                    material = plan.sampleUpgrade(cell, trigger, x, y, z, proof.allowsAir);
                 } catch (RuntimeException | LinkageError failure) {
                     material = null;
                 }
@@ -216,7 +247,7 @@ final class ChannelUpgrade {
     }
 
     /** Only exact dependency implementations are unwrapped; no class-name/subclass guess grants replacement. */
-    private static Proof prove(IStructureElement<?> element) {
+    static Proof prove(IStructureElement<?> element, Object context, ItemStack trigger) {
         String channel = null;
         boolean glassFactory = false, glassTransform = false;
         Set<IStructureElement<?>> seen = Collections.newSetFromMap(new IdentityHashMap<>());
@@ -225,7 +256,6 @@ final class ChannelUpgrade {
                 if (nativeMethod(element, StructureUtility.class, "withChannel")) {
                     if (channel != null) return null;
                     channel = field(element, String.class);
-                    if (!"glass".equals(channel) && !"coil".equals(channel)) return null;
                     element = field(element, IStructureElement.class);
                 } else if (nativeMethod(element, GTStructureUtility.class, "triggerItemTransform")) {
                     Function<?, ?> transform = field(element, Function.class);
@@ -246,15 +276,66 @@ final class ChannelUpgrade {
                     return "coil".equals(channel) && !glassFactory && !glassTransform
                             && maximum > 0 && maximum <= MAX_NATIVE_VALUES ? new Proof(channel, maximum) : null;
                 } else if (nativeMethod(element, StructureUtility.class, "ofBlocksTiered")) {
-                    int maximum = GlassTier.getGlassList().size();
-                    return "glass".equals(channel) && glassFactory && glassTransform
-                            && maximum > 0 && maximum <= MAX_NATIVE_VALUES ? new Proof(channel, maximum) : null;
+                    if (channel == null) return null;
+                    if ("glass".equals(channel) ? !glassFactory || !glassTransform : glassFactory || glassTransform)
+                        return null;
+                    int maximum = "glass".equals(channel) ? GlassTier.getGlassList().size() : tierOptions(element);
+                    return maximum > 0 && maximum <= MAX_NATIVE_VALUES ? new Proof(channel, maximum) : null;
+                } else if (channel != null && !glassFactory && !glassTransform
+                        && nativeMethod(element, StructureUtility.class, "defer")) {
+                    return deferredOptions(element, channel, context, trigger);
                 } else return null;
             }
         } catch (ReflectiveOperationException | RuntimeException | LinkageError failure) {
             return null;
         }
         return null;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Proof deferredOptions(IStructureElement<?> element, String channel, Object context, ItemStack trigger)
+            throws ReflectiveOperationException {
+        BiFunction<Object, ItemStack, ?> selector = field(element, BiFunction.class);
+        if (selector == null || trigger == null) return null;
+        List<?> choices = field(selector, List.class);
+        if (choices == null || choices.isEmpty() || choices.size() > MAX_NATIVE_VALUES) return null;
+        // Recognize a contiguous prefix of a native block list that clamps to its last available choice.
+        int maximum = 0;
+        boolean allowsAir = false;
+        Object last = null;
+        for (int rank = 1; rank <= choices.size(); rank++) {
+            Object choice = select(selector, context, trigger, channel, rank);
+            if (maximum == rank - 1 && choice == choices.get(rank - 1)) {
+                if (choice == StructureUtility.isAir()) allowsAir = true;
+                else if (choice == null || !nativeMethod(choice, StructureUtility.class, "ofBlock")) return null;
+                maximum = rank;
+                last = choice;
+            } else if (choice != last) return null;
+        }
+        if (maximum == 0 || select(selector, context, trigger, channel, choices.size() + 1) != last
+                || select(selector, context, trigger, channel, Integer.MAX_VALUE) != last) return null;
+        return new Proof(channel, maximum, allowsAir);
+    }
+
+    private static Object select(BiFunction<Object, ItemStack, ?> selector, Object context, ItemStack trigger,
+            String channel, int rank) {
+        ItemStack probe = trigger.copy();
+        ChannelDataAccessor.setChannelData(probe, channel, rank);
+        return selector.apply(context, ChannelDataAccessor.withChannel(probe, channel));
+    }
+
+    private static int tierOptions(IStructureElement<?> element) throws IllegalAccessException {
+        // The native tier element captures its block/metadata hints and may also capture text.
+        for (Field field : element.getClass().getDeclaredFields()) {
+            if (!List.class.isAssignableFrom(field.getType())) continue;
+            field.setAccessible(true);
+            List<?> values = (List<?>) field.get(element);
+            if (values == null || values.isEmpty() || values.size() > MAX_NATIVE_VALUES) continue;
+            if (values.stream().allMatch(value -> value instanceof Pair
+                    && ((Pair<?, ?>) value).getLeft() instanceof Block
+                    && ((Pair<?, ?>) value).getRight() instanceof Integer)) return values.size();
+        }
+        return 0;
     }
 
     private static boolean nativeMethod(Object object, Class<?> owner, String name) {
